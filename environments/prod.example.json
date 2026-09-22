@@ -81,7 +81,7 @@
     "databaseContainersList": [], "storageAccountContainersList": []
   },
   "gateway": {
-    "enabled": true, "name": null, "workloadKey": null, "sku": "Premium", "capacity": 1,
+    "enabled": true, "name": null, "workloadKey": null, "sku": "Premium", "capacity": 2,
     "publisherEmail": null, "publisherName": null, "audience": null,
     "integrationSubnetName": null, "integrationSubnetPrefix": null,
     "privateDnsZoneResourceId": null, "stopNewRequests": false, "foundryIntegration": false,

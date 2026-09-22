@@ -188,7 +188,7 @@ templates, because a deployment can be entirely healthy and still unreachable:
   before any other.
 - No migration path to v2 (§5).
 - Production zone redundancy is only meaningful at **≥2 units**, which roughly
-  doubles production cost. Unit count is still open — see below.
+  doubles production cost. Decided: production runs **2 units** — see Decisions.
 
 **Gained:**
 
@@ -259,8 +259,15 @@ the injection subnet's NSG is the operator's control, not this template's.**
 
 ## Open items
 
-1. **Production unit count.** Learn recommends ≥2 units for zone redundancy to
-   be meaningful. Currently unpriced and undecided.
+1. **Production unit count — DECIDED 2026-09-22: 2 units.** Zone redundancy at a
+   single unit is not meaningful, because there is only one compute unit to
+   distribute across zones. `environments/prod.example.json` now carries
+   `capacity: 2`. This roughly doubles production gateway cost and is still
+   **unpriced** — obtain a quote before committing budget. Note this also keeps
+   automatic zone redundancy valid: with the default empty `availabilityZones`
+   the platform selects zones itself, so capacity need not be an exact multiple
+   of a zone count. Dev and test remain Developer at 1 unit, which has no SLA
+   and cannot scale.
 2. **Region capacity.** Confirm Developer and Premium classic availability and
    quota in the target regions before any deployment.
 3. **Network path confirmation with Brother** — peering plus bidirectional DNS
