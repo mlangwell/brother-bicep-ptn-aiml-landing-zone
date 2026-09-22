@@ -191,11 +191,17 @@ function New-CompletionAdapter {
         Sleep = { param($seconds) Start-Sleep -Seconds $seconds }
         Gateway = {
             param($resolution, $output, $armGet)
-            Assert-CompletionCondition ($output.gateway.Contains('privateEndpointResourceId') -and
-                -not [string]::IsNullOrWhiteSpace($output.gateway.privateEndpointResourceId)) 'The deployed gateway private endpoint resource ID is required.'
-            $privateEndpointResourceId = $output.gateway.privateEndpointResourceId
+            # Classic VNet injection has no inbound private endpoint - Learn:
+            # "In the classic API Management tiers, private endpoints aren't
+            # supported in instances injected in an internal or external virtual
+            # network." The completion evidence is therefore the injected private
+            # topology (Internal mode, approved subnet, no PE) rather than an
+            # approved private endpoint plus publicNetworkAccess=Disabled, which
+            # this topology can never reach.
+            Assert-CompletionCondition ($output.gateway.Contains('hostName') -and
+                -not [string]::IsNullOrWhiteSpace($output.gateway.hostName)) 'The deployed gateway hostname is required.'
             $path = Join-Path $PSScriptRoot 'Gateway.psm1'
-            Assert-CompletionCondition (Test-Path -LiteralPath $path -PathType Leaf) 'Gateway private/PNA verifier is required before completion.'
+            Assert-CompletionCondition (Test-Path -LiteralPath $path -PathType Leaf) 'Gateway injected-topology verifier is required before completion.'
             Import-Module $path -ErrorAction Stop
             $request = {
                 param($method, $url, $body, $headers)
@@ -209,18 +215,17 @@ function New-CompletionAdapter {
                 return @{ StatusCode = 200; Body = $value; Headers = @{} }
             }.GetNewClosure()
             $plan = Get-GatewayDeploymentPlan -ServiceResourceId $output.gateway.resourceId -EnvironmentName $resolution.environment -WorkloadKey $resolution.profile.gateway.workloadKey -Request $request
-            Assert-CompletionCondition ($plan.observedState -ceq 'Private' -and -not $plan.initialProvisioning) 'Gateway is absent or not privately completed.'
+            Assert-CompletionCondition ($plan.observedState -ceq 'Injected' -and -not $plan.initialProvisioning) 'Gateway is absent or not settled in the injected private topology.'
             $service = & $armGet $output.gateway.resourceId '2024-05-01'
-            $approved = @($service.properties.privateEndpointConnections | Where-Object {
-                $_.properties.privateLinkServiceConnectionState.status -ceq 'Approved'
-            })
-            Assert-CompletionCondition ($approved.Count -eq 1) 'Exactly the owned approved gateway private connection is required.'
-            Assert-CompletionCondition ($approved[0].properties.privateEndpoint.id -ieq $privateEndpointResourceId) 'The approved gateway private endpoint differs from the deployed output.'
-            $verified = Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $privateEndpointResourceId `
-                -Request $request -MaxAttempts 1 -RetryDelaySeconds 0
+            $connections = @()
+            if ($service.properties.Contains('privateEndpointConnections') -and $service.properties.privateEndpointConnections) {
+                $connections = @($service.properties.privateEndpointConnections)
+            }
+            Assert-CompletionCondition ($connections.Count -eq 0) 'An injected gateway must carry no private endpoint connection; classic VNet injection does not support one.'
+            Assert-CompletionCondition ($service.properties.virtualNetworkType -ceq 'Internal') 'Gateway must be injected in Internal virtual network mode to keep the data plane off public DNS.'
+            $verified = Complete-GatewayActivation -Plan $plan -Request $request -MaxAttempts 1 -RetryDelaySeconds 0
             Assert-CompletionCondition ($verified.status -ceq 'VerifiedControlPlane' -and
-                $verified.privateEndpointResourceId -ieq $privateEndpointResourceId -and
-                $verified.publicNetworkAccess -ceq 'Disabled' -and -not $verified.changed) 'Gateway private control-plane verification did not complete without mutation.'
+                $verified.virtualNetworkType -ceq 'Internal' -and -not $verified.changed) 'Gateway injected-topology verification did not complete without mutation.'
             return @{ privateReady = $true }
         }
     }

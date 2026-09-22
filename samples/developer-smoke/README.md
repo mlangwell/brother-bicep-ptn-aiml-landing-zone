@@ -175,9 +175,13 @@ active healthy revision, immutable digest, workload identity, required deployed
 settings, and this starter's health/readiness identity and source SHA. It never
 calls `az containerapp update`, deploys an image, or creates a public exception.
 The P3 integration calls `Get-GatewayDeploymentPlan` and
-`Complete-GatewayPrivateAccess` **without `-Apply`**, requires
-`VerifiedControlPlane`/disabled PNA with no change, and supplies a GET-only
-management transport. Authenticated management reads retain server ETags for
+`Complete-GatewayActivation` **without `-Apply`**, requires
+`VerifiedControlPlane` with `virtualNetworkType: 'Internal'` and no change, and
+supplies a GET-only management transport. The gateway uses classic VNet
+injection, so there is no private endpoint to approve and no public-access flag
+to disable; the verified invariants are Internal mode, the approved injection
+subnet, and the absence of any private endpoint connection. Authenticated
+management reads retain server ETags for
 P3's owned-entity observations. Backend public access and local-key
 authentication must also be disabled.
 

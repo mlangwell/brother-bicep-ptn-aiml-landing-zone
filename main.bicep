@@ -98,6 +98,12 @@ param apiManagementConfiguration object = {}
 @maxLength(24)
 param apiManagementWorkloadKey string = take(toLower(uniqueString(resourceGroup().id)), 12)
 
+@description('Resource ID of an existing, platform-owned API Management gateway to consume instead of creating one. API Management is per-subscription platform infrastructure with a much longer lifecycle than a landing zone, so the recommended topology is to deploy the gateway once per subscription (see platform/api-management/main.bicep) and point every landing zone at it. When supplied, this landing zone creates NO gateway, NO integration subnet and NO integration NSG; it only creates its own workload-scoped API, backend, logger and named values inside the shared gateway. The gateway may live in a different resource group in the same subscription.')
+param existingApiManagementResourceId string?
+
+@description('System-assigned principal ID of the existing API Management gateway, taken from the platform template `principalId` output. Required when `existingApiManagementResourceId` is supplied, because the landing zone must grant that identity the backend inference and telemetry roles on its own resources. It is passed in rather than read so the template never calls `.properties` against a cross-resource-group `existing` reference.')
+param existingApiManagementPrincipalId string?
+
 @description('Opt in to the release-owned developer application and private completion contract. This profile removes executor and application direct Foundry inference grants; privileged deployment access is configured separately by platform bootstrap.')
 param enableDeveloperExperience bool = false
 
@@ -1247,8 +1253,28 @@ var _apiManagementName = !empty(apiManagementConfiguration.?name ?? '')
   : (resourceNamingMode == 'caf'
       ? cafTrim('${const.abbrs.integration.apiManagement}${_cafNameStem}', 50)
       : '${const.abbrs.integration.apiManagement}${resourceToken}')
+
+// ----------------------------------------------------------------------
+// Shared platform gateway (BYO) derivations
+// ----------------------------------------------------------------------
+// Mirrors the existingLogAnalyticsWorkspaceResourceId pattern above. When the
+// operator supplies a platform-owned gateway we create no service, no
+// integration subnet and no integration NSG — those belong to the platform
+// template — and deploy only this landing zone's workload-scoped children into
+// the gateway's own resource group.
+//
+// Cross-RG-safe: the gateway's principal ID is supplied as a parameter and is
+// never read off an `existing` reference.
+var _hasExistingApiManagement = !empty(existingApiManagementResourceId ?? '')
+var _createApiManagement      = deployApiManagement && !_hasExistingApiManagement
+var _apimSegments             = _hasExistingApiManagement ? split(existingApiManagementResourceId!, '/') : ['']
+var _apimSubscriptionId       = length(_apimSegments) >= 3 ? _apimSegments[2] : subscription().subscriptionId
+var _apimResourceGroupName    = length(_apimSegments) >= 5 ? _apimSegments[4] : resourceGroup().name
+var _effectiveApiManagementName = _hasExistingApiManagement ? last(_apimSegments) : _apiManagementName
+var _apiManagementPrincipalId = existingApiManagementPrincipalId ?? ''
+
 var _inferenceGatewayApiPath = 'inference/${apiManagementWorkloadKey}'
-var _inferenceGatewayEndpoint = deployApiManagement ? 'https://${_apiManagementName}.azure-api.net/${_inferenceGatewayApiPath}/v1/responses' : ''
+var _inferenceGatewayEndpoint = deployApiManagement ? 'https://${_effectiveApiManagementName}.azure-api.net/${_inferenceGatewayApiPath}/v1/responses' : ''
 
 var _developerRuntimeSettings = enableDeveloperExperience ? [
   { name: 'INFERENCE_ACCESS_MODE', value: 'gateway', label: appConfigLabel, contentType: 'text/plain' }
@@ -1483,7 +1509,16 @@ var baseSubnets = [
       }
 ]
 
-module apiManagementNsg 'modules/networking/network-security-group.bicep' = if (deployApiManagement && (!useExistingVNet || deploySubnets)) {
+// The injection subnet and its NSG belong to whoever owns the gateway. On the
+// BYO path the gateway lives in the platform VNet, so the landing zone must not
+// carve a subnet out of its own spoke for a service it does not own.
+//
+// This NSG is NOT the shared empty-rule helper. Classic VNet injection requires
+// explicit rules, because "the load balancer used internally by API Management
+// is secure by default and rejects all inbound traffic". The rule set is shared
+// with platform/api-management/network.bicep so the two gateway creation paths
+// cannot drift apart.
+module apiManagementNsg 'modules/networking/api-management-injection-nsg.bicep' = if (_createApiManagement && (!useExistingVNet || deploySubnets)) {
   name: 'apiManagementIntegrationNsg'
   params: {
     name: '${const.abbrs.networking.networkSecurityGroup}${_apiManagementName}'
@@ -1491,14 +1526,31 @@ module apiManagementNsg 'modules/networking/network-security-group.bicep' = if (
   }
 }
 
-var subnets = concat(baseSubnets, deployApiManagement ? [
+// NOTE on delegation: this subnet MUST NOT be delegated. Classic VNet injection
+// requires an undelegated subnet - Learn: "The subnet used to connect to the API
+// Management instance shouldn't have any delegations enabled." The previous
+// Microsoft.Web/serverFarms delegation belonged to the v2 outbound-integration
+// model and is fatal here.
+//
+// NOTE on routing: _effectiveRouteTableId may send 0.0.0.0/0 to the hub
+// firewall. When it does, that route table MUST also carry a route for the
+// ApiManagement service tag with next hop type Internet, or the gateway's
+// control-plane responses cannot map back symmetrically and the deployment
+// fails. Service endpoints below keep the hard dependencies off the tunnelled
+// path, as Learn strongly recommends for force-tunnelled injection subnets.
+var subnets = concat(baseSubnets, _createApiManagement ? [
   {
     name: apiManagementConfiguration.integrationSubnetName
     addressPrefix: apiManagementConfiguration.integrationSubnetPrefix
-    delegation: 'Microsoft.Web/serverFarms'
+    delegation: ''
     networkSecurityGroupResourceId: (!useExistingVNet || deploySubnets) ? apiManagementNsg!.outputs.id : ''
     routeTableResourceId: _effectiveRouteTableId
-    serviceEndpoints: []
+    serviceEndpoints: [
+      'Microsoft.Storage'
+      'Microsoft.Sql'
+      'Microsoft.KeyVault'
+      'Microsoft.EventHub'
+    ]
   }
 ] : [])
 
@@ -3343,7 +3395,7 @@ module storageAccount 'br/public:avm/res/storage/storage-account:0.26.2' = if (d
 // ROLE ASSIGNMENTS
 //////////////////////////////////////////////////////////////////////////
 
-module apiManagement 'modules/api-management/main.bicep' = if (deployApiManagement) {
+module apiManagement 'modules/api-management/main.bicep' = if (_createApiManagement) {
   name: 'apiManagementDeployment'
   params: {
     name: _apiManagementName
@@ -3367,7 +3419,6 @@ module apiManagement 'modules/api-management/main.bicep' = if (deployApiManageme
       callerMappings: apiManagementConfiguration.callerMappings
     }
     integrationSubnetResourceId: '${virtualNetworkResourceId}/subnets/${apiManagementConfiguration.integrationSubnetName}'
-    privateEndpointSubnetResourceId: _peSubnetId
     backendAccountResourceId: aiFoundryAccountResourceId
     backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
     applicationInsightsResourceId: _appInsightsResourceId
@@ -3381,6 +3432,70 @@ module apiManagement 'modules/api-management/main.bicep' = if (deployApiManageme
   dependsOn: [
     virtualNetworkSubnets
   ]
+}
+
+// ---------------------------------------------------------------------------
+// Shared platform gateway (BYO) — workload-scoped children only
+// ---------------------------------------------------------------------------
+// The gateway is owned by the platform template and may sit in a different
+// resource group, so these children are deployed AT the gateway's scope. The
+// previous current-resource-group `existing` lookup could not reach it.
+module apiManagementWorkload 'modules/api-management/workload.bicep' = if (deployApiManagement && _hasExistingApiManagement) {
+  name: 'apiManagementWorkloadDeployment'
+  scope: resourceGroup(_apimSubscriptionId, _apimResourceGroupName)
+  params: {
+    apiManagementName: _effectiveApiManagementName
+    environmentName: environmentName
+    workloadKey: apiManagementWorkloadKey
+    tenantId: tenant().tenantId
+    configuration: {
+      enabled: true
+      name: _effectiveApiManagementName
+      sku: apiManagementConfiguration.sku
+      capacity: apiManagementConfiguration.capacity
+      publisherEmail: apiManagementConfiguration.publisherEmail
+      publisherName: apiManagementConfiguration.publisherName
+      audience: apiManagementConfiguration.audience
+      integrationSubnetName: apiManagementConfiguration.integrationSubnetName
+      integrationSubnetPrefix: apiManagementConfiguration.integrationSubnetPrefix
+      privateDnsZoneResourceId: apiManagementConfiguration.privateDnsZoneResourceId
+      stopNewRequests: apiManagementConfiguration.stopNewRequests
+      foundryIntegration: apiManagementConfiguration.?foundryIntegration ?? false
+      callerMappings: apiManagementConfiguration.callerMappings
+    }
+    backendAccountResourceId: aiFoundryAccountResourceId
+    backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
+    applicationInsightsResourceId: _appInsightsResourceId
+    initialProvisioning: apiManagementConfiguration.?initialProvisioning ?? false
+  }
+  dependsOn: [
+    apiManagementSharedGatewayRoles
+  ]
+}
+
+// The gateway identity needs inference and telemetry rights on THIS landing
+// zone's resources, so the assignments stay at the landing zone's scope even
+// though the gateway itself is elsewhere. The principal ID arrives as a
+// parameter; it is never read from a cross-resource-group existing reference.
+module apiManagementSharedGatewayRoles 'modules/security/resource-role-assignment.bicep' = if (deployApiManagement && _hasExistingApiManagement && !empty(_apiManagementPrincipalId)) {
+  name: 'apiManagementSharedGatewayRoles'
+  params: {
+    name: 'ailz-inference-${environmentName}-${apiManagementWorkloadKey}'
+    roleAssignments: [
+      {
+        resourceId: aiFoundryAccountResourceId
+        roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesOpenAIUser.guid)
+        principalId: _apiManagementPrincipalId
+        principalType: 'ServicePrincipal'
+      }
+      {
+        resourceId: _appInsightsResourceId
+        roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.MonitoringMetricsPublisher.guid)
+        principalId: _apiManagementPrincipalId
+        principalType: 'ServicePrincipal'
+      }
+    ]
+  }
 }
 
 // Role assignments are centralized in this section to make it easier to view all permissions granted in this template.
@@ -4111,8 +4226,20 @@ output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
   applications: _developerApplications
   gateway: {
     accessMode: 'gateway'
-    resourceId: deployApiManagement ? resourceId('Microsoft.ApiManagement/service', _apiManagementName) : ''
-    privateEndpointResourceId: deployApiManagement ? apiManagement!.outputs.privateEndpointResourceId : ''
+    resourceId: deployApiManagement
+      ? (_hasExistingApiManagement
+          ? existingApiManagementResourceId!
+          : resourceId('Microsoft.ApiManagement/service', _apiManagementName))
+      : ''
+    // Classic VNet injection has no inbound private endpoint - Learn: "In the
+    // classic API Management tiers, private endpoints aren't supported in
+    // instances injected in an internal or external virtual network." Privacy
+    // is delivered by Internal mode, and the completion evidence that matters
+    // is therefore the gateway hostname plus the private VIP the operator must
+    // publish in DNS, not a private endpoint approval.
+    hostName: deployApiManagement ? '${_effectiveApiManagementName}.azure-api.net' : ''
+    privateIpAddress: _createApiManagement ? apiManagement!.outputs.gatewayPrivateIpAddress : ''
+    networkModel: deployApiManagement ? 'classic-vnet-injection' : ''
     endpoint: _inferenceGatewayEndpoint
     audience: apiManagementConfiguration.audience
     backendResourceId: aiFoundryAccountResourceId

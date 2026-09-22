@@ -117,11 +117,11 @@ function Import-ReleaseImage {
     $context.imports++
     return @{digest=$Resolved.profile.release.imageDigest;executed=$true}
 }
-function Complete-GatewayPrivateAccess {
-    param($Plan,$PrivateEndpointResourceId,$Request,[switch]$Apply,[bool]$StopNewRequests,[switch]$Confirm)
+function Complete-GatewayActivation {
+    param($Plan,$Request,[switch]$Apply,[bool]$StopNewRequests,[switch]$Confirm)
     if (-not $Apply) { throw 'Gateway completion was not explicitly requested.' }
     $context.gatewayCompletions++
-    return @{status='VerifiedControlPlane';publicNetworkAccess='Disabled';stopControlVerified=$true;stopNewRequests=$StopNewRequests}
+    return @{status='VerifiedControlPlane';virtualNetworkType='Internal';networkModel='classic-vnet-injection';publicNetworkAccess='Enabled';stopControlVerified=$true;stopNewRequests=$StopNewRequests}
 }
 function Invoke-DeveloperCompletion {
     param($Resolution,$DeploymentOutput,[switch]$Execute)

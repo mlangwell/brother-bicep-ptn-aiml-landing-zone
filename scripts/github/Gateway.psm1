@@ -76,8 +76,23 @@ function Assert-GatewayConfiguration {
     if ($encodedLength -gt 4096 -or $configuration.audience.Length -gt 4096) {
         throw 'Gateway encoded configuration exceeds the APIM named-value limit (4096 characters). Reduce explicit mappings or implement a separately reviewed configuration layout.'
     }
-    if (-not $configuration.privateDnsZoneResourceId.EndsWith('/providers/Microsoft.Network/privateDnsZones/privatelink.azure-api.net', [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Gateway requires the approved privatelink.azure-api.net private DNS zone.'
+    # ---------------------------------------------------------------------
+    # Private DNS zone contract - classic VNet injection
+    # ---------------------------------------------------------------------
+    # Injected instances cannot hold a private endpoint, so privatelink.azure-api.net
+    # does not apply. Internal mode registers NOTHING on public DNS, so the
+    # operator must publish a service-scoped zone instead. Learn is also explicit
+    # that a zone for the shared apex domain is unsupported and actively harmful:
+    # "Do not create a Private DNS zone or forward lookup zone for azure-api.net."
+    $zoneName = ($configuration.privateDnsZoneResourceId -split '/')[-1]
+    if ($zoneName -ieq 'azure-api.net') {
+        throw 'Gateway must never use a private DNS zone for the apex azure-api.net domain. It is a shared public Azure domain; an apex private zone becomes authoritative inside the VNet and breaks resolution for other Azure services.'
+    }
+    if ($zoneName -ieq 'privatelink.azure-api.net') {
+        throw 'Gateway uses classic VNet injection, which cannot hold a private endpoint, so a privatelink.azure-api.net zone does not apply. Supply the service-scoped <service>.azure-api.net zone instead.'
+    }
+    if ($zoneName -cne "$($ServiceName.ToLowerInvariant()).azure-api.net") {
+        throw "Gateway requires the service-scoped private DNS zone $($ServiceName.ToLowerInvariant()).azure-api.net, holding an apex (@) A record for the instance private VIP."
     }
 }
 
@@ -182,72 +197,118 @@ function Get-GatewayOwnedChildren {
     return ,@($facts | Sort-Object kind, name)
 }
 
+function Assert-GatewayInjection {
+    <#
+    .SYNOPSIS
+    Assert the privacy invariants that actually apply to a classic injected gateway.
+    .DESCRIPTION
+    This replaces the private-endpoint assertions used by the previous v2 shape.
+    On classic VNet injection a private endpoint CANNOT exist (Learn: "In the
+    classic API Management tiers, private endpoints aren't supported in instances
+    injected in an internal or external virtual network"), and public network
+    access CANNOT be disabled (Learn: "You can disable public network access in
+    API Management instances configured with a private endpoint, not with other
+    networking configurations").
+
+    So asserting publicNetworkAccess=Disabled here would be unsatisfiable. The
+    properties that genuinely deliver inbound privacy on this topology are:
+      - virtualNetworkType is Internal, so no endpoint is on public DNS, and
+      - the instance is attached to the approved undelegated injection subnet.
+    Both are checked, plus the negative: no private endpoint has appeared.
+    #>
+    param(
+        [Parameter(Mandatory)][Collections.IDictionary]$Service,
+        [AllowNull()][AllowEmptyString()][string]$InjectionSubnetResourceId = $null
+    )
+    $virtualNetworkType = if ($Service.properties.Contains('virtualNetworkType')) { $Service.properties['virtualNetworkType'] } else { $null }
+    if ($virtualNetworkType -cne 'Internal') {
+        throw "Gateway must be injected in Internal virtual network mode; observed '$virtualNetworkType'. External publishes the gateway to the internet and None means it is not injected at all, so neither keeps the data plane private."
+    }
+    $configuredSubnet = $null
+    if ($Service.properties.Contains('virtualNetworkConfiguration') -and
+        $Service.properties.virtualNetworkConfiguration -is [Collections.IDictionary]) {
+        $configuredSubnet = $Service.properties.virtualNetworkConfiguration['subnetResourceId']
+    }
+    if ([string]::IsNullOrWhiteSpace($configuredSubnet)) {
+        throw 'Gateway reports Internal mode without an injection subnet; the observed network configuration is incoherent and must not be treated as private.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($InjectionSubnetResourceId) -and $configuredSubnet -ine $InjectionSubnetResourceId) {
+        throw 'Gateway is injected into a subnet other than the approved injection subnet; preserve it and obtain a dedicated-scope decision rather than moving a live gateway.'
+    }
+    $connections = @()
+    if ($Service.properties.Contains('privateEndpointConnections') -and $Service.properties.privateEndpointConnections) {
+        $connections = @($Service.properties.privateEndpointConnections)
+    }
+    if ($connections.Count -gt 0) {
+        throw 'Gateway has a private endpoint connection, which classic VNet injection does not support. Investigate before proceeding; this indicates the instance is not the topology this automation manages.'
+    }
+    return $configuredSubnet
+}
+
 function Get-GatewayDeploymentPlan {
     <#
     .SYNOPSIS
-    Observe absent, interrupted-public, public-with-PE or private state; never writes.
+    Observe absent, interrupted or injected gateway state; never writes.
     .DESCRIPTION
     Request is the parent's authorized ARM transport: (method, absolute URI,
     body, headers) -> IDictionary { StatusCode; Body; Headers }. It must not log
     tokens/response bodies. Freeze this whole result alongside resolved inputs.
-    Only absence or an owned already-public service without an approved PE may
-    use initial=true. P4 readiness still requires observedState=Private.
+
+    There is no public-then-private transition on this topology: an injected
+    Internal-mode gateway is private from the moment it exists. `initialProvisioning`
+    therefore no longer gates public network access. It means "this is a first or
+    interrupted creation", and it holds the owned stop control on so the gateway
+    serves no request until the operator has published the private DNS A record.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ServiceResourceId,
         [Parameter(Mandatory)][ValidateSet('dev', 'test', 'prod')][string]$EnvironmentName,
         [Parameter(Mandatory)][ValidatePattern('^[a-z0-9]{3,24}$')][string]$WorkloadKey,
-        [Parameter(Mandatory)][scriptblock]$Request
+        [Parameter(Mandatory)][scriptblock]$Request,
+        [AllowNull()][AllowEmptyString()][string]$InjectionSubnetResourceId = $null
     )
     Assert-GatewayResourceId $ServiceResourceId
     $owner = Get-GatewayOwnerName -EnvironmentName $EnvironmentName -WorkloadKey $WorkloadKey
     $apiPath = Get-GatewayApiPath -WorkloadKey $WorkloadKey
     $service = Get-GatewayService $ServiceResourceId $EnvironmentName $Request -AllowAbsent -Owner $owner
-    $scope = $ServiceResourceId -replace '/providers/.*$', ''
-    $privateEndpointId = "$scope/providers/Microsoft.Network/privateEndpoints/$(($ServiceResourceId -split '/')[-1])-inbound"
-    $privateEndpoint = $null
     $observedState = 'Absent'
     $initialProvisioning = $true
+    $injectionSubnet = ''
     $facts = @()
-    if ($null -eq $service) {
-        $peResponse = Invoke-GatewayRequest $Request GET $privateEndpointId
-        if ($peResponse.StatusCode -ne 404 -or -not $peResponse.Body.Contains('error') -or
-            $peResponse.Body.error -isnot [Collections.IDictionary] -or $peResponse.Body.error['code'] -notin @('ResourceNotFound', 'ResourceGroupNotFound')) {
-            throw 'Gateway initial provisioning requires an absent owned-name private endpoint; inspect the existing endpoint or failed read before planning recovery.'
-        }
-    }
-    else {
+    if ($null -ne $service) {
         $access = $service.properties.publicNetworkAccess
         if ($access -cnotin @('Enabled', 'Disabled')) { throw 'Gateway returned an unsupported public network access state.' }
-        $approvedConnections = @()
-        if ($service.properties.Contains('privateEndpointConnections')) {
-            $approvedConnections = @($service.properties.privateEndpointConnections | Where-Object { $_.properties.privateLinkServiceConnectionState.status -ceq 'Approved' })
+        if ($service.properties.provisioningState -cnotin @('Succeeded', 'Failed', 'Canceled')) {
+            throw 'Gateway provisioning is still in progress; wait and re-observe before planning.'
         }
-        $initialProvisioning = $access -ceq 'Enabled' -and $approvedConnections.Count -eq 0
-        if ($initialProvisioning) {
-            if ($service.properties.provisioningState -cnotin @('Succeeded', 'Failed', 'Canceled')) { throw 'Gateway provisioning is still in progress; wait and re-observe before recovery.' }
-            $observedState = 'PublicPendingPrivateEndpoint'
-            $privateEndpoint = Assert-GatewayPrivateEndpoint $service $privateEndpointId $Request -AllowUnapproved -AllowAbsent -Owner $owner
+        $injectionSubnet = Assert-GatewayInjection -Service $service -InjectionSubnetResourceId $InjectionSubnetResourceId
+        if ($service.properties.provisioningState -ceq 'Succeeded') {
+            $observedState = 'Injected'
+            $initialProvisioning = $false
         }
         else {
-            if ($service.properties.provisioningState -cne 'Succeeded') { throw 'Gateway is not in a stable provisioning state.' }
-            $observedState = if ($access -ceq 'Disabled') { 'Private' } else { 'PublicPendingDisable' }
-            $privateEndpoint = Assert-GatewayPrivateEndpoint $service $privateEndpointId $Request -Owner $owner
+            # An owned failed/cancelled creation is resumable. It is NOT a
+            # private-to-public regression, because Internal mode is set at
+            # creation and a redeploy cannot silently publish the gateway.
+            $observedState = 'InterruptedProvisioning'
+            $initialProvisioning = $true
         }
         $facts = Get-GatewayOwnedChildren $ServiceResourceId $owner $Request -ApiPath $apiPath
     }
     return [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         serviceResourceId = $ServiceResourceId
-        privateEndpointResourceId = $privateEndpointId
+        networkModel = 'classic-vnet-injection'
+        virtualNetworkType = 'Internal'
+        injectionSubnetResourceId = $injectionSubnet
         environmentName = $EnvironmentName
         workloadKey = $WorkloadKey
         owner = $owner
         apiPath = $apiPath
         observedState = $observedState
         initialProvisioning = $initialProvisioning
-        observedStateHash = Get-CanonicalHash @{ service = $service; privateEndpoint = $privateEndpoint; ownedChildren = $facts }
+        observedStateHash = Get-CanonicalHash @{ service = $service; ownedChildren = $facts }
         ownedChildren = $facts
     }
 }
@@ -255,40 +316,14 @@ function Get-GatewayDeploymentPlan {
 function Assert-GatewayDeploymentPlan {
     [CmdletBinding()]
     param([Parameter(Mandatory)][Collections.IDictionary]$Plan, [Parameter(Mandatory)][scriptblock]$Request)
-    if ($Plan.schemaVersion -ne 1 -or $Plan.owner -cne (Get-GatewayOwnerName -EnvironmentName $Plan.environmentName -WorkloadKey $Plan.workloadKey) -or
+    if ($Plan.schemaVersion -ne 2 -or $Plan.owner -cne (Get-GatewayOwnerName -EnvironmentName $Plan.environmentName -WorkloadKey $Plan.workloadKey) -or
         $Plan.apiPath -cne (Get-GatewayApiPath -WorkloadKey $Plan.workloadKey) -or
-        $Plan.observedState -cnotin @('Absent', 'PublicPendingPrivateEndpoint', 'PublicPendingDisable', 'Private') -or
-        $Plan.initialProvisioning -ne ($Plan.observedState -cin @('Absent', 'PublicPendingPrivateEndpoint'))) { throw 'Invalid gateway state plan.' }
-    $current = Get-GatewayDeploymentPlan -ServiceResourceId $Plan.serviceResourceId -EnvironmentName $Plan.environmentName -WorkloadKey $Plan.workloadKey -Request $Request
+        $Plan.networkModel -cne 'classic-vnet-injection' -or
+        $Plan.observedState -cnotin @('Absent', 'InterruptedProvisioning', 'Injected') -or
+        $Plan.initialProvisioning -ne ($Plan.observedState -cin @('Absent', 'InterruptedProvisioning'))) { throw 'Invalid gateway state plan.' }
+    $current = Get-GatewayDeploymentPlan -ServiceResourceId $Plan.serviceResourceId -EnvironmentName $Plan.environmentName `
+        -WorkloadKey $Plan.workloadKey -Request $Request -InjectionSubnetResourceId $Plan.injectionSubnetResourceId
     if ($current.observedStateHash -cne $Plan.observedStateHash) { throw 'Gateway plan is stale; repeat preview and approval with observed state.' }
-}
-
-function Assert-GatewayPrivateEndpoint {
-    param([Collections.IDictionary]$Service, [string]$PrivateEndpointResourceId, [scriptblock]$Request, [switch]$AllowUnapproved, [switch]$AllowAbsent, [AllowNull()][string]$Owner = $null)
-    $response = Invoke-GatewayRequest $Request GET $PrivateEndpointResourceId '2024-05-01'
-    if ($response.StatusCode -eq 404 -and $AllowAbsent -and $response.Body.Contains('error') -and
-        $response.Body.error -is [Collections.IDictionary] -and $response.Body.error['code'] -in @('ResourceNotFound', 'ResourceGroupNotFound')) { return $null }
-    if ($response.StatusCode -ne 200) { throw "Gateway private endpoint read failed (HTTP $($response.StatusCode))." }
-    $pe = $response.Body
-    if ($pe.id -ine $PrivateEndpointResourceId -or (-not $AllowUnapproved -and $pe.properties.provisioningState -cne 'Succeeded')) { throw 'Gateway private endpoint is not provisioned.' }
-    if (-not $pe.Contains('tags')) { throw 'Gateway private endpoint ownership conflict.' }
-    Assert-GatewayOwnership $pe.tags $Service.tags['ailz-environment'] 'private endpoint' $Owner
-    $connections = if ($pe.properties.Contains('privateLinkServiceConnections')) { @($pe.properties.privateLinkServiceConnections) } else { @() }
-    if ($pe.properties.Contains('manualPrivateLinkServiceConnections')) { $connections += @($pe.properties.manualPrivateLinkServiceConnections) }
-    $targets = @($connections | Where-Object { $_.properties.privateLinkServiceId -ieq $Service.id -and @($_.properties.groupIds) -icontains 'Gateway' })
-    if ($targets.Count -ne 1 -or $connections.Count -ne 1) { throw 'Gateway private endpoint target is conflicting or ambiguous.' }
-    $approved = @($connections | Where-Object {
-        $_.properties.privateLinkServiceId -ieq $Service.id -and
-        @($_.properties.groupIds) -icontains 'Gateway' -and
-        $_.properties.privateLinkServiceConnectionState.status -ceq 'Approved'
-    })
-    $serviceConnections = if ($Service.properties.Contains('privateEndpointConnections')) { @($Service.properties.privateEndpointConnections) } else { @() }
-    $approvedService = @($serviceConnections | Where-Object {
-        $_.properties.privateEndpoint.id -ieq $PrivateEndpointResourceId -and
-        $_.properties.privateLinkServiceConnectionState.status -ceq 'Approved'
-    })
-    if (-not $AllowUnapproved -and ($approved.Count -ne 1 -or $approvedService.Count -ne 1)) { throw 'Gateway private endpoint must be Approved on both resource sides before disabling public access.' }
-    return $pe
 }
 
 function Get-GatewayStopValue {
@@ -312,25 +347,39 @@ function Get-GatewayStopValue {
     return @{ resourceId = $id; value = $value.Body.value; etag = $valueEtag; stable = $metadataEtag -ceq $valueEtag }
 }
 
-function Complete-GatewayPrivateAccess {
+function Complete-GatewayActivation {
     <#
     .SYNOPSIS
-    Plan or explicitly apply the public-disable completion of an owned gateway.
+    Verify an owned injected gateway's private topology and reconcile its stop control.
     .DESCRIPTION
-    No resource creation/deletion, PE approval, public enable, or global-policy
-    change is performed. Service PATCH has no documented If-Match contract:
-    the parent must hold the environment mutation lease. Re-read ownership and
-    PE state on every retry; return success only after a Succeeded/Disabled GET.
-    Optional StopNewRequests explicitly restores and verifies the approved
-    Boolean after private completion. It uses only the owned nonsecret stop
-    entity: GET metadata, POST listValue, and If-Match-protected value-only PATCH.
-    Without Apply this function remains GET-only, including with StopNewRequests.
-    DNS/connectivity, backend permissions and inference are separate live gates.
+    Replaces the former Complete-GatewayPrivateAccess. On classic VNet injection
+    there is no public-disable step to perform, because there is no private
+    endpoint to enable one. Learn: "In the classic API Management tiers, private
+    endpoints aren't supported in instances injected in an internal or external
+    virtual network", and "You can disable public network access in API
+    Management instances configured with a private endpoint, not with other
+    networking configurations".
+
+    Privacy on this topology is established at CREATION by virtualNetworkType
+    Internal - "None of the API Management endpoints are registered on the public
+    DNS" - so there is nothing to complete. What this function verifies instead is
+    that the observed instance really is Internal-mode, injected into the approved
+    subnet, carries no private endpoint, and has settled in Succeeded.
+
+    No resource creation/deletion, public-access change, or global-policy change
+    is performed. Optional StopNewRequests explicitly restores and verifies the
+    approved Boolean using only the owned nonsecret stop entity: GET metadata,
+    POST listValue, and If-Match-protected value-only PATCH. Without Apply this
+    function remains GET-only, including with StopNewRequests.
+
+    DNS resolution, backend permissions and live inference remain separate gates.
+    In particular this function CANNOT prove the operator created the private DNS
+    A record; an injected gateway with no DNS record is unreachable but otherwise
+    perfectly healthy from the control plane's point of view.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][Collections.IDictionary]$Plan,
-        [Parameter(Mandatory)][string]$PrivateEndpointResourceId,
         [Parameter(Mandatory)][scriptblock]$Request,
         [switch]$Apply,
         [bool]$StopNewRequests,
@@ -338,34 +387,41 @@ function Complete-GatewayPrivateAccess {
         [ValidateRange(0, 30)][int]$RetryDelaySeconds = 10
     )
     Assert-GatewayResourceId $Plan.serviceResourceId
-    if ($Plan.schemaVersion -ne 1 -or $Plan.environmentName -cnotin @('dev', 'test', 'prod') -or
-        $Plan.owner -cne (Get-GatewayOwnerName -EnvironmentName $Plan.environmentName -WorkloadKey $Plan.workloadKey)) { throw 'Invalid gateway completion ownership plan.' }
-    $scope = $Plan.serviceResourceId -replace '/providers/.*$', ''
-    $expectedPe = "$scope/providers/Microsoft.Network/privateEndpoints/$(($Plan.serviceResourceId -split '/')[-1])-inbound"
-    if ($PrivateEndpointResourceId -ine $expectedPe) { throw 'Gateway private endpoint is outside the owned resource scope/name.' }
+    if ($Plan.schemaVersion -ne 2 -or $Plan.environmentName -cnotin @('dev', 'test', 'prod') -or
+        $Plan.networkModel -cne 'classic-vnet-injection' -or
+        $Plan.owner -cne (Get-GatewayOwnerName -EnvironmentName $Plan.environmentName -WorkloadKey $Plan.workloadKey)) {
+        throw 'Invalid gateway completion ownership plan.'
+    }
     $restoreStop = $PSBoundParameters.ContainsKey('StopNewRequests')
     $desiredStop = if ($StopNewRequests) { 'true' } else { 'false' }
-    $mayWrite = $Apply -and $PSCmdlet.ShouldProcess($Plan.serviceResourceId, 'Complete private access and, when explicitly supplied, restore the approved stop control')
+    $mayWrite = $Apply -and $PSCmdlet.ShouldProcess($Plan.serviceResourceId, 'Reconcile the approved stop control on the owned injected gateway')
     $patchAccepted = $false
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $service = Get-GatewayService $Plan.serviceResourceId $Plan.environmentName $Request -Owner $Plan.owner
-        $null = Assert-GatewayPrivateEndpoint $service $PrivateEndpointResourceId $Request -Owner $Plan.owner
-        if ($service.properties.publicNetworkAccess -ceq 'Disabled' -and $service.properties.provisioningState -ceq 'Succeeded') {
+        if ($service.properties.publicNetworkAccess -cnotin @('Enabled', 'Disabled')) { throw 'Gateway returned an unsupported public network access state.' }
+        if ($service.properties.provisioningState -cin @('Failed', 'Canceled')) { throw 'Gateway provisioning failed; activation cannot declare success.' }
+        $injectionSubnet = Assert-GatewayInjection -Service $service -InjectionSubnetResourceId $Plan.injectionSubnetResourceId
+        $base = @{
+            serviceResourceId = $Plan.serviceResourceId
+            injectionSubnetResourceId = $injectionSubnet
+            virtualNetworkType = 'Internal'
+            networkModel = 'classic-vnet-injection'
+            publicNetworkAccess = $service.properties.publicNetworkAccess
+        }
+        if ($service.properties.provisioningState -ceq 'Succeeded') {
             if (-not $restoreStop) {
-                return @{ serviceResourceId = $Plan.serviceResourceId; privateEndpointResourceId = $PrivateEndpointResourceId; publicNetworkAccess = 'Disabled'; status = 'VerifiedControlPlane'; changed = $patchAccepted }
+                return $base + @{ status = 'VerifiedControlPlane'; changed = $patchAccepted }
             }
             if (-not $mayWrite) {
-                return @{ serviceResourceId = $Plan.serviceResourceId; privateEndpointResourceId = $PrivateEndpointResourceId; publicNetworkAccess = 'Disabled'; status = 'Planned'; action = 'ReconcileOwnedStopControl' }
+                return $base + @{ status = 'Planned'; action = 'ReconcileOwnedStopControl' }
             }
             $stop = Get-GatewayStopValue $Plan.serviceResourceId $Plan.owner $Request
             $latestService = Get-GatewayService $Plan.serviceResourceId $Plan.environmentName $Request -Owner $Plan.owner
-            $stillPrivate = $latestService.properties.publicNetworkAccess -ceq 'Disabled' -and $latestService.properties.provisioningState -ceq 'Succeeded'
-            if ($stop.stable -and $stillPrivate) {
-                $null = Assert-GatewayPrivateEndpoint $latestService $PrivateEndpointResourceId $Request -Owner $Plan.owner
+            $null = Assert-GatewayInjection -Service $latestService -InjectionSubnetResourceId $Plan.injectionSubnetResourceId
+            if ($stop.stable -and $latestService.properties.provisioningState -ceq 'Succeeded') {
                 if ($stop.value -ceq $desiredStop) {
-                    return @{
-                        serviceResourceId = $Plan.serviceResourceId; privateEndpointResourceId = $PrivateEndpointResourceId
-                        publicNetworkAccess = 'Disabled'; status = 'VerifiedControlPlane'; changed = $patchAccepted
+                    return $base + @{
+                        status = 'VerifiedControlPlane'; changed = $patchAccepted
                         stopControlVerified = $true; stopNewRequests = $StopNewRequests
                     }
                 }
@@ -375,18 +431,10 @@ function Complete-GatewayPrivateAccess {
             }
         }
         elseif (-not $mayWrite) {
-            return @{ serviceResourceId = $Plan.serviceResourceId; privateEndpointResourceId = $PrivateEndpointResourceId; publicNetworkAccess = $service.properties.publicNetworkAccess; status = 'Planned'; action = 'DisablePublicNetworkAccess' }
-        }
-        if ($service.properties.provisioningState -cin @('Failed', 'Canceled')) { throw 'Gateway provisioning failed; private completion cannot declare success.' }
-        if ($service.properties.publicNetworkAccess -cnotin @('Enabled', 'Disabled')) { throw 'Gateway returned an unsupported public network access state.' }
-        elseif ($service.properties.provisioningState -ceq 'Succeeded' -and $service.properties.publicNetworkAccess -ceq 'Enabled') {
-            $response = Invoke-GatewayRequest $Request PATCH $Plan.serviceResourceId '2024-05-01' @{ properties = @{ publicNetworkAccess = 'Disabled' } }
-            if ($response.StatusCode -in @(200, 202)) { $patchAccepted = $true }
-            elseif ($response.StatusCode -notin @(409, 412, 429, 503)) { throw "Gateway public-disable PATCH failed (HTTP $($response.StatusCode))." }
+            return $base + @{ status = 'Planned'; action = 'AwaitProvisioning' }
         }
         if ($attempt -lt $MaxAttempts -and $RetryDelaySeconds) { Start-Sleep -Seconds $RetryDelaySeconds }
     }
-    throw 'Gateway private completion exceeded its bounded retry budget; public-disable success was not verified.'
+    throw 'Gateway activation exceeded its bounded retry budget; verification did not complete.'
 }
-
-Export-ModuleMember -Function Assert-GatewayConfiguration, Get-GatewayDeploymentPlan, Assert-GatewayDeploymentPlan, Complete-GatewayPrivateAccess
+Export-ModuleMember -Function Assert-GatewayConfiguration, Get-GatewayDeploymentPlan, Assert-GatewayDeploymentPlan, Complete-GatewayActivation

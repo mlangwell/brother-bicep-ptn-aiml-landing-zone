@@ -230,14 +230,14 @@
           "pattern": "^[a-z0-9]+$",
           "description": "Landing-zone-scoped key that keeps the API name, API path, backend, logger and named values unique when several landing zones share one gateway. Lowercase alphanumeric so it is valid as both an APIM resource name segment and a URL path segment. Must be distinct per landing zone; it must NOT be derived from subscription+environment+location, because two landing zones in the same subscription, environment and region would then collide."
         },
-        "sku": { "type": "string", "enum": ["StandardV2", "PremiumV2"] },
+        "sku": { "type": "string", "enum": ["Developer", "Premium"], "description": "Classic VNet injection tiers. Developer for sandbox/dev/test (no SLA, capped at one unit); Premium for production. Both use the identical injection model, so one topology serves every subscription. The v2 tiers are rejected: Standard v2 cannot be injected at all, and Premium v2 uses a different delegated-subnet model with no migration path from classic." },
         "capacity": { "$ref": "#/definitions/positiveInteger" },
         "publisherEmail": { "$ref": "#/definitions/email" },
         "publisherName": { "$ref": "#/definitions/nonblank" },
         "audience": { "$ref": "#/definitions/audience" },
         "integrationSubnetName": { "$ref": "#/definitions/resourceName" },
         "integrationSubnetPrefix": { "$ref": "#/definitions/cidr" },
-        "privateDnsZoneResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "privateDnsZoneResourceId": { "$ref": "#/definitions/gatewayPrivateDnsId" },
         "stopNewRequests": { "type": "boolean" },
         "foundryIntegration": { "type": "boolean", "const": false, "default": false },
         "callerMappings": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/callerMapping" } }
@@ -276,6 +276,14 @@
     "subnetId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.Network/virtualNetworks/[A-Za-z0-9_.-]+/subnets/[A-Za-z0-9_.-]+$" }] },
     "routeTableId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.Network/routeTables/[A-Za-z0-9_.-]+$" }] },
     "privateDnsId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.Network/privateDnsZones/[a-z0-9.-]+$" }] },
+    "gatewayPrivateDnsId": {
+      "description": "Service-scoped private DNS zone for a classic VNet-injected API Management gateway: <gateway-name>.azure-api.net, holding an apex (@) A record for the instance private VIP. Internal mode registers nothing on public DNS, so this zone is what makes the gateway reachable. A privatelink.azure-api.net zone is INVALID here because injected classic instances cannot hold a private endpoint, and a zone for the bare apex azure-api.net is forbidden by Learn: it is a shared public Azure domain and an apex private zone breaks resolution for other Azure services.",
+      "allOf": [
+        { "$ref": "#/definitions/armId" },
+        { "pattern": "/providers/Microsoft\\.Network/privateDnsZones/[a-z0-9-]+\\.azure-api\\.net$" },
+        { "not": { "pattern": "/privateDnsZones/privatelink\\.azure-api\\.net$" } }
+      ]
+    },
     "actionGroupId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/[Mm]icrosoft\\.[Ii]nsights/actionGroups/[A-Za-z0-9_.-]+$" }] },
     "identity": {
       "type": "object",

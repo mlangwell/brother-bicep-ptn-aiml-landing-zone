@@ -383,15 +383,20 @@ namespace P3GatewayTests {
     }
     $configurationNode.value = $priorConfiguration
 
+    # Classic VNet injection state model. There is no Public->Private transition
+    # to simulate: an injected Internal-mode instance is private from creation,
+    # and publicNetworkAccess can never be Disabled because Azure permits that
+    # only on instances holding a private endpoint, which injection forbids.
+    $injectionSubnetId = ($serviceId -replace '/providers/.*$', '') + '/providers/Microsoft.Network/virtualNetworks/synthetic-spoke/subnets/synthetic-apim-integration'
     $arm = @{
         calls = [Collections.Generic.List[object]]::new()
         state = 'Absent'
-        approvedPe = $true
         conflicts = 0
         ownerTag = $owner
         children = @{}
-        peTarget = $serviceId
-        peCollision = $false
+        virtualNetworkType = 'Internal'
+        injectionSubnet = $injectionSubnetId
+        peConnections = @()
         namedValueEtag = 'version-1'
         managedBy = 'github-dev-environment'
         environment = 'dev'
@@ -420,21 +425,10 @@ namespace P3GatewayTests {
             return @{ StatusCode = 200; Headers = @{ ETag = $arm.namedValueEtag }; Body = @{} }
         }
         if ($Method -eq 'PATCH') {
-            if ($arm.conflicts -gt 0) { $arm.conflicts--; return @{ StatusCode = 409; Body = @{}; Headers = @{} } }
-            $arm.state = 'Private'
-            return @{ StatusCode = 202; Body = @{}; Headers = @{} }
-        }
-        if ($Uri -like '*Microsoft.Network/privateEndpoints/*') {
-            if ($arm.state -eq 'Absent' -and -not $arm.peCollision) { return @{ StatusCode = 404; Body = @{ error = @{ code = 'ResourceNotFound' } }; Headers = @{} } }
-            return @{ StatusCode = 200; Headers = @{}; Body = @{
-                id = $peId; tags = @{ 'ailz-managed-by' = $arm.managedBy; 'ailz-environment' = $arm.environment }; properties = @{
-                    provisioningState = 'Succeeded'
-                    privateLinkServiceConnections = @(@{ properties = @{
-                        privateLinkServiceId = $arm.peTarget; groupIds = @('Gateway')
-                        privateLinkServiceConnectionState = @{ status = $(if ($arm.approvedPe) { 'Approved' } else { 'Pending' }) }
-                    } })
-                }
-            } }
+            # The only legal PATCH on this topology is the owned stop control,
+            # handled above. A service PATCH would mean something tried to
+            # disable public network access, which injection cannot support.
+            throw 'Unexpected service PATCH; classic injection has no public-disable step.'
         }
         if ($Uri -match "/namedValues/$owner-stop\?") {
             return @{ StatusCode = 200; Headers = @{ ETag = $arm.namedValueEtag }; Body = @{
@@ -455,61 +449,67 @@ namespace P3GatewayTests {
             id = $serviceId; tags = $serviceTags
             properties = @{
                 provisioningState = $arm.provisioningState
-                publicNetworkAccess = $(if ($arm.state -eq 'Private') { 'Disabled' } else { 'Enabled' })
-                privateEndpointConnections = @(@{ properties = @{
-                    privateEndpoint = @{ id = $peId }
-                    privateLinkServiceConnectionState = @{ status = $(if ($arm.approvedPe) { 'Approved' } else { 'Pending' }) }
-                } })
+                # Always Enabled: Learn permits Disabled only on instances with a
+                # private endpoint, which an injected instance cannot have.
+                publicNetworkAccess = 'Enabled'
+                virtualNetworkType = $arm.virtualNetworkType
+                virtualNetworkConfiguration = $(if ($null -eq $arm.injectionSubnet) { $null } else { @{ subnetResourceId = $arm.injectionSubnet } })
+                privateEndpointConnections = @($arm.peConnections)
             }
         } }
     }.GetNewClosure()
     $plan = Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request
-    Assert-True ($plan.initialProvisioning -and $plan.observedState -ceq 'Absent') 'Initial public creation must require observed absence.'
-    $arm.peCollision = $true
-    Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*private endpoint*'
-    $arm.peCollision = $false
+    Assert-True ($plan.initialProvisioning -and $plan.observedState -ceq 'Absent') 'Initial creation must require observed absence.'
+    Assert-True ($plan.networkModel -ceq 'classic-vnet-injection' -and $plan.schemaVersion -eq 2) 'The plan must declare the classic injection network model.'
     Assert-GatewayDeploymentPlan -Plan $plan -Request $request
     Assert-True ($arm.calls.Count -gt 0 -and @($arm.calls | Where-Object method -ne GET).Count -eq 0) 'Planning did not exclusively read actual mocked ARM state.'
-    $arm.state = 'Public'
+    $arm.state = 'Injected'
     Assert-Throws { Assert-GatewayDeploymentPlan -Plan $plan -Request $request } '*stale*'
-    $publicApproved = Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request
-    Assert-True (-not $publicApproved.initialProvisioning -and $publicApproved.observedState -ceq 'PublicPendingDisable') 'Public with an approved PE must disable without initial=true.'
-    $arm.approvedPe = $false
-    $interrupted = Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request
-    Assert-True ($interrupted.initialProvisioning -and $interrupted.observedState -ceq 'PublicPendingPrivateEndpoint') 'Owned already-public interrupted creation must preserve Enabled, not require deletion.'
-    Assert-GatewayDeploymentPlan -Plan $interrupted -Request $request
+    $injected = Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request
+    Assert-True (-not $injected.initialProvisioning -and $injected.observedState -ceq 'Injected') 'A settled injected gateway must not report initial provisioning.'
+    Assert-True ($injected.virtualNetworkType -ceq 'Internal' -and $injected.injectionSubnetResourceId -ceq $injectionSubnetId) 'The plan must record the observed injected private topology.'
+
+    # An owned failed/cancelled creation is resumable. Unlike the v2 shape this
+    # can never be a private-to-public regression, because Internal mode is
+    # chosen at creation and a redeploy cannot silently publish the gateway.
     $arm.provisioningState = 'Failed'
-    Assert-True ((Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request).initialProvisioning) 'An owned failed first creation must be recoverable without reopening a private service.'
+    $interrupted = Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request
+    Assert-True ($interrupted.initialProvisioning -and $interrupted.observedState -ceq 'InterruptedProvisioning') 'An owned failed first creation must be recoverable.'
+    Assert-GatewayDeploymentPlan -Plan $interrupted -Request $request
+    $arm.provisioningState = 'Updating'
+    Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*still in progress*'
     $arm.provisioningState = 'Succeeded'
-    $arm.approvedPe = $true
     Assert-Throws { Assert-GatewayDeploymentPlan -Plan $interrupted -Request $request } '*stale*'
+
+    # The privacy invariants that replace the private-endpoint assertions.
+    $arm.virtualNetworkType = 'External'
+    Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*Internal*'
+    $arm.virtualNetworkType = 'None'
+    Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*Internal*'
+    $arm.virtualNetworkType = 'Internal'
+    $arm.injectionSubnet = $null
+    Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*injection subnet*'
+    $arm.injectionSubnet = $injectionSubnetId
+    $arm.peConnections = @(@{ properties = @{ privateEndpoint = @{ id = $peId }; privateLinkServiceConnectionState = @{ status = 'Approved' } } })
+    Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*private endpoint*'
+    $arm.peConnections = @()
+    Assert-Throws {
+        Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request `
+            -InjectionSubnetResourceId ($injectionSubnetId + '-other')
+    } '*approved injection subnet*'
+
     $arm.calls.Clear()
-    Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request | Out-Null
-    Assert-True (@($arm.calls | Where-Object method -eq PATCH).Count -eq 0) 'Completion without explicit Apply made a write.'
-    Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -WhatIf | Out-Null
-    Assert-True (@($arm.calls | Where-Object method -eq PATCH).Count -eq 0) 'WhatIf made an ARM write.'
-    $arm.approvedPe = $false
-    Assert-Throws { Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -MaxAttempts 2 -RetryDelaySeconds 0 } '*private endpoint*'
-    Assert-True (@($arm.calls | Where-Object method -eq PATCH).Count -eq 0) 'Public access was changed before PE approval.'
-    $arm.approvedPe = $true
-    $arm.peTarget = $serviceId + '-unrelated'
-    Assert-Throws { Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -MaxAttempts 1 -RetryDelaySeconds 0 } '*private endpoint*'
-    $arm.peTarget = $serviceId
-    $arm.conflicts = 1
-    Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -MaxAttempts 3 -RetryDelaySeconds 0 | Out-Null
-    Assert-True ($arm.state -ceq 'Private') 'Public access was not disabled.'
-    $patches = @($arm.calls | Where-Object method -eq PATCH)
-    Assert-True ($patches.Count -eq 2) 'A conflict did not trigger a bounded read/retry.'
-    foreach ($patch in $patches) {
-        Assert-True (($patch.body | ConvertTo-Json -Depth 10 -Compress) -ceq '{"properties":{"publicNetworkAccess":"Disabled"}}') 'PATCH changed unrelated service settings.'
-    }
+    Complete-GatewayActivation -Plan $injected -Request $request | Out-Null
+    Assert-True (@($arm.calls | Where-Object method -ne GET).Count -eq 0) 'Activation without explicit Apply made a write.'
+    Complete-GatewayActivation -Plan $injected -Request $request -Apply -WhatIf | Out-Null
+    Assert-True (@($arm.calls | Where-Object method -ne GET).Count -eq 0) 'WhatIf made an ARM write.'
     $arm.calls.Clear()
-    Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -RetryDelaySeconds 0 | Out-Null
-    Assert-True (@($arm.calls | Where-Object method -ne GET).Count -eq 0) 'A private rerun wrote or reenabled public access.'
+    Complete-GatewayActivation -Plan $injected -Request $request -Apply -RetryDelaySeconds 0 | Out-Null
+    Assert-True (@($arm.calls | Where-Object method -ne GET).Count -eq 0) 'An injected rerun wrote to the service; there is no public-disable step to perform.'
     $steady = Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request
-    Assert-True (-not $steady.initialProvisioning -and $steady.observedState -ceq 'Private') 'A steady deployment would reenable public access.'
+    Assert-True (-not $steady.initialProvisioning -and $steady.observedState -ceq 'Injected') 'A steady deployment changed the observed injected state.'
     $arm.ownerTag = $null
-    Assert-True ((Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request).observedState -ceq 'Private') 'The agreed management/environment ownership pair must be sufficient.'
+    Assert-True ((Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request).observedState -ceq 'Injected') 'The agreed management/environment ownership pair must be sufficient.'
     $arm.managedBy = 'unrelated-manager'
     Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*ownership*'
     $arm.managedBy = 'github-dev-environment'
@@ -517,9 +517,6 @@ namespace P3GatewayTests {
     Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*ownership*'
     $arm.environment = 'dev'
     $arm.ownerTag = $owner
-    $arm.approvedPe = $false
-    Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*private endpoint*'
-    $arm.approvedPe = $true
     $arm.children.namedValues = @(@{ name = "$owner-stop"; properties = @{ tags = @($owner); secret = $false } })
     $withStop = Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request
     $arm.namedValueEtag = 'version-2'
@@ -533,62 +530,93 @@ namespace P3GatewayTests {
     $arm.children.Clear()
     $arm.ownerTag = 'unrelated-owner'
     Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*ownership*'
-    Assert-Throws { Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -RetryDelaySeconds 0 } '*ownership*'
+    Assert-Throws { Complete-GatewayActivation -Plan $injected -Request $request -Apply -RetryDelaySeconds 0 } '*ownership*'
     $arm.ownerTag = $owner
     $arm.failure = 403
     Assert-Throws { Get-GatewayDeploymentPlan -ServiceResourceId $serviceId -EnvironmentName dev -WorkloadKey $workloadKey -Request $request } '*HTTP 403*'
     $arm.failure = 0
-    $arm.state = 'Public'
-    $arm.conflicts = 5
-    $arm.calls.Clear()
-    Assert-Throws { Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -MaxAttempts 2 -RetryDelaySeconds 0 } '*retry budget*'
-    Assert-True (@($arm.calls | Where-Object method -eq PATCH).Count -eq 2 -and $arm.state -ceq 'Public') 'Retry exhaustion did not fail closed at the configured bound.'
-    $arm.conflicts = 0
     $arm.stopValue = 'true'
     $arm.stopConflicts = 1
     $arm.calls.Clear()
-    $resumed = Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -StopNewRequests $false -MaxAttempts 5 -RetryDelaySeconds 0
-    Assert-True ($resumed.status -ceq 'VerifiedControlPlane' -and $resumed.stopControlVerified -and $resumed.stopNewRequests -eq $false -and $resumed.changed) 'Approved stop value was not persisted and verified after private completion.'
+    $resumed = Complete-GatewayActivation -Plan $injected -Request $request -Apply -StopNewRequests $false -MaxAttempts 5 -RetryDelaySeconds 0
+    Assert-True ($resumed.status -ceq 'VerifiedControlPlane' -and $resumed.stopControlVerified -and $resumed.stopNewRequests -eq $false -and $resumed.changed) 'Approved stop value was not persisted and verified.'
     $stopCalls = @($arm.calls | Where-Object uri -Like '*namedValues*')
-    Assert-True ($stopCalls.Count -gt 0 -and @($stopCalls | Where-Object state -ne Private).Count -eq 0) 'Stop control was read or changed before private access was established.'
+    Assert-True ($stopCalls.Count -gt 0 -and @($stopCalls | Where-Object state -ne Injected).Count -eq 0) 'Stop control was read or changed before the injected topology was established.'
     foreach ($write in @($stopCalls | Where-Object method -eq PATCH)) {
         Assert-True ($write.headers['If-Match'] -and $write.headers['If-Match'] -cne '*' -and
             ($write.body | ConvertTo-Json -Depth 5 -Compress) -ceq '{"properties":{"value":"false"}}') 'Stop restoration must use exact-scope value-only conditional PATCH.'
     }
     $arm.calls.Clear()
-    $sameStop = Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -StopNewRequests $false -MaxAttempts 2 -RetryDelaySeconds 0
+    $sameStop = Complete-GatewayActivation -Plan $injected -Request $request -Apply -StopNewRequests $false -MaxAttempts 2 -RetryDelaySeconds 0
     Assert-True ($sameStop.stopControlVerified -and -not $sameStop.changed -and @($arm.calls | Where-Object method -eq PATCH).Count -eq 0) 'An unchanged stop setting made another write.'
     $arm.calls.Clear()
-    Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -StopNewRequests $true | Out-Null
+    Complete-GatewayActivation -Plan $injected -Request $request -StopNewRequests $true | Out-Null
     Assert-True (@($arm.calls | Where-Object method -ne GET).Count -eq 0) 'Read-only verification acquired values or changed the stop setting.'
     $arm.stopSecret = $true
-    Assert-Throws { Complete-GatewayPrivateAccess -Plan $plan -PrivateEndpointResourceId $peId -Request $request -Apply -StopNewRequests $false -MaxAttempts 1 -RetryDelaySeconds 0 } '*nonsecret*'
+    Assert-Throws { Complete-GatewayActivation -Plan $injected -Request $request -Apply -StopNewRequests $false -MaxAttempts 1 -RetryDelaySeconds 0 } '*nonsecret*'
     $arm.stopSecret = $false
 
     if (-not $TemplatePath) {
         $TemplatePath = Join-Path $scratch 'gateway.template.json'
         Invoke-Bicep @('build', (Join-Path $root 'modules\api-management\main.bicep'), '--outfile', $TemplatePath)
     }
+    # Per-workload children moved into workload.bicep so the same code path can
+    # target a platform-owned gateway in another resource group.
+    $workloadTemplatePath = Join-Path $scratch 'gateway.workload.json'
+    Invoke-Bicep @('build', (Join-Path $root 'modules\api-management\workload.bicep'), '--outfile', $workloadTemplatePath)
+    $workloadTemplate = Get-Content -LiteralPath $workloadTemplatePath -Raw | ConvertFrom-Json -AsHashtable
+    $workloadSource = Get-Content -LiteralPath (Join-Path $root 'modules\api-management\workload.bicep') -Raw
     $template = Get-Content -LiteralPath $TemplatePath -Raw | ConvertFrom-Json -AsHashtable
-    Assert-True ($template.resources.operation.dependsOn -contains 'apiPolicy') 'A callable operation can appear before its enforcement policy.'
-    Assert-True ($template.parameters.initialProvisioning.defaultValue -eq $false) 'Private must be the steady-state default.'
+    Assert-True ($workloadTemplate.resources.operation.dependsOn -contains 'apiPolicy') 'A callable operation can appear before its enforcement policy.'
+    Assert-True ($template.parameters.initialProvisioning.defaultValue -eq $false) 'Holding the stop control on must not be the steady-state default.'
     $bicepSource = Get-Content -LiteralPath (Join-Path $root 'modules\api-management\main.bicep') -Raw
     Assert-True ((Get-Content -LiteralPath (Join-Path $root 'main.bicep') -Raw) -match '(?m)^param deployApiManagement bool = false\r?$') 'The parent opt-in default changed.'
     Assert-True ($bicepSource -match 'br/public:avm/res/api-management/service:0\.14\.4') 'Unverified AVM version.'
-    Assert-True ($bicepSource -match "initialProvisioning\s*\?\s*'Enabled'\s*:\s*'Disabled'") 'Incorrect initial/private ordering.'
-    Assert-True ($bicepSource -match 'gatewayNamedValues\(owner, environmentName, tenantId, configuration, backendEndpoint, initialProvisioning\)') 'Initial stop enforcement is not wired to the real module state.'
-    Assert-True ($bicepSource -match "virtualNetworkType:\s*'External'" -and $bicepSource -match 'subnetResourceId:\s*integrationSubnetResourceId') 'Missing explicit v2 outbound integration.'
-    Assert-True ($bicepSource -notmatch "resource\s+\w+\s+'Microsoft.ApiManagement/service/policies@") 'Global policy write.'
+    Assert-True ($workloadSource -match 'gatewayNamedValues\(owner, environmentName, tenantId, configuration, backendEndpoint, initialProvisioning\)') 'Initial stop enforcement is not wired to the real module state.'
+    # ---------------------------------------------------------------------
+    # Classic VNet injection invariants
+    # ---------------------------------------------------------------------
+    # Internal mode is what keeps the data plane private here: Learn states that
+    # in internal mode "None of the API Management endpoints are registered on
+    # the public DNS". External mode would publish the gateway to the internet.
+    Assert-True ($bicepSource -match "virtualNetworkType:\s*'Internal'" -and $bicepSource -match 'subnetResourceId:\s*integrationSubnetResourceId') 'Missing explicit Internal-mode classic VNet injection.'
+    Assert-True ($bicepSource -notmatch "virtualNetworkType:\s*'External'") 'External mode publishes the gateway to the internet and must never be selected.'
+    # A private endpoint cannot coexist with injection, and publicNetworkAccess
+    # can only be Disabled on an instance that has one, so the module must not
+    # attempt either.
+    Assert-True ($bicepSource -match 'privateEndpoints:\s*\[\]') 'Classic injection must declare no private endpoints; Learn does not support them on injected instances.'
+    Assert-True ($bicepSource -notmatch "publicNetworkAccess:\s*initialProvisioning") 'publicNetworkAccess must not be driven by initialProvisioning; Disabled is unreachable without a private endpoint.'
+    Assert-True ($bicepSource -match "publicNetworkAccess:\s*'Enabled'") 'publicNetworkAccess must be the only value Azure permits for an injected instance.'
+    # The AVM default for availabilityZones is [1,2,3], which is MANUAL zone
+    # selection and requires capacity to be an exact multiple of the zone count.
+    Assert-True ($bicepSource -match 'availabilityZones:\s*\[\]') 'availabilityZones must be passed explicitly as empty to select automatic zone redundancy rather than inheriting the AVM manual default.'
+    # The injection subnet must not be delegated, and its NSG must carry real
+    # rules, because the internal load balancer rejects all inbound by default.
+    $parentSource = Get-Content -LiteralPath (Join-Path $root 'main.bicep') -Raw
+    Assert-True ($parentSource -notmatch "delegation:\s*'Microsoft\.Web/serverFarms'") 'The injection subnet must not be delegated; Learn requires delegation None for classic injection.'
+    Assert-True ($parentSource -match 'modules/networking/api-management-injection-nsg\.bicep') 'The injection subnet must use the rule-carrying NSG, not the empty shared NSG helper.'
+    $nsgSource = Get-Content -LiteralPath (Join-Path $root 'modules\networking\api-management-injection-nsg.bicep') -Raw
+    foreach ($rule in @('ApiManagement', 'AzureLoadBalancer', 'Storage', 'Sql', 'AzureKeyVault', 'AzureMonitor')) {
+        Assert-True ($nsgSource -match [regex]::Escape($rule)) "The injection NSG is missing the required $rule rule."
+    }
+    Assert-True ($nsgSource -match "destinationPortRange:\s*'3443'" -and $nsgSource -match "destinationPortRange:\s*'6390'") 'The injection NSG must allow the required 3443 control-plane and 6390 load-balancer inbound ports.'
+    # Internet:80,443 inbound is EXTERNAL mode only. Allowing it here would
+    # expose the data plane that Internal mode exists to keep private.
+    Assert-True ($nsgSource -notmatch "sourceAddressPrefix:\s*'Internet'") 'The injection NSG must not allow inbound Internet; that rule is external-mode only and would expose the data plane.'
+    Assert-True ($bicepSource -notmatch "resource\s+\w+\s+'Microsoft.ApiManagement/service/policies@" -and $workloadSource -notmatch "resource\s+\w+\s+'Microsoft.ApiManagement/service/policies@") 'Global policy write.'
     Assert-True ($bicepSource -match 'const\.roles\.CognitiveServicesOpenAIUser' -and $bicepSource -match 'resource-role-assignment\.bicep') 'Backend role must use the existing role boundary and constants.'
-    Assert-True ($bicepSource -match 'logClientIp:\s*false' -and $bicepSource -match 'bytes:\s*0' -and $bicepSource -match 'metrics:\s*true') 'Missing explicit no-body diagnostic defaults or token metrics.'
-    Assert-True ($bicepSource -match 'percentage:\s*0' -and $bicepSource -match 'alwaysLog:\s*null' -and $bicepSource -match 'logCategoriesAndGroups:\s*\[\]') 'Automatic URL/error telemetry can expose malicious query credentials; only explicit metadata traces and token metrics are permitted.'
+    Assert-True ($workloadSource -match 'logClientIp:\s*false' -and $workloadSource -match 'bytes:\s*0' -and $workloadSource -match 'metrics:\s*true') 'Missing explicit no-body diagnostic defaults or token metrics.'
+    Assert-True ($workloadSource -match 'percentage:\s*0' -and $workloadSource -match 'alwaysLog:\s*null' -and $bicepSource -match 'logCategoriesAndGroups:\s*\[\]') 'Automatic URL/error telemetry can expose malicious query credentials; only explicit metadata traces and token metrics are permitted.'
     # One gateway is shared by many landing zones, so the owner marker, the API
     # name/path and the published route must all be keyed by workloadKey. A route
     # that is merely 'inference/v1/responses' collides across landing zones.
     Assert-True ($bicepSource.Contains("var owner = 'ailz-inference-`${environmentName}-`${workloadKey}'")) 'The owner marker is not workload-scoped; landing zones sharing a gateway would collide.'
-    Assert-True ($bicepSource.Contains("var apiPath = 'inference/`${workloadKey}'") -and $bicepSource.Contains('path: apiPath')) 'The API path is not workload-scoped; two landing zones would claim the same route.'
-    Assert-True ($template.outputs.inferenceEndpoint.value -match 'v1/responses' -and $template.outputs.inferenceEndpoint.value -match 'apiPath') 'Gateway endpoint contract changed.'
-    Assert-True ($template.outputs.inferenceEndpoint.value -notmatch 'inference/v1/responses') 'The published route must not be the unscoped, collision-prone path.'
+    Assert-True ($workloadSource.Contains("var apiPath = 'inference/`${workloadKey}'") -and $workloadSource.Contains('path: apiPath')) 'The API path is not workload-scoped; two landing zones would claim the same route.'
+    Assert-True ($workloadTemplate.outputs.inferenceEndpoint.value -match 'v1/responses' -and $workloadTemplate.outputs.inferenceEndpoint.value -match 'apiPath') 'Gateway endpoint contract changed.'
+    Assert-True ($workloadTemplate.outputs.inferenceEndpoint.value -notmatch 'inference/v1/responses') 'The published route must not be the unscoped, collision-prone path.'
+    # The gateway may be platform-owned in another resource group, so the shared
+    # service reference must be resolvable at the caller-supplied scope.
+    Assert-True ($workloadTemplate.parameters.ContainsKey('apiManagementName')) 'Workload children must name their host gateway explicitly rather than assume the current resource group.'
     Write-Host "Gateway: $script:assertions assertions passed. Native JWT, metering and ARM behavior still require the authorized live matrix."
 }
 finally {

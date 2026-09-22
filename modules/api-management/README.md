@@ -29,25 +29,55 @@ Entry point: `modules\api-management\main.bicep`, resource-group scope.
 | `environmentName` | `dev \| test \| prod`, required | Ownership and counter isolation. |
 | `tenantId` | string, required | Approved Entra tenant GUID. |
 | `configuration` | exported `gatewayConfiguration`, required | Unchanged enabled P1 gateway object. `foundryIntegration=true` is unsupported and rejected. |
-| `integrationSubnetResourceId` | string, required | Dedicated `Microsoft.Web/serverFarms` subnet with NSG and approved egress/DNS. Never the app/agent subnet. |
-| `privateEndpointSubnetResourceId` | string, required | Separate PE subnet; the profile supplies the BYO `privatelink.azure-api.net` zone ID. |
+| `integrationSubnetResourceId` | string, required | Dedicated **undelegated** injection subnet with the API Management NSG rule set and approved egress/DNS. Never the app/agent subnet. Classic VNet injection forbids subnet delegation. |
 | `backendAccountResourceId` | string, required | Verified Foundry account ID. |
 | `backendEndpoint` | string, required | Verified account-named HTTPS root on `openai.azure.com` or `services.ai.azure.com`; no path, port, query, credentials or fragment. |
 | `applicationInsightsResourceId` | string, required | Existing component; the connection string is read internally, never output. |
 | `logAnalyticsWorkspaceResourceId` | string, required | Existing metrics destination; existing private monitoring topology is retained. |
 | `tags` | object, `{}` | Merged with the reserved management/environment pair and namespace marker. |
-| `initialProvisioning` | bool, `false` | True only for absence or an owned already-Enabled service without an approved PE, frozen and rechecked before deployment. Never true for an existing Disabled service. |
+| `initialProvisioning` | bool, `false` | True only for a first or interrupted creation. It does **not** gate public network access — see below — it holds the stop control on until the operator has published the private DNS A record. |
 
-Outputs are `serviceResourceId:string`, `privateEndpointResourceId:string`,
-`principalId:string`, `inferenceEndpoint:string`, `audience:string`, and
-`facts:object`. `facts` lists owned IDs, source links and pending operational
+Outputs are `serviceResourceId:string`, `gatewayHostName:string`,
+`gatewayPrivateIpAddress:string`, `principalId:string`,
+`inferenceEndpoint:string`, `audience:string`, and `facts:object`. `facts` lists
+owned IDs, source links, `operatorObligations` and pending operational
 requirements, effective `stopNewRequests` and `approvedStopNewRequests`; it does
 not assert readiness.
 
+## Network topology: classic VNet injection, Internal mode
+
+This module deploys the gateway with `virtualNetworkType: 'Internal'` into an
+**undelegated** subnet, and declares **no private endpoint**. That combination
+is required, not preferred:
+
+- Injected classic instances cannot hold a private endpoint. Learn: *"In the
+  classic API Management tiers, private endpoints aren't supported in instances
+  injected in an internal or external virtual network."*
+- Consequently `publicNetworkAccess` can never be `Disabled` here. Learn: *"You
+  can disable public network access in API Management instances configured with
+  a private endpoint, not with other networking configurations."* The module
+  sets `'Enabled'`, which is the only legal value.
+- Inbound privacy is delivered by Internal mode instead. Learn: *"None of the
+  API Management endpoints are registered on the public DNS."* The instance
+  keeps a public VIP, but it serves control-plane port 3443 only, restricted by
+  NSG to the `ApiManagement` service tag.
+
+The injection subnet's NSG must carry explicit rules — a rule-less NSG blocks
+the gateway entirely, because *"the load balancer used internally by API
+Management is secure by default and rejects all inbound traffic."* Use
+`modules/networking/api-management-injection-nsg.bicep`, which is shared with
+`platform/api-management/` so the two gateway paths cannot drift.
+
+**Operator obligation:** Internal mode registers nothing on public DNS, so the
+gateway is unreachable until a private DNS zone named exactly
+`<name>.azure-api.net`, holding an apex `@` A record for the
+`gatewayPrivateIpAddress` output, is created and linked to every calling VNet.
+Never create a zone for the bare apex `azure-api.net`.
+
 The endpoint is exactly
-`https://<name>.azure-api.net/inference/v1/responses`. Backend routing is fixed
-to `<backendEndpoint>/openai/v1/responses`. There is one `POST` operation.
-The API policy is established **before** that callable operation.
+`https://<name>.azure-api.net/inference/<workloadKey>/v1/responses`. Backend
+routing is fixed to `<backendEndpoint>/openai/v1/responses`. There is one `POST`
+operation. The API policy is established **before** that callable operation.
 
 The gateway system identity receives `CognitiveServicesOpenAIUser` only on the
 provided account and `MonitoringMetricsPublisher` only on the provided Insights
@@ -109,10 +139,11 @@ Assert-GatewayConfiguration
   -Profile IDictionary -ServiceName string
   -BackendAccountResourceId string -BackendEndpoint string [-AllowSynthetic]
 Get-GatewayDeploymentPlan
-  -ServiceResourceId string -EnvironmentName dev|test|prod -Request scriptblock
+  -ServiceResourceId string -EnvironmentName dev|test|prod -WorkloadKey string
+  -Request scriptblock [-InjectionSubnetResourceId string]
 Assert-GatewayDeploymentPlan -Plan IDictionary -Request scriptblock
-Complete-GatewayPrivateAccess
-  -Plan IDictionary -PrivateEndpointResourceId string -Request scriptblock
+Complete-GatewayActivation
+  -Plan IDictionary -Request scriptblock
   [-Apply] [-StopNewRequests bool] [-WhatIf]
   [-MaxAttempts 60] [-RetryDelaySeconds 10]
 ```
@@ -129,15 +160,24 @@ detects a changed emergency stop without a secret-retrieval POST. No function
 implicitly logs in, dispatches, provisions or invokes a model.
 
 `Get-GatewayDeploymentPlan` returns `observedState` as `Absent`,
-`PublicPendingPrivateEndpoint`, `PublicPendingDisable`, or `Private`.
-`initialProvisioning` is true only in the first two states. P4 must still require
-`Private` and false; public recovery states are not readiness.
+`InterruptedProvisioning`, or `Injected`. `initialProvisioning` is true only in
+the first two states. P4 must require `Injected` and false.
+
+There is **no public-then-private transition on this topology**: an injected
+Internal-mode gateway is private from the moment it exists, and
+`publicNetworkAccess` can never be `Disabled` because Azure permits that only on
+instances holding a private endpoint. The plan therefore asserts the properties
+that actually deliver privacy — `virtualNetworkType` is `Internal`, the instance
+is attached to an injection subnet (and, when
+`-InjectionSubnetResourceId` is supplied, to the *approved* one), and no private
+endpoint connection exists.
 
 P4's existing call without `-Apply` and without `-StopNewRequests` stays GET-only
-and retains its `VerifiedControlPlane`/`Disabled`/`changed=false` result shape.
+and retains its `VerifiedControlPlane`/`changed=false` result shape, now
+reporting `virtualNetworkType: 'Internal'` rather than a public-access state.
 An explicitly requested stop reconciliation without `-Apply` returns `Planned`,
 never false verification. With `-Apply -StopNewRequests <approved bool>`, the
-helper first establishes private access, then reads and conditionally updates
+helper first verifies the injected private topology, then reads and conditionally updates
 only `.../namedValues/ailz-inference-<environment>-stop`.
 
 **P5 transport requirement:** permit the documented, nonmutating
@@ -209,12 +249,12 @@ no Azure changes or paid inference calls.
 
 | Gate | Required live evidence |
 | --- | --- |
-| Provider/topology | Selected StandardV2/PremiumV2 is available with approved capacity/availability. External outbound integration, dedicated delegation/NSG/routes and PE-before-disable succeed. No SKU substitution. |
-| Private ingress/backend | Developer, workload and runner resolve/reach the intended private endpoints; public gateway access fails. APIM reaches the private account through approved egress/DNS. |
+| Provider/topology | Selected Developer/Premium classic tier is available with approved capacity/availability in the region. Classic VNet injection succeeds on an **undelegated** subnet with the required NSG rules and the `ApiManagement` service-tag UDR bypass. No SKU substitution. |
+| Private ingress/backend | Developer, workload and runner resolve the gateway hostname to the internal load balancer private VIP through the operator-created `<name>.azure-api.net` zone, and the hostname does not resolve publicly. APIM reaches the private Foundry account through approved egress/DNS. |
 | Identity | Resolve the URI/GUID audience decision against issued tokens. Valid tenant/audience/OID succeeds; missing/expired/wrong-signature/audience/tenant/unmapped tokens fail. Backend uses the gateway MI, not a key. |
 | Authorization | Exact models only; case/prefix spoof, project/routing/key headers, unknown routes/methods and all excluded body modalities fail without inference. Inventory contains no unapproved callable API. |
 | Enforcement | Measured configured rate -> 429; period quota -> 403; Retry-After survives. Different callers/models/projects/environments have distinct counters. |
-| Stop/recovery | Owned stop prevents new inference; caller headers cannot resume. In-flight work is not cancelled. Initial completion, conflict retries, stale plans and private reruns never reenable public access. |
+| Stop/recovery | Owned stop prevents new inference; caller headers cannot resume. In-flight work is not cancelled. Initial activation, conflict retries, stale plans and reruns never change the injected network topology or move the gateway out of Internal mode. |
 | Bypass | Ordinary developers/workload/runners cannot call the backend directly, list keys or acquire APIM debug privileges. Assess preexisting grants: omitting a Bicep assignment does not revoke it. |
 | Metering/privacy | Correlate trace and native token metrics with no content/auth headers; verify metrics-with-dimensions delivery and cardinality. Exercise streaming interruption and concurrency overshoot. |
 | Promotion | Parent-owned workflow freezes identical source/configuration/observed-state inputs and completes the independent approval/readiness gates. |
@@ -234,9 +274,11 @@ Primary contracts were reopened on 2026-09-16. APIM AVM is
 `sha256:8df75309183c6dd846dbd577dbee974d66b262fd596a18580ec028a2c0a83c86`.
 The upstream `version.json` minor `0.15` was not a published full version in the
 opened registry listing. The pinned service source forwards `subnetResourceId`
-and `virtualNetworkType` without a StandardV2 exclusion; the 2024-05-01 API
-contracts and current v2 networking guidance were checked independently of the
-AVM parameter's injection-oriented description.
+and `virtualNetworkType` without a tier exclusion; the 2024-05-01 API
+contracts and current classic-injection networking guidance were checked
+independently of the AVM parameter's description, which incorrectly claims the
+injection subnet must be delegated. Learn requires delegation `None` for classic
+injection; AVM emits no delegation, so the description is misleading but inert.
 
 Sources:
 

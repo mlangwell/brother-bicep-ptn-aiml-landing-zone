@@ -29,6 +29,17 @@ not developer readiness: private completion, human SSO and the live acceptance
 gates are separate. The existing wrapper, `azd` hooks and Azure DevOps assets
 remain supported and unchanged.
 
+The APIM gateway is **per-subscription platform infrastructure**: deploy
+[`platform/api-management/`](platform/api-management/) **once per subscription**,
+then deploy the landing zone **many times** against it via
+`existingApiManagementResourceId`. The gateway uses classic VNet injection in
+Internal mode (Developer for sandbox/dev/test, Premium for production), so it is
+reachable only from inside the virtual network and its governed route is
+`/inference/<workloadKey>/v1/responses`. Internal mode registers nothing on
+public DNS, so an operator-created private DNS zone is required before the
+gateway is reachable — see
+[the topology ADR](docs/adr/2026-09-22-apim-classic-vnet-injection.md).
+
 The script configures this topology automatically:
 
 - `DEPLOYMENT_MODE=ailz-integrated`

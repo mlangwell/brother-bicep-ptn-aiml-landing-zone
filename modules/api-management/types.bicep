@@ -18,11 +18,11 @@ type callerMapping = {
 
 @export()
 @sealed()
-@description('Validated P1 gateway configuration. Native Foundry portal integration is deliberately unsupported.')
+@description('Validated P1 gateway configuration. Native Foundry portal integration is deliberately unsupported. The gateway uses classic VNet injection in Internal mode on every tier, so `privateDnsZoneResourceId` names the service-scoped `<apim-name>.azure-api.net` zone, NOT a `privatelink.azure-api.net` zone: classic injected instances cannot hold a private endpoint, and Learn forbids a private zone for the shared apex domain `azure-api.net`.')
 type gatewayConfiguration = {
   enabled: true
   name: string?
-  sku: 'StandardV2' | 'PremiumV2'
+  sku: 'Developer' | 'Premium'
   @minValue(1)
   capacity: int
   @minLength(1)

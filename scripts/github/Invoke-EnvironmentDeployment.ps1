@@ -81,12 +81,14 @@ if ($Phase -ceq 'Complete') {
     if ($output.gateway.backendResourceId -ine $backendId -or $output.gateway.backendEndpoint -cne $backendEndpoint) { throw 'Actual Foundry backend differs from the approved explicit binding.' }
     $gatewayPlan = ConvertFrom-BootstrapJson -Json (Get-Content -LiteralPath (Join-Path $PreviewDirectory 'gateway-plan.json') -Raw)
     if ($preview.gatewayPlanHash -cne (Get-CanonicalHash -Value $gatewayPlan)) { throw 'Approved gateway plan changed before completion.' }
-    $privateEndpointId = "$($output.gateway.resourceId -replace '/providers/.*$', '')/providers/Microsoft.Network/privateEndpoints/$($profile.gateway.name)-inbound"
-    $gatewayEvidence = Complete-GatewayPrivateAccess -Plan $gatewayPlan -PrivateEndpointResourceId $privateEndpointId -Request $request `
+    # Classic VNet injection has no inbound private endpoint to verify. The
+    # equivalent evidence is that the instance really is Internal-mode, injected
+    # into the approved subnet, and carrying the approved stop control.
+    $gatewayEvidence = Complete-GatewayActivation -Plan $gatewayPlan -Request $request `
         -Apply -StopNewRequests $profile.gateway.stopNewRequests -Confirm:$false
-    if ($gatewayEvidence.status -cne 'VerifiedControlPlane' -or $gatewayEvidence.publicNetworkAccess -cne 'Disabled' -or
+    if ($gatewayEvidence.status -cne 'VerifiedControlPlane' -or $gatewayEvidence.virtualNetworkType -cne 'Internal' -or
         $gatewayEvidence.stopControlVerified -ne $true -or $gatewayEvidence.stopNewRequests -ne $profile.gateway.stopNewRequests) {
-        throw 'Gateway private access and the approved stop control were not verified.'
+        throw 'Gateway injected private topology and the approved stop control were not verified.'
     }
     Write-JsonFile -Path (Join-Path $OutputDirectory 'gateway.json') -Value $gatewayEvidence
     $completion = Invoke-DeveloperCompletion -Resolution $resolved -DeploymentOutput $output -Execute
@@ -107,7 +109,15 @@ if ($Phase -ceq 'Complete') {
 }
 
 $state = Get-GatewayObservedState -Profile $profile
-$gatewayPlan = Get-GatewayDeploymentPlan -ServiceResourceId $state.resourceId -EnvironmentName $profile.environment -WorkloadKey $profile.gateway.workloadKey -Request $request
+# InjectionSubnetResourceId is deliberately NOT passed here. The always-true
+# invariants (Internal mode, an injection subnet present, no private endpoint)
+# are still asserted by Get-GatewayDeploymentPlan. The additional exact-subnet
+# match is only meaningful for a landing-zone-created gateway: on the BYO path
+# the gateway lives in the platform VNet and this orchestrator has no reliable
+# knowledge of that subnet. Asserting against a guessed ID would be worse than
+# not asserting at all.
+$gatewayPlan = Get-GatewayDeploymentPlan -ServiceResourceId $state.resourceId -EnvironmentName $profile.environment `
+    -WorkloadKey $profile.gateway.workloadKey -Request $request
 $parameters = Get-DeploymentParameters -Resolved $resolved -ObservedState $state
 if ($parameters.parameters.apiManagementConfiguration.value.initialProvisioning -ne $gatewayPlan.initialProvisioning) { throw 'Gateway state planners disagree; resolve ownership/completion before proceeding.' }
 Write-JsonFile -Path (Join-Path $OutputDirectory 'main.parameters.json') -Value $parameters

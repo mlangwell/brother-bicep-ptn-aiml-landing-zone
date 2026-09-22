@@ -167,14 +167,17 @@ $profile = @{
         enabled = $true
         name = 'synthetic-governed-gateway'
         workloadKey = 'syntheticlz01'
-        sku = 'StandardV2'
+        sku = 'Developer'
         capacity = 1
         publisherEmail = 'synthetic-owner@example.invalid'
         publisherName = 'SYNTHETIC OFFLINE TEST OWNER'
         audience = 'api://synthetic-governed-inference'
         integrationSubnetName = 'synthetic-apim-integration'
         integrationSubnetPrefix = '10.220.4.0/27'
-        privateDnsZoneResourceId = "$hubScope/providers/Microsoft.Network/privateDnsZones/privatelink.azure-api.net"
+        # Service-scoped zone, not privatelink: classic VNet injection cannot
+        # hold a private endpoint, and Learn forbids a zone for the shared apex
+        # azure-api.net domain.
+        privateDnsZoneResourceId = "$hubScope/providers/Microsoft.Network/privateDnsZones/synthetic-governed-gateway.azure-api.net"
         stopNewRequests = $false
         foundryIntegration = $false
         callerMappings = @(

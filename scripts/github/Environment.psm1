@@ -317,8 +317,19 @@ function Assert-ProfileTopology {
             throw "Integrated topology requires the BYO private DNS input parameters.$parameter."
         }
     }
-    if (($Profile.gateway.privateDnsZoneResourceId -split '/')[-1] -cne 'privatelink.azure-api.net') {
-        throw 'Wrong private DNS namespace at gateway.privateDnsZoneResourceId.'
+    # Classic VNet injection: the gateway has no private endpoint, so there is no
+    # privatelink zone. Internal mode registers nothing on public DNS, so the
+    # operator supplies a SERVICE-SCOPED zone instead. Learn forbids a private
+    # zone for the shared apex domain azure-api.net outright.
+    $gatewayZone = ($Profile.gateway.privateDnsZoneResourceId -split '/')[-1]
+    if ($gatewayZone -ieq 'azure-api.net') {
+        throw 'gateway.privateDnsZoneResourceId must never be the apex azure-api.net domain; an apex private zone breaks resolution for other Azure services.'
+    }
+    if ($gatewayZone -ieq 'privatelink.azure-api.net') {
+        throw 'gateway.privateDnsZoneResourceId must not be a privatelink zone: classic VNet injection cannot hold a private endpoint. Supply the service-scoped <gateway-name>.azure-api.net zone.'
+    }
+    if ($gatewayZone -cne "$($Profile.gateway.name.ToLowerInvariant()).azure-api.net") {
+        throw 'Wrong private DNS namespace at gateway.privateDnsZoneResourceId; it must be the service-scoped <gateway-name>.azure-api.net zone.'
     }
 }
 

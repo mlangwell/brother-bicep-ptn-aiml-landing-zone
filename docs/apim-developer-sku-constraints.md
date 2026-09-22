@@ -24,9 +24,12 @@ Developer is roughly **1/14th** the cost of Standard v2.
 
 ## The topology constraint
 
-The shipped module implements the **Standard v2** shape: outbound VNet
+The module originally implemented the **Standard v2** shape: outbound VNet
 integration into a `Microsoft.Web/serverFarms`-delegated subnet, plus an inbound
-private endpoint, then `publicNetworkAccess: 'Disabled'`.
+private endpoint, then `publicNetworkAccess: 'Disabled'`. **That shape has since
+been replaced** by classic VNet injection in Internal mode — see
+`docs/adr/2026-09-22-apim-classic-vnet-injection.md`. The analysis below is what
+drove that reroute.
 
 Developer cannot do that shape. From the
 [tier feature comparison](https://learn.microsoft.com/azure/api-management/api-management-features):
@@ -203,17 +206,27 @@ What **does** matter:
 - **No SLA, one unit, no availability zones, no autoscale.** Acceptable for a
   dev environment; disqualifying for production. Any promotion path must move to
   Standard v2 or Premium v2.
-- **`publicNetworkAccess` stays `Enabled`.** The `initialProvisioning` /
-  private-completion sequence in `modules/api-management/` asserts a
-  PE-then-disable transition that has no meaning on the injected path and must
-  be bypassed rather than satisfied.
+- **`publicNetworkAccess` stays `Enabled`.** This is now implemented. The
+  `initialProvisioning` / private-completion sequence asserted a
+  PE-then-disable transition that has no meaning on the injected path; it has
+  been replaced by `Complete-GatewayActivation`, which verifies Internal mode,
+  the approved undelegated injection subnet, and the absence of any private
+  endpoint. `initialProvisioning` now only holds the stop control on until the
+  operator publishes the DNS A record.
 - **1,024 concurrent backend connections.**
-- **Profile validators** hard-require `privatelink.azure-api.net`
-  (`scripts/github/Environment.psm1`, `scripts/github/Gateway.psm1`). The
-  injected path uses a service-scoped `<name>.azure-api.net` zone instead.
+- **Profile validators** previously hard-required `privatelink.azure-api.net`
+  (`scripts/github/Environment.psm1`, `scripts/github/Gateway.psm1`). They now
+  require the service-scoped `<gateway-name>.azure-api.net` zone and reject both
+  a privatelink zone and the shared apex `azure-api.net` zone.
 
-The gateway endpoint URL is unchanged either way:
-`https://<name>.azure-api.net/inference/v1/responses`.
+The gateway endpoint URL is
+`https://<name>.azure-api.net/inference/<workloadKey>/v1/responses`, and in
+Internal mode that hostname resolves only inside the VNet, via the private DNS
+zone the operator creates.
+
+> **Implementation status (2026-09-22):** the reroute to Developer + Premium
+> classic injection is implemented. See
+> `docs/adr/2026-09-22-apim-classic-vnet-injection.md`.
 
 ## Not checked
 

@@ -32,6 +32,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $moduleFile = Join-Path $RepositoryRoot 'modules\api-management\main.bicep'
+$workloadFile = Join-Path $RepositoryRoot 'modules\api-management\workload.bicep'
 $policyFile = Join-Path $RepositoryRoot 'modules\api-management\policy.bicep'
 $mainFile = Join-Path $RepositoryRoot 'main.bicep'
 $scratch = Join-Path ([System.IO.Path]::GetTempPath()) "apim-workload-isolation-$([guid]::NewGuid().ToString('N'))"
@@ -59,14 +60,16 @@ function New-GatewayConfiguration {
     $zoneScope = '/subscriptions/00000000-0000-4000-8000-000000000001/resourceGroups/rg-contract-never-deploy'
     return [ordered]@{
         enabled                  = $true
-        sku                      = 'StandardV2'
+        sku                      = 'Developer'
         capacity                 = 1
         publisherEmail           = 'contract-owner@example.invalid'
         publisherName            = 'CONTRACT OFFLINE TEST OWNER'
         audience                 = $Audience
         integrationSubnetName    = 'contract-apim-integration'
         integrationSubnetPrefix  = '10.220.4.0/27'
-        privateDnsZoneResourceId = "$zoneScope/providers/Microsoft.Network/privateDnsZones/privatelink.azure-api.net"
+        # Service-scoped zone: classic VNet injection has no private endpoint,
+        # so privatelink.azure-api.net does not apply.
+        privateDnsZoneResourceId = "$zoneScope/providers/Microsoft.Network/privateDnsZones/contract-gateway.azure-api.net"
         stopNewRequests          = $false
         callerMappings           = @(
             [ordered]@{
@@ -86,14 +89,14 @@ Write-Host 'API Management workload-isolation contract' -ForegroundColor Cyan
 [System.IO.Directory]::CreateDirectory($scratch) | Out-Null
 try {
     # ---------------------------------------------------------------------
-    # Structural: the compiled module must thread workloadKey into every
-    # per-workload resource name and into the published route.
+    # Structural: the compiled workload module must thread workloadKey into
+    # every per-workload resource name and into the published route.
     # ---------------------------------------------------------------------
-    $compiledModule = Join-Path $scratch 'api-management.json'
-    az bicep build --file $moduleFile --outfile $compiledModule | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Bicep compilation of the API Management module failed with exit code $LASTEXITCODE." }
+    $compiledWorkload = Join-Path $scratch 'api-management-workload.json'
+    az bicep build --file $workloadFile --outfile $compiledWorkload | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Bicep compilation of the API Management workload module failed with exit code $LASTEXITCODE." }
 
-    $template = Get-Content -LiteralPath $compiledModule -Raw | ConvertFrom-Json -Depth 100
+    $template = Get-Content -LiteralPath $compiledWorkload -Raw | ConvertFrom-Json -Depth 100
     $owner = [string]$template.variables.owner
     $apiPath = [string]$template.variables.apiPath
 
@@ -134,6 +137,67 @@ try {
     Assert-True `
         -Condition ($policyXml.Contains('/__API_PATH__/v1/responses') -and -not $policyXml.Contains('&quot;/inference/v1/responses&quot;')) `
         -Message 'The policy pins the request to the workload-scoped route token, not a fixed literal'
+
+    # ---------------------------------------------------------------------
+    # Cross-resource-group: a shared gateway lives in the platform resource
+    # group, so the workload children must be deployed at ITS scope. The old
+    # current-resource-group `existing` lookup silently resolved nothing.
+    # ---------------------------------------------------------------------
+    $workloadSource = Get-Content -LiteralPath $workloadFile -Raw
+    Assert-True `
+        -Condition (-not $workloadSource.Contains('../security/resource-role-assignment.bicep')) `
+        -Message 'The gateway-scoped module assigns no roles; landing zone resources are granted at the landing zone scope'
+
+    $compiledMain = Join-Path $scratch 'main.json'
+    az bicep build --file $mainFile --outfile $compiledMain | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Bicep compilation of main.bicep failed with exit code $LASTEXITCODE." }
+
+    $mainTemplate = Get-Content -LiteralPath $compiledMain -Raw | ConvertFrom-Json -Depth 100
+    $byoWorkload = $mainTemplate.resources.apiManagementWorkload
+    Assert-True `
+        -Condition ($null -ne $byoWorkload) `
+        -Message 'main.bicep deploys the workload children against an existing shared gateway'
+
+    if ($null -ne $byoWorkload) {
+        Assert-True `
+            -Condition ([string]$byoWorkload.subscriptionId -match "_apimSubscriptionId" -and
+                [string]$byoWorkload.resourceGroup -match "_apimResourceGroupName") `
+            -Message 'Workload children target the gateway subscription and resource group, not the landing zone resource group'
+
+        Assert-True `
+            -Condition ([string]$byoWorkload.condition -match '_hasExistingApiManagement') `
+            -Message 'The cross-resource-group workload deployment is gated on the BYO gateway'
+    }
+
+    # On the BYO path the delegated integration subnet and its NSG belong to the
+    # platform VNet, so the landing zone must not carve them out of its spoke.
+    $integrationNsg = $mainTemplate.resources.apiManagementNsg
+    Assert-True `
+        -Condition ($null -ne $integrationNsg -and [string]$integrationNsg.condition -match '_createApiManagement') `
+        -Message 'The integration NSG is created only when this landing zone owns the gateway'
+
+    # Bicep inlines the `subnets` variable into the VNet module parameters, so
+    # assert against the materialized parameter rather than a named variable.
+    $subnetConsumers = @(
+        foreach ($key in @('virtualNetwork', 'virtualNetworkSubnets')) {
+            $resource = $mainTemplate.resources.$key
+            if ($null -ne $resource -and $null -ne $resource.properties.parameters.subnets) {
+                [string]($resource.properties.parameters.subnets | ConvertTo-Json -Depth 30 -Compress)
+            }
+        }
+    )
+    Assert-True `
+        -Condition ($subnetConsumers.Count -gt 0) `
+        -Message 'The compiled template still materializes a subnet list'
+
+    $gatedSubnetConsumers = @($subnetConsumers | Where-Object { $_ -match '_createApiManagement' })
+    Assert-True `
+        -Condition ($gatedSubnetConsumers.Count -eq $subnetConsumers.Count) `
+        -Message 'The delegated integration subnet is added only when this landing zone owns the gateway'
+
+    Assert-True `
+        -Condition (@($subnetConsumers | Where-Object { $_ -match 'deployApiManagement''\)\), createArray\(createObject\(''name''' }).Count -eq 0) `
+        -Message 'The integration subnet is no longer gated on deployApiManagement alone, which would also fire on the BYO path'
 
     # ---------------------------------------------------------------------
     # Functional: two distinct landing-zone identities must produce fully

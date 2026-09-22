@@ -65,7 +65,9 @@ function New-Fixture {
         gateway = @{
             accessMode = 'gateway'; endpoint = "https://synthetic-gateway.azure-api.net/inference/$($profile.gateway.workloadKey)/v1/responses"
             resourceId = "$scope/providers/Microsoft.ApiManagement/service/synthetic-gateway"; audience = $profile.gateway.audience
-            privateEndpointResourceId = "$scope/providers/Microsoft.Network/privateEndpoints/synthetic-gateway-inbound"
+            hostName = 'synthetic-gateway.azure-api.net'
+            privateIpAddress = '10.220.4.4'
+            networkModel = 'classic-vnet-injection'
             backendResourceId = "$scope/providers/Microsoft.CognitiveServices/accounts/synthetic-backend"
             backendEndpoint = 'https://synthetic-backend.openai.azure.com/'
         }
@@ -341,30 +343,29 @@ Test-Case 'Private routing, active digest, required config and starter identity 
         $id = $f.output.gateway.resourceId
         $workloadKey = $f.resolution.profile.gateway.workloadKey
         $owner = "ailz-inference-dev-$workloadKey"
-        $pe = $f.output.gateway.privateEndpointResourceId
+        $injectionSubnet = "$($id -replace '/providers/.*$', '')/providers/Microsoft.Network/virtualNetworks/synthetic-spoke/subnets/synthetic-apim-integration"
         $serviceTags = @{
             'ailz-managed-by' = 'github-dev-environment'
             'ailz-environment' = $f.resolution.environment
             'ailz-owner' = $owner
         }
-        $peTags = @{} + $serviceTags
+        # Classic VNet injection: Internal mode, an injection subnet, and NO
+        # private endpoint. publicNetworkAccess stays Enabled because Azure only
+        # permits Disabled on instances that have a private endpoint, which an
+        # injected instance can never have.
+        $network = @{
+            publicNetworkAccess = 'Enabled'
+            provisioningState = 'Succeeded'
+            virtualNetworkType = 'Internal'
+            virtualNetworkConfiguration = @{ subnetResourceId = $injectionSubnet }
+            privateEndpointConnections = @()
+        }
         $reads = [Collections.Generic.List[string]]::new()
         $f.adapter.ArmGet = {
             param($resourceId, $apiVersion)
             $reads.Add($resourceId)
             if ($resourceId -eq $id) {
-                return @{ id = $id; tags = $serviceTags; properties = @{
-                    publicNetworkAccess = 'Disabled'; provisioningState = 'Succeeded'
-                    privateEndpointConnections = @(@{ properties = @{
-                        privateEndpoint = @{ id = $pe }
-                        privateLinkServiceConnectionState = @{ status = 'Approved' }
-                    } })
-                } }
-            }
-            if ($resourceId -eq $pe) {
-                return @{ id = $pe; tags = $peTags; properties = @{ provisioningState = 'Succeeded'; privateLinkServiceConnections = @(@{ properties = @{
-                    privateLinkServiceId = $id; groupIds = @('Gateway'); privateLinkServiceConnectionState = @{ status = 'Approved' }
-                } }) } }
+                return @{ id = $id; tags = $serviceTags; properties = $network }
             }
             if ($resourceId -eq "$id/apis") {
                 return @{ value = @(@{ name = $owner; properties = @{ description = "owner:$owner"; path = "inference/$workloadKey"; subscriptionRequired = $false } }) }
@@ -389,39 +390,47 @@ Test-Case 'Private routing, active digest, required config and starter identity 
         }.GetNewClosure()
         $result = Complete-Fixture $f
         Assert-True ($result.mode -ceq 'offline-test') 'Fake execution was mislabeled.'
-        Assert-True ($reads -contains $pe -and $reads -contains "$id/apis/$owner/operations") 'P3 private endpoint or governed operation verification was skipped.'
+        Assert-True ($reads -contains "$id/apis/$owner/operations") 'P3 governed operation verification was skipped.'
         foreach ($child in @('policies/policy', 'schemas/responses', 'diagnostics/applicationinsights')) {
             Assert-True ($reads -contains "$id/apis/$owner/$child") 'P3 owned API-child inventory was skipped.'
         }
         Assert-True (@($f.state.calls | Where-Object { $_.kind -eq 'native' -and $_.arguments -contains 'rest' }).Count -eq 0) 'Production gateway adapter escaped the fake management boundary.'
         $writes = @($f.state.calls | Where-Object { $_.kind -eq 'http' -and $_.method -eq 'PUT' }).Count
         $serviceTags.Remove('ailz-owner')
-        $peTags.Remove('ailz-owner')
         Complete-Fixture $f | Out-Null
         Assert-True (@($f.state.calls | Where-Object { $_.kind -eq 'http' -and $_.method -eq 'PUT' }).Count -eq $writes) 'Valid parent-pair ownership was not an idempotent rerun.'
         $serviceTags['ailz-owner'] = $owner
-        $peTags['ailz-owner'] = $owner
-        foreach ($ownership in @(
-            @{ tags = $serviceTags; kind = 'service' },
-            @{ tags = $peTags; kind = 'private endpoint' }
-        )) {
-            foreach ($key in @('ailz-managed-by', 'ailz-environment')) {
-                $expected = $ownership.tags[$key]
-                $ownership.tags.Remove($key)
-                Assert-Rejected { Complete-Fixture $f } "*$($ownership.kind) ownership conflict*"
-                $ownership.tags[$key] = 'invalid-parent-tag'
-                Assert-Rejected { Complete-Fixture $f } "*$($ownership.kind) ownership conflict*"
-                $ownership.tags[$key] = $expected
-            }
-            $ownership.tags['ailz-owner'] = 'ailz-inference-other'
-            Assert-Rejected { Complete-Fixture $f } "*$($ownership.kind) ownership conflict*"
-            $ownership.tags['ailz-owner'] = $owner
+        foreach ($key in @('ailz-managed-by', 'ailz-environment')) {
+            $expected = $serviceTags[$key]
+            $serviceTags.Remove($key)
+            Assert-Rejected { Complete-Fixture $f } '*service ownership conflict*'
+            $serviceTags[$key] = 'invalid-parent-tag'
+            Assert-Rejected { Complete-Fixture $f } '*service ownership conflict*'
+            $serviceTags[$key] = $expected
         }
-        $f.output.gateway.privateEndpointResourceId = "$pe-other"
+        $serviceTags['ailz-owner'] = 'ailz-inference-other'
+        Assert-Rejected { Complete-Fixture $f } '*service ownership conflict*'
+        $serviceTags['ailz-owner'] = $owner
+
+        # The privacy invariants that replace the private-endpoint assertions.
+        $network.virtualNetworkType = 'External'
+        Assert-Rejected { Complete-Fixture $f } '*Internal*'
+        $network.virtualNetworkType = 'None'
+        Assert-Rejected { Complete-Fixture $f } '*Internal*'
+        $network.virtualNetworkType = 'Internal'
+        $network.virtualNetworkConfiguration = $null
+        Assert-Rejected { Complete-Fixture $f } '*injection subnet*'
+        $network.virtualNetworkConfiguration = @{ subnetResourceId = $injectionSubnet }
+        $network.privateEndpointConnections = @(@{ properties = @{
+            privateEndpoint = @{ id = 'unexpected' }
+            privateLinkServiceConnectionState = @{ status = 'Approved' }
+        } })
         Assert-Rejected { Complete-Fixture $f } '*private endpoint*'
-        $f.output.gateway.Remove('privateEndpointResourceId')
-        Assert-Rejected { Complete-Fixture $f } '*private endpoint*'
-        Assert-True (@($f.state.calls | Where-Object { $_.kind -eq 'http' -and $_.method -eq 'PUT' }).Count -eq $writes) 'Ownership or declared-PE mismatch permitted configuration writes.'
+        $network.privateEndpointConnections = @()
+        $f.output.gateway.Remove('hostName')
+        Assert-Rejected { Complete-Fixture $f } '*hostname*'
+        $f.output.gateway.hostName = 'synthetic-gateway.azure-api.net'
+        Assert-True (@($f.state.calls | Where-Object { $_.kind -eq 'http' -and $_.method -eq 'PUT' }).Count -eq $writes) 'Ownership or injected-topology mismatch permitted configuration writes.'
     }
 }
 

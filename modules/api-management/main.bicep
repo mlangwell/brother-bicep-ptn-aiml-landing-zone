@@ -2,7 +2,6 @@ targetScope = 'resourceGroup'
 
 import * as const from '../../constants/constants.bicep'
 import { gatewayConfiguration } from './types.bicep'
-import { renderPolicy, gatewayNamedValues } from './policy.bicep'
 
 @description('Resolved explicit, CAF or legacy gateway name. The parent gates this module with deployApiManagement=false by default.')
 @minLength(1)
@@ -28,11 +27,8 @@ param tenantId string
 @description('Frozen, validated P1 gateway configuration. This module only accepts enabled, ordinary APIM integration.')
 param configuration gatewayConfiguration
 
-@description('Dedicated Microsoft.Web/serverFarms delegated subnet with approved NSG, routes, DNS and egress; never the app or agent subnet.')
+@description('Dedicated UNDELEGATED injection subnet with the API Management NSG rule set, routes, DNS and egress; never the app or agent subnet. Classic VNet injection forbids subnet delegation - Learn: "The subnet used to connect to the API Management instance shouldn\'t have any delegations enabled."')
 param integrationSubnetResourceId string
-
-@description('Separate private endpoint subnet. It must resolve the BYO privatelink.azure-api.net zone to the private clients.')
-param privateEndpointSubnetResourceId string
 
 @description('Foundry account resource ID; only the gateway identity receives the backend inference role here.')
 param backendAccountResourceId string
@@ -49,28 +45,46 @@ param logAnalyticsWorkspaceResourceId string
 @description('Deployment tags, merged with the reserved gateway ownership marker.')
 param tags object = {}
 
-@description('True only for observed absence or an owned already-Enabled service without an approved PE, frozen and rechecked before deployment. This never reopens an existing Disabled service. Forces stop until PE/private completion restores the approved setting.')
+@description('True only during an observed initial or interrupted provisioning pass. On classic VNet injection this NO LONGER gates public network access - see the block above - it holds the workload stop control on so the gateway serves no request until the operator has created the private DNS A record and verified resolution.')
 param initialProvisioning bool = false
 
 // One gateway is shared by many landing zones, so every per-workload resource
 // name and the public route are keyed by workloadKey. Keying by environmentName
 // alone collides the moment a second landing zone lands in the same
 // subscription and environment — which is the whole point of the shared model.
+// The workload-scoped children themselves live in ./workload.bicep so the same
+// code path serves a platform-owned gateway in another resource group.
 var owner = 'ailz-inference-${environmentName}-${workloadKey}'
-var apiPath = 'inference/${workloadKey}'
-var marker = 'owner:${owner}'
 var ownedTags = union(tags, {
   'ailz-managed-by': 'github-dev-environment'
   'ailz-environment': environmentName
   'ailz-owner': owner
 })
-var backendUrl = uri(backendEndpoint, 'openai')
 
-resource applicationInsights 'Microsoft.Insights/components@2020-02-02' existing = {
-  scope: resourceGroup(split(applicationInsightsResourceId, '/')[2], split(applicationInsightsResourceId, '/')[4])
-  name: last(split(applicationInsightsResourceId, '/'))
-}
-
+// ---------------------------------------------------------------------------
+// Network topology: classic VNet injection, Internal mode
+// ---------------------------------------------------------------------------
+// This module previously implemented the Standard v2 shape - outbound VNet
+// integration into a Microsoft.Web/serverFarms-delegated subnet plus an inbound
+// private endpoint, then publicNetworkAccess: 'Disabled'. That shape is not
+// reachable on the Developer and Premium classic tiers this landing zone now
+// targets, and the reasons are structural. Verified against Learn 2026-09-22:
+//
+//   - "In the classic API Management tiers, private endpoints aren't supported
+//     in instances injected in an internal or external virtual network."
+//   - "You can disable public network access in API Management instances
+//     configured with a private endpoint, not with other networking
+//     configurations."
+//
+// So publicNetworkAccess: 'Enabled' below is the ONLY legal value here. It is
+// not a weakened posture. Inbound privacy comes from Internal mode instead -
+// "None of the API Management endpoints are registered on the public DNS. The
+// endpoints remain inaccessible until you configure DNS for the VNet." The
+// instance keeps a public VIP, but it serves control-plane 3443 only, and the
+// injection NSG restricts even that to the ApiManagement service tag.
+//
+// Do not reintroduce privateEndpoints or a public-disable sequence here: on
+// this topology they are invalid, not merely redundant.
 module gateway 'br/public:avm/res/api-management/service:0.14.4' = {
   name: '${owner}-service'
   params: {
@@ -84,26 +98,16 @@ module gateway 'br/public:avm/res/api-management/service:0.14.4' = {
     managedIdentities: { systemAssigned: true }
     enableTelemetry: false
     enableDeveloperPortal: false
+    // Empty selects AUTOMATIC zone redundancy on Premium and is inert on
+    // Developer. The AVM default is [1,2,3], which is MANUAL mode and requires
+    // capacity to be an exact multiple of the zone count, so it must be passed
+    // explicitly rather than left to the default.
     availabilityZones: []
     customProperties: {}
-    virtualNetworkType: 'External'
+    virtualNetworkType: 'Internal'
     subnetResourceId: integrationSubnetResourceId
-    publicNetworkAccess: initialProvisioning ? 'Enabled' : 'Disabled'
-    privateEndpoints: [
-      {
-        name: '${name}-inbound'
-        location: location
-        service: 'Gateway'
-        subnetResourceId: privateEndpointSubnetResourceId
-        tags: ownedTags
-        privateDnsZoneGroup: {
-          name: 'default'
-          privateDnsZoneGroupConfigs: [
-            { privateDnsZoneResourceId: configuration.privateDnsZoneResourceId }
-          ]
-        }
-      }
-    ]
+    publicNetworkAccess: 'Enabled'
+    privateEndpoints: []
     diagnosticSettings: [
       {
         name: '${owner}-monitor'
@@ -114,10 +118,6 @@ module gateway 'br/public:avm/res/api-management/service:0.14.4' = {
       }
     ]
   }
-}
-
-resource service 'Microsoft.ApiManagement/service@2024-05-01' existing = {
-  name: name
 }
 
 module backendAndTelemetryRoles '../security/resource-role-assignment.bicep' = {
@@ -141,165 +141,85 @@ module backendAndTelemetryRoles '../security/resource-role-assignment.bicep' = {
   }
 }
 
-resource namedValues 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = [
-  for value in gatewayNamedValues(owner, environmentName, tenantId, configuration, backendEndpoint, initialProvisioning): {
-    parent: service
-    name: value.name
-    properties: {
-      displayName: value.displayName
-      secret: value.secret
-      tags: value.tags
-      value: value.value
-    }
-    dependsOn: [gateway]
+// Per-workload children live in their own module so the same code path serves
+// both a landing-zone-created gateway (this module, same resource group) and a
+// shared platform gateway (main.bicep, scoped to the platform resource group).
+module workload './workload.bicep' = {
+  name: '${owner}-workload'
+  params: {
+    apiManagementName: name
+    environmentName: environmentName
+    workloadKey: workloadKey
+    tenantId: tenantId
+    configuration: configuration
+    backendAccountResourceId: backendAccountResourceId
+    backendEndpoint: backendEndpoint
+    applicationInsightsResourceId: applicationInsightsResourceId
+    initialProvisioning: initialProvisioning
   }
-]
-
-resource backend 'Microsoft.ApiManagement/service/backends@2024-05-01' = {
-  parent: service
-  name: '${owner}-foundry'
-  properties: {
-    title: '${owner}-foundry'
-    description: marker
-    protocol: 'http'
-    url: backendUrl
-    resourceId: '${environment().resourceManager}${substring(backendAccountResourceId, 1)}'
-    tls: {
-      validateCertificateChain: true
-      validateCertificateName: true
-    }
-  }
-  dependsOn: [gateway]
+  dependsOn: [
+    gateway
+    backendAndTelemetryRoles
+  ]
 }
 
-resource logger 'Microsoft.ApiManagement/service/loggers@2024-05-01' = {
-  parent: service
-  name: '${owner}-insights'
-  properties: {
-    loggerType: 'applicationInsights'
-    description: marker
-    resourceId: applicationInsightsResourceId
-    isBuffered: true
-    credentials: {
-      connectionString: applicationInsights.properties.ConnectionString
-      identityClientId: 'SystemAssigned'
-    }
-  }
-  dependsOn: [backendAndTelemetryRoles]
+// Read back the deployed instance purely to surface its dynamically assigned
+// private VIP. Learn: "it is impossible to anticipate the private IP of the API
+// Management instance prior to its deployment." Operators need this value to
+// create the DNS A record that makes the gateway reachable at all.
+resource deployedGateway 'Microsoft.ApiManagement/service@2024-05-01' existing = {
+  name: name
 }
 
-resource api 'Microsoft.ApiManagement/service/apis@2024-05-01' = {
-  parent: service
-  name: owner
-  properties: {
-    displayName: 'Governed text Responses (${environmentName})'
-    description: marker
-    apiType: 'http'
-    path: apiPath
-    protocols: ['https']
-    subscriptionRequired: false
-    serviceUrl: backendUrl
-  }
-  dependsOn: [gateway]
-}
-
-resource schema 'Microsoft.ApiManagement/service/apis/schemas@2024-05-01' = {
-  parent: api
-  name: 'responses'
-  properties: {
-    contentType: 'application/vnd.ms-azure-apim.swagger.definitions+json'
-    document: { value: loadTextContent('./responses.schema.json') }
-  }
-}
-
-resource operation 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' = {
-  parent: api
-  name: 'responses'
-  properties: {
-    displayName: 'Create a governed text response'
-    description: marker
-    method: 'POST'
-    urlTemplate: '/v1/responses'
-    request: {
-      representations: [{ contentType: 'application/json', schemaId: schema.name, typeName: 'ResponsesRequest' }]
-    }
-  }
-  dependsOn: [apiPolicy]
-}
-
-var noBodyDiagnostic = {
-  request: { headers: ['x-correlation-id'], body: { bytes: 0 } }
-  response: { headers: ['x-correlation-id'], body: { bytes: 0 } }
-}
-
-resource diagnostic 'Microsoft.ApiManagement/service/apis/diagnostics@2024-05-01' = {
-  parent: api
-  name: 'applicationinsights'
-  properties: {
-    loggerId: logger.id
-    alwaysLog: null
-    sampling: { samplingType: 'fixed', percentage: 0 }
-    frontend: noBodyDiagnostic
-    backend: noBodyDiagnostic
-    httpCorrelationProtocol: 'None'
-    logClientIp: false
-    metrics: true
-    verbosity: 'information'
-    operationNameFormat: 'Name'
-  }
-}
-
-resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = {
-  parent: api
-  name: 'policy'
-  properties: {
-    format: 'rawxml'
-    value: renderPolicy(owner, apiPath, configuration.callerMappings)
-  }
-  dependsOn: [namedValues, backend, backendAndTelemetryRoles, diagnostic]
-}
-
-@description('Owned APIM service resource ID. Not evidence of private readiness.')
+@description('Owned APIM service resource ID. Not evidence of private readiness: on classic injection readiness also requires the private DNS A record described in facts.operatorObligations.')
 output serviceResourceId string = gateway.outputs.resourceId
 
-@description('Owned inbound PE resource ID; completion must verify approval on both PE and APIM sides before disabling public access.')
-output privateEndpointResourceId string = gateway.outputs.privateEndpoints[0].resourceId
+@description('Gateway hostname. This is the exact name the private DNS A record must serve and the exact Host header callers must send: API Management responds only to requests addressed to its configured host names and does not listen on its private IP directly.')
+output gatewayHostName string = '${name}.azure-api.net'
+
+@description('Dynamically assigned private VIP of the internal load balancer - the address the DNS A record must point at. Empty until provisioning completes, and it can change if the instance moves subnet.')
+output gatewayPrivateIpAddress string = length(deployedGateway.properties.?privateIPAddresses ?? []) > 0
+  ? (deployedGateway.properties.?privateIPAddresses ?? [''])[0]
+  : ''
 
 @description('Backend and monitoring principal, with roles assigned only at the supplied resource scopes.')
 output principalId string = gateway.outputs.systemAssignedMIPrincipalId!
 
 @description('The only governed inference route; never a fallback to a direct backend endpoint. Workload-scoped so landing zones sharing this gateway each get a distinct route.')
-output inferenceEndpoint string = 'https://${name}.azure-api.net/${apiPath}/v1/responses'
+output inferenceEndpoint string = workload.outputs.inferenceEndpoint
 
 @description('Entra audience of the owned API.')
 output audience string = configuration.audience
 
 @description('Nonsecret resource ownership and operational prerequisites. The parent must reconcile only these resources, reject conflicts and preserve unrelated estates.')
-output facts object = {
-  owner: owner
-  workloadKey: workloadKey
-  apiPath: apiPath
+output facts object = union(workload.outputs.facts, {
   serviceResourceId: gateway.outputs.resourceId
-  privateEndpointResourceId: gateway.outputs.privateEndpoints[0].resourceId
-  apiResourceId: api.id
-  operationResourceId: operation.id
-  backendResourceId: backend.id
-  loggerResourceId: logger.id
-  diagnosticResourceId: diagnostic.id
-  stopNamedValueResourceId: '${service.id}/namedValues/${owner}-stop'
-  backendAccountResourceId: backendAccountResourceId
-  initialProvisioning: initialProvisioning
-  privateCompletionRequired: initialProvisioning
-  stopNewRequests: initialProvisioning || configuration.stopNewRequests
-  approvedStopNewRequests: configuration.stopNewRequests
+  hostName: '${name}.azure-api.net'
+  networkModel: 'classic-vnet-injection'
+  virtualNetworkType: 'Internal'
+  injectionSubnetResourceId: integrationSubnetResourceId
+  subnetDelegated: false
+  privateEndpointSupported: false
+  publicNetworkAccess: 'Enabled'
+  publicNetworkAccessRationale: 'Classic injected instances cannot hold a private endpoint, and Learn permits disabling public network access only on instances that have one. Enabled is the sole legal value. Inbound privacy comes from virtualNetworkType Internal - no API Management endpoint is registered on public DNS - and the public VIP serves control-plane 3443 only, restricted by NSG to the ApiManagement service tag.'
+  privateCompletionRequired: false
   foundryIntegration: false
   appInsightsDimensionsEnablementRequired: true
   avmVersion: '0.14.4'
+  operatorObligations: [
+    'DNS A record: create a private DNS zone named exactly "${name}.azure-api.net" holding an apex (@) A record pointing at the gatewayPrivateIpAddress output, linked to every VNet that must reach the gateway. Internal mode has no public DNS registration: "The endpoints remain inaccessible until you configure DNS for the VNet."'
+    'NEVER create a private DNS zone for the apex domain "azure-api.net". Learn: "Do not create a Private DNS zone or forward lookup zone for azure-api.net." It is a shared public Azure domain and an apex private zone breaks resolution for other Azure services.'
+    'Forced tunnelling: if the injection subnet routes 0.0.0.0/0 to a hub firewall, add a user-defined route for the ApiManagement service tag with next hop type Internet, or control-plane connectivity is lost and deployment fails.'
+    'Backend resolution: the injection subnet must resolve the Foundry account privatelink zone so the gateway can reach the private-endpoint-only backend.'
+  ]
   sources: [
     'https://github.com/Azure/bicep-registry-modules/tree/e5823c10bdd9e83a8119d7e2ce40ac1c277fc195/avm/res/api-management/service'
     'https://learn.microsoft.com/azure/api-management/virtual-network-concepts'
-    'https://learn.microsoft.com/azure/api-management/integrate-vnet-outbound'
+    'https://learn.microsoft.com/azure/api-management/virtual-network-injection-resources'
+    'https://learn.microsoft.com/azure/api-management/virtual-network-reference'
+    'https://learn.microsoft.com/azure/api-management/api-management-using-with-internal-vnet'
+    'https://learn.microsoft.com/azure/api-management/private-endpoint'
     'https://learn.microsoft.com/azure/api-management/llm-token-limit-policy'
     'https://learn.microsoft.com/azure/api-management/llm-emit-token-metric-policy'
   ]
-}
+})

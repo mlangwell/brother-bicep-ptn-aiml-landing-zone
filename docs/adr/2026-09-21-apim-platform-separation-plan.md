@@ -1,6 +1,25 @@
 # Plan — separate API Management from the AI Landing Zone lifecycle
 
-**Status:** Draft for handoff. Not implemented. No Azure changes made.
+> **⚠️ SUPERSEDED (2026-09-22) — in part.**
+>
+> The **platform-separation decision in this ADR still stands**: API Management
+> is per-subscription platform infrastructure and the landing zone consumes an
+> existing gateway.
+>
+> The **tier and network topology in this ADR do not.** The tier table below
+> (Standard v2 / Premium v2), the "Architecture split" bullets describing a
+> `Microsoft.Web/serverFarms`-delegated subnet and an inbound private endpoint
+> with a `privatelink.azure-api.net` zone group, and the whole of Phase 1 have
+> been replaced by classic VNet injection in Internal mode on the Developer and
+> Premium tiers.
+>
+> The rejection of Developer tier recorded below was also reversed.
+>
+> See **`docs/adr/2026-09-22-apim-classic-vnet-injection.md`** for the reroute
+> and its reasoning. Read that ADR before acting on anything below.
+
+**Status:** Partially superseded. Platform separation implemented; tier and
+topology replaced.
 **Date:** 2026-09-21
 **Customer:** Brother
 **CI/CD target:** GitHub Actions
