@@ -120,6 +120,33 @@ param capacity int = 1
 @description('Availability zones for Premium. Leave EMPTY (the default) to select automatic zone redundancy, which is the recommended mode. Supplying explicit zones switches to manual mode, where capacity MUST be an exact multiple of the number of zones - Premium at capacity 1 with [1,2,3] will fail to deploy. Inert on Developer.')
 param availabilityZones int[] = []
 
+// ---------------------------------------------------------------------------
+// Public IP - REQUIRED for a zone-redundant injected instance
+// ---------------------------------------------------------------------------
+// Premium is zone redundant (automatically, by default, in an AZ-capable
+// region), and Learn requires a public IP resource whenever availability zone
+// support is enabled on an injected instance:
+//
+//   "When you enable availability zone support on an API Management instance
+//    that's deployed in an external or internal virtual network, you must
+//    specify a public IP address resource for the instance to use. In an
+//    internal virtual network, the public IP address is used only for
+//    management operations, not for API requests."
+//
+// This does NOT weaken the private posture: in Internal mode the address
+// carries control-plane traffic only, and no endpoint is published to public
+// DNS. Developer has no availability zones, so it needs no public IP - Learn:
+// "Starting May 2024, a public IP address resource is no longer needed when
+// deploying (injecting) an API Management instance in a VNet in internal mode."
+@description('Existing Standard SKU public IP to associate with the gateway. Required by Azure for a zone-redundant injected instance. Leave empty on Premium to have one created automatically; ignored on Developer, which has no availability zones.')
+param publicIpAddressResourceId string = ''
+
+@description('Create the zone-redundant public IP that Premium requires for availability zone support. Set false only when supplying publicIpAddressResourceId, or when deploying Premium into a region with no availability zones.')
+param deployPublicIpAddress bool = true
+
+@description('Availability zones for the created public IP. Must be zone redundant wherever the gateway is. Set to an empty list ONLY in regions without availability zone support.')
+param publicIpAvailabilityZones int[] = [1, 2, 3]
+
 @description('Publisher email recorded on the service.')
 @minLength(1)
 param publisherEmail string
@@ -175,6 +202,13 @@ var zoneRedundancyMode = sku != 'Premium'
   ? 'unavailable'
   : (empty(availabilityZones) ? 'automatic' : 'manual')
 
+// Only Premium has availability zones, so only Premium needs the public IP.
+var _needsPublicIp = sku == 'Premium'
+var _createPublicIp = _needsPublicIp && empty(publicIpAddressResourceId) && deployPublicIpAddress
+var _effectivePublicIpResourceId = !empty(publicIpAddressResourceId)
+  ? publicIpAddressResourceId
+  : (_createPublicIp ? gatewayPublicIp!.outputs.resourceId : '')
+
 var virtualNetworkSegments = split(platformVirtualNetworkResourceId, '/')
 var virtualNetworkSubscriptionId = virtualNetworkSegments[2]
 var virtualNetworkResourceGroupName = virtualNetworkSegments[4]
@@ -192,6 +226,17 @@ module injectionNetwork './network.bicep' = if (deployInjectionSubnet) {
     subnetAddressPrefix: injectionSubnetPrefix
     routeTableResourceId: routeTableResourceId
     enableDependencyServiceEndpoints: enableDependencyServiceEndpoints
+    tags: ownedTags
+  }
+}
+
+module gatewayPublicIp '../../modules/networking/api-management-public-ip.bicep' = if (_createPublicIp) {
+  name: 'platformApimPublicIp'
+  params: {
+    name: '${const.abbrs.networking.publicIPAddress}${name}'
+    location: location
+    domainNameLabel: toLower(name)
+    availabilityZones: publicIpAvailabilityZones
     tags: ownedTags
   }
 }
@@ -216,6 +261,9 @@ module gateway 'br/public:avm/res/api-management/service:0.14.4' = {
     // reachable only through the internal load balancer inside the VNet.
     virtualNetworkType: 'Internal'
     subnetResourceId: injectionSubnetResourceId
+    // Required by Azure for a zone-redundant injected instance; control-plane
+    // only in Internal mode. Null on Developer, which has no zones.
+    publicIpAddressResourceId: empty(_effectivePublicIpResourceId) ? null : _effectivePublicIpResourceId
     // Classic injection cannot hold a private endpoint, and Learn permits
     // disabling public network access ONLY on instances that have one. This is
     // the sole legal value here - see the header block. It does not expose the
@@ -289,6 +337,12 @@ output facts object = {
   publicNetworkAccess: 'Enabled'
   publicNetworkAccessRationale: 'Classic injected instances cannot hold a private endpoint, and Learn permits disabling public network access only on instances that have one. Enabled is the sole legal value. Inbound privacy comes from virtualNetworkType Internal; the public VIP serves control-plane 3443 only and the NSG restricts it to the ApiManagement service tag.'
   zoneRedundancyMode: zoneRedundancyMode
+  publicIpAddressResourceId: _effectivePublicIpResourceId
+  publicIpAddressCreated: _createPublicIp
+  publicIpRequiredForZoneRedundancy: _needsPublicIp
+  publicIpRationale: _needsPublicIp
+    ? 'Azure requires a public IP resource whenever availability zone support is enabled on an injected instance. In Internal mode that address carries management operations only, NOT API requests, so it does not expose the data plane.'
+    : 'Developer has no availability zones, and since May 2024 a public IP is not needed to inject an instance in internal mode.'
   zoneRedundancyNote: zoneRedundancyMode == 'manual'
     ? 'Manual zone selection is active. Capacity MUST be an exact multiple of the number of selected zones or the deployment fails. Prefer an empty availabilityZones list for automatic zone redundancy.'
     : (zoneRedundancyMode == 'automatic'
@@ -301,6 +355,7 @@ output facts object = {
   // are not mistaken for delivered behaviour.
   operatorObligations: [
     'DNS A record: create a private DNS zone named exactly "${name}.azure-api.net" holding an apex (@) A record that points at the gatewayPrivateIpAddress output, and link that zone to the platform VNet and to every landing zone spoke VNet that must reach the gateway. In Internal mode Learn requires customer-managed DNS: "you must provide your own DNS solution".'
+    'Re-check that A record after ANY availability zone change. Learn: "Changing the availability zone configuration of an existing API Management Premium instance changes the public virtual IP (VIP) address and, if the instance is deployed in internal virtual network mode, the private VIP address." That includes switching between automatic and manual zones. The DNS record IS the reachability mechanism here, so a stale record silently breaks every caller.'
     'NEVER create a private DNS zone for the apex domain "azure-api.net". Learn: "Do not create a Private DNS zone or forward lookup zone for azure-api.net." It is a shared public Azure domain; an apex private zone becomes authoritative inside the VNet and breaks resolution for other Azure services.'
     'DNS ordering: if the platform VNet uses custom DNS servers, configure them BEFORE deploying this gateway. Learn: otherwise "you\'ll need to update the API Management service each time you change the DNS server(s) by running the Apply Network Configuration Operation".'
     'Forced tunnelling: if the injection subnet routes 0.0.0.0/0 to a hub firewall, add a user-defined route for the ApiManagement service tag with next hop type Internet. Learn: when force tunnelled "the responses won\'t symmetrically map back to these inbound source IPs and connectivity to the management endpoint is lost". Learn also states this bypass "isn\'t considered a significant security risk" because inbound 3443 is already restricted to the ApiManagement service tag.'

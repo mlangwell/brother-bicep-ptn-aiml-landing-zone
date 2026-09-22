@@ -190,35 +190,195 @@ try {
         -Condition ($platformNetworkSource -match 'api-management-injection-nsg\.bicep') `
         -Message 'The platform path shares the same authoritative NSG rule set, so the two paths cannot drift'
 
-    foreach ($required in @(
-        @{ tag = 'ApiManagement'; port = '3443'; why = 'control-plane management endpoint' },
-        @{ tag = 'AzureLoadBalancer'; port = '6390'; why = 'infrastructure load balancer health probe' }
+    # ---------------------------------------------------------------------
+    # NSG rules, asserted STRUCTURALLY against the compiled ARM body.
+    # ---------------------------------------------------------------------
+    # An earlier version of this test grepped the .bicep source for a service
+    # tag and, separately, for a port number, anywhere in the file. That could
+    # not bind tag, port and direction to the SAME rule, so it survived three
+    # internet-exposing mutations: widening the 3443 source tag to '*',
+    # flipping that rule to Outbound, and adding an inbound '*' -> :443 rule.
+    # Parsing the compiled template and asserting per rule closes that gap.
+    $nsgTemplate = Build-Template -Path $nsgFile -OutFile (Join-Path $scratch 'injection-nsg.json') |
+        ConvertFrom-Json -Depth 100
+    # Bicep emits `resources` as either an array or a symbolic-name-keyed object
+    # depending on languageVersion. Handle both rather than assuming one.
+    $nsgResource = $null
+    if ($nsgTemplate.resources -is [System.Collections.IEnumerable] -and $nsgTemplate.resources -isnot [string] -and
+        $nsgTemplate.resources -isnot [System.Management.Automation.PSCustomObject]) {
+        $nsgResource = @($nsgTemplate.resources | Where-Object { [string]$_.type -eq 'Microsoft.Network/networkSecurityGroups' })[0]
+    }
+    else {
+        $nsgResource = @($nsgTemplate.resources.PSObject.Properties.Value |
+            Where-Object { [string]$_.type -eq 'Microsoft.Network/networkSecurityGroups' })[0]
+    }
+    Assert-True `
+        -Condition ($null -ne $nsgResource) `
+        -Message 'The compiled injection NSG template emits a network security group'
+    $rules = @($nsgResource.properties.securityRules)
+
+    Assert-True `
+        -Condition ($rules.Count -ge 9) `
+        -Message "The injection NSG declares its full rule set (found $($rules.Count))"
+
+    function Get-Rule {
+        param([string]$Name)
+        return ($rules | Where-Object { [string]$_.name -eq $Name } | Select-Object -First 1)
+    }
+
+    # Each required rule is asserted as a whole: direction, access, protocol,
+    # source and destination together. A mutation to any single field fails.
+    foreach ($spec in @(
+        @{ n = 'AllowApiManagementControlPlaneInbound'; dir = 'Inbound'; proto = 'Tcp'; src = 'ApiManagement'; dst = 'VirtualNetwork'; port = '3443' },
+        @{ n = 'AllowAzureLoadBalancerInbound'; dir = 'Inbound'; proto = 'Tcp'; src = 'AzureLoadBalancer'; dst = 'VirtualNetwork'; port = '6390' },
+        @{ n = 'AllowStorageOutbound'; dir = 'Outbound'; proto = 'Tcp'; src = 'VirtualNetwork'; dst = 'Storage'; port = '443' },
+        @{ n = 'AllowSqlOutbound'; dir = 'Outbound'; proto = 'Tcp'; src = 'VirtualNetwork'; dst = 'Sql'; port = '1433' },
+        @{ n = 'AllowKeyVaultOutbound'; dir = 'Outbound'; proto = 'Tcp'; src = 'VirtualNetwork'; dst = 'AzureKeyVault'; port = '443' },
+        @{ n = 'AllowCertificateValidationOutbound'; dir = 'Outbound'; proto = 'Tcp'; src = 'VirtualNetwork'; dst = 'Internet'; port = '80' },
+        @{ n = 'AllowMicrosoftEntraIdOutbound'; dir = 'Outbound'; proto = 'Tcp'; src = 'VirtualNetwork'; dst = 'AzureActiveDirectory'; port = '443' }
     )) {
+        $rule = Get-Rule $spec.n
+        if ($null -eq $rule) {
+            Add-Failure "The injection NSG is missing the required rule $($spec.n)"
+            continue
+        }
+        $p = $rule.properties
+        $ok = ([string]$p.direction -ceq $spec.dir) -and
+              ([string]$p.access -ceq 'Allow') -and
+              ([string]$p.protocol -ceq $spec.proto) -and
+              ([string]$p.sourceAddressPrefix -ceq $spec.src) -and
+              ([string]$p.destinationAddressPrefix -ceq $spec.dst) -and
+              ([string]$p.destinationPortRange -ceq $spec.port)
         Assert-True `
-            -Condition ($nsgSource -match [regex]::Escape($required.tag) -and $nsgSource -match "destinationPortRange:\s*'$($required.port)'") `
-            -Message "The injection NSG allows inbound $($required.tag) on $($required.port) ($($required.why))"
+            -Condition $ok `
+            -Message "$($spec.n) is exactly $($spec.dir) Allow $($spec.proto) $($spec.src) -> $($spec.dst):$($spec.port)"
     }
 
-    foreach ($tag in @('Storage', 'Sql', 'AzureKeyVault', 'AzureMonitor', 'AzureActiveDirectory')) {
-        Assert-True `
-            -Condition ($nsgSource -match "destinationAddressPrefix:\s*'$tag'") `
-            -Message "The injection NSG allows the required outbound dependency on $tag"
-    }
+    # AzureMonitor uses destinationPortRanges (plural) for 1886 + 443.
+    $monitor = Get-Rule 'AllowAzureMonitorOutbound'
+    Assert-True `
+        -Condition ($null -ne $monitor -and
+            [string]$monitor.properties.direction -ceq 'Outbound' -and
+            [string]$monitor.properties.destinationAddressPrefix -ceq 'AzureMonitor' -and
+            (@($monitor.properties.destinationPortRanges) -contains '1886') -and
+            (@($monitor.properties.destinationPortRanges) -contains '443')) `
+        -Message 'AllowAzureMonitorOutbound is Outbound to AzureMonitor on both 1886 and 443'
 
-    # Internet:80,443 INBOUND is external-mode only. Allowing it would defeat the
-    # entire point of Internal mode. Outbound Internet:80 for CRL/OCSP is
-    # required and legitimate, so the assertion is direction-specific.
-    $inboundInternet = [regex]::Matches(
-        $nsgSource,
-        "sourceAddressPrefix:\s*'Internet'"
+    $dns = Get-Rule 'AllowDnsOutbound'
+    Assert-True `
+        -Condition ($null -ne $dns -and
+            [string]$dns.properties.direction -ceq 'Outbound' -and
+            [string]$dns.properties.destinationPortRange -ceq '53') `
+        -Message 'AllowDnsOutbound is Outbound on port 53'
+
+    # ---------------------------------------------------------------------
+    # The exposure check. This is the assertion that matters most: it must
+    # reject ANY inbound rule whose source is broader than a specific Azure
+    # service tag or the VNet itself. '*' is strictly broader than 'Internet',
+    # so matching only on 'Internet' was insufficient.
+    # ---------------------------------------------------------------------
+    $permittedInboundSources = @('ApiManagement', 'AzureLoadBalancer', 'VirtualNetwork')
+    $inboundRules = @($rules | Where-Object { [string]$_.properties.direction -ceq 'Inbound' })
+    $exposing = @(
+        foreach ($rule in $inboundRules) {
+            $src = [string]$rule.properties.sourceAddressPrefix
+            if ([string]$rule.properties.access -cne 'Allow') { continue }
+            if ($src -notin $permittedInboundSources) { "$($rule.name) (source '$src')" }
+        }
     )
     Assert-True `
-        -Condition ($inboundInternet.Count -eq 0) `
-        -Message 'The injection NSG allows no inbound from Internet; that rule is external-mode only and would expose the data plane'
+        -Condition ($exposing.Count -eq 0) `
+        -Message "Every inbound Allow rule sources from a specific Azure service tag or the VNet$(if ($exposing.Count) { ' - VIOLATIONS: ' + ($exposing -join ', ') })"
+
+    # Internal mode must never carry the external-mode client-traffic rules.
+    Assert-True `
+        -Condition (@($inboundRules | Where-Object { [string]$_.properties.sourceAddressPrefix -cin @('Internet', '*', '0.0.0.0/0') }).Count -eq 0) `
+        -Message 'No inbound rule sources from Internet, * or 0.0.0.0/0; those are external-mode only and would expose the data plane'
 
     Assert-True `
-        -Condition ($nsgSource -notmatch "sourceAddressPrefix:\s*'AzureTrafficManager'") `
-        -Message 'The injection NSG carries no AzureTrafficManager rule, which applies only to external multi-region deployments'
+        -Condition (@($inboundRules | Where-Object { [string]$_.properties.sourceAddressPrefix -ceq 'AzureTrafficManager' }).Count -eq 0) `
+        -Message 'No AzureTrafficManager rule, which applies only to external multi-region deployments'
+
+    # The module advertises its rule names in an output. That claim is only
+    # meaningful if something checks it against the rules actually declared.
+    $declaredNames = @($rules | ForEach-Object { [string]$_.name } | Sort-Object)
+    $advertisedNames = @($nsgTemplate.outputs.ruleNames.value | ForEach-Object { [string]$_ } | Sort-Object)
+    Assert-True `
+        -Condition (($declaredNames -join '|') -ceq ($advertisedNames -join '|')) `
+        -Message 'The ruleNames output matches the rules actually declared, so a dropped rule cannot be misreported to the operator'
+
+    # ---------------------------------------------------------------------
+    # Public IP: required by Azure for a zone-redundant injected instance.
+    # ---------------------------------------------------------------------
+    # Learn, reliability-api-management: "When you enable availability zone
+    # support on an API Management instance that's deployed in an external or
+    # internal virtual network, you must specify a public IP address resource
+    # for the instance to use." Premium is zone redundant by default in an
+    # AZ-capable region, so Premium without a public IP fails to deploy - and
+    # that failure is invisible to compilation. Hence these assertions.
+    #
+    # The same Learn page: "In an internal virtual network, the public IP
+    # address is used only for management operations, not for API requests."
+    # So this is not a data-plane exposure, and must not be "hardened" away.
+    foreach ($path in @(
+        @{ name = 'landing-zone-created gateway'; source = $moduleSource },
+        @{ name = 'platform-owned gateway'; source = $platformSource }
+    )) {
+        Assert-True `
+            -Condition ($path.source -match 'publicIpAddressResourceId:\s*empty\(_effectivePublicIpResourceId\)\s*\?\s*null\s*:\s*_effectivePublicIpResourceId') `
+            -Message "The $($path.name) passes a public IP to the gateway, which Azure requires for zone redundancy, and null when there is none"
+
+        Assert-True `
+            -Condition ($path.source -match "_needsPublicIp\s*=\s*(configuration\.)?sku\s*==\s*'Premium'") `
+            -Message "The $($path.name) requires a public IP exactly when the tier is Premium, the only classic tier with availability zones"
+
+        # Both paths must expose zone control. A hardcoded [1,2,3] cannot deploy
+        # into a region without availability zones, so a path that omits this
+        # makes Premium undeployable there - and the two paths must not drift.
+        Assert-True `
+            -Condition ($path.source -match 'availabilityZones:\s*publicIpAvailabilityZones') `
+            -Message "The $($path.name) passes public IP zones explicitly rather than hardcoding zone redundancy"
+    }
+
+    $pipFile = Join-Path $RepositoryRoot 'modules\networking\api-management-public-ip.bicep'
+    Assert-True `
+        -Condition (Test-Path -LiteralPath $pipFile) `
+        -Message 'The shared API Management public IP module exists'
+
+    if (Test-Path -LiteralPath $pipFile) {
+        $pipTemplate = Build-Template -Path $pipFile -OutFile (Join-Path $scratch 'apim-public-ip.json') |
+            ConvertFrom-Json -Depth 100
+        $pipResource = $null
+        if ($pipTemplate.resources -is [System.Collections.IEnumerable] -and $pipTemplate.resources -isnot [string] -and
+            $pipTemplate.resources -isnot [System.Management.Automation.PSCustomObject]) {
+            $pipResource = @($pipTemplate.resources | Where-Object { [string]$_.type -eq 'Microsoft.Network/publicIPAddresses' })[0]
+        }
+        else {
+            $pipResource = @($pipTemplate.resources.PSObject.Properties.Value |
+                Where-Object { [string]$_.type -eq 'Microsoft.Network/publicIPAddresses' })[0]
+        }
+
+        Assert-True `
+            -Condition ($null -ne $pipResource) `
+            -Message 'The public IP module emits a public IP address resource'
+
+        if ($null -ne $pipResource) {
+            # Both are mandatory for API Management VNet deployments on stv2.
+            # Basic or Dynamic is rejected by the platform, at deploy time only.
+            Assert-True `
+                -Condition ([string]$pipResource.sku.name -ceq 'Standard') `
+                -Message 'The gateway public IP is Standard SKU, which API Management VNet deployment requires'
+
+            Assert-True `
+                -Condition ([string]$pipResource.properties.publicIPAllocationMethod -ceq 'Static') `
+                -Message 'The gateway public IP uses Static allocation, which API Management VNet deployment requires'
+
+            # Learn: "ensure you assign a DNS name label to it."
+            Assert-True `
+                -Condition ($null -ne $pipResource.properties.dnsSettings.domainNameLabel) `
+                -Message 'The gateway public IP carries a DNS name label, which Learn requires for an injected instance'
+        }
+    }
 
     # ---------------------------------------------------------------------
     # DNS: service-scoped zone only. An apex azure-api.net private zone is

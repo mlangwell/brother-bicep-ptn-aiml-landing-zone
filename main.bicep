@@ -397,7 +397,7 @@ param existingJumpboxResourceId string?
 @description('DEPRECATED (v2.0.0). Legacy v1.x consolidated switch for jumpbox + Bastion + NAT Gateway. Provided as a transitional fallback so v1.x parameter files continue to deploy unmodified — explicit `deployJumpbox` / `deployBastion` / `deployNatGateway` values ALWAYS take precedence over this flag. Will be REMOVED in v3.0.0; migrate to the three component-specific flags.')
 param deployVM bool?
 
-@description('Deploy the virtual network subnets.')
+@description('Deploy the virtual network subnets. NOTE for API Management: setting this to `false` alongside `useExistingVNet: true` does NOT stop the gateway being deployed — it only stops this template creating the gateway\'s injection subnet and its network security group. The pre-existing subnet must then be undelegated and already carry the required classic-injection NSG rules (see `modules/networking/api-management-injection-nsg.bicep`), or the internal load balancer rejects all inbound traffic and the gateway fails. The `injectionNsgManaged` gateway fact reports which side owns the NSG.')
 param deploySubnets bool = true
 
 @description('Will deploy network security groups.')
@@ -1518,6 +1518,28 @@ var baseSubnets = [
 // is secure by default and rejects all inbound traffic". The rule set is shared
 // with platform/api-management/network.bicep so the two gateway creation paths
 // cannot drift apart.
+//
+// OPERATOR OBLIGATION - BYO virtual network without subnet management.
+// This template manages the injection NSG only when it also manages the subnet.
+// With `useExistingVNet: true` AND `deploySubnets: false` the gateway below is
+// STILL deployed, into a subnet this template does not create, so the NSG is
+// the operator's responsibility. That pre-existing subnet MUST be undelegated
+// and MUST already carry this exact rule set, or the gateway will fail: Learn,
+// virtual-network-reference, "It is required to assign a Network Security Group
+// to your VNet in order for the Azure Load Balancer to work", and
+// virtual-network-injection-resources, "A network security group (NSG) is
+// required to explicitly allow inbound connectivity, because the load balancer
+// used internally by API Management is secure by default and rejects all
+// inbound traffic." This mirrors `deployInjectionSubnet: false` on
+// platform/api-management/main.bicep. The `injectionNsgManaged` gateway fact
+// reports which side owns it, so the obligation is visible after deployment
+// rather than only in this comment.
+//
+// The condition below is deliberately written inline rather than hoisted into a
+// variable: Test-ApiManagementWorkloadIsolationContract.ps1 asserts on the
+// COMPILED condition of this resource and must be able to see
+// `_createApiManagement` in it. A variable would compile to
+// `[variables('...')]` and silently blind that check.
 module apiManagementNsg 'modules/networking/api-management-injection-nsg.bicep' = if (_createApiManagement && (!useExistingVNet || deploySubnets)) {
   name: 'apiManagementIntegrationNsg'
   params: {
@@ -4240,6 +4262,10 @@ output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
     hostName: deployApiManagement ? '${_effectiveApiManagementName}.azure-api.net' : ''
     privateIpAddress: _createApiManagement ? apiManagement!.outputs.gatewayPrivateIpAddress : ''
     networkModel: deployApiManagement ? 'classic-vnet-injection' : ''
+    // False means this template did NOT create the injection NSG, so the
+    // operator owns it on the pre-existing subnet. Classic injection cannot
+    // work without one, so this is a live obligation, not a preference.
+    injectionNsgManaged: _createApiManagement && (!useExistingVNet || deploySubnets)
     endpoint: _inferenceGatewayEndpoint
     audience: apiManagementConfiguration.audience
     backendResourceId: aiFoundryAccountResourceId

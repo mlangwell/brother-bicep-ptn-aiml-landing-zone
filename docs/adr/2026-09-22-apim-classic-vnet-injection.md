@@ -124,11 +124,20 @@ Other structural changes:
 - **A rule-carrying NSG.** `modules/networking/network-security-group.bicep`
   creates an NSG with **zero rules**, which blocks everything, because "the load
   balancer used internally by API Management is secure by default and rejects
-  all inbound traffic." New shared module
-  `modules/networking/api-management-injection-nsg.bicep` carries the nine
-  required rules and is consumed by **both** gateway paths so they cannot drift.
-  The external-mode-only `Internet:80,443` and `AzureTrafficManager:443` inbound
-  rules are deliberately absent.
+  all inbound traffic." Learn is also explicit that the NSG itself is
+  mandatory: "It is required to assign a Network Security Group to your VNet in
+  order for the Azure Load Balancer to work." New shared module
+  `modules/networking/api-management-injection-nsg.bicep` carries nine rules and
+  is consumed by **both** gateway paths so they cannot drift. Those nine are not
+  uniformly "required", and the module says so rather than flattening it: seven
+  are bold *and* "External & Internal" in the Learn required-ports table
+  (`ApiManagement:3443` in, `AzureLoadBalancer:6390` in, `Storage:443`,
+  `Sql:1433`, `AzureKeyVault:443`, `AzureMonitor:1886+443`, `Internet:80`);
+  `AzureActiveDirectory:443` is marked *optional* there and is required only
+  because this workload's inbound policy is `validate-azure-ad-token`; and
+  `DNS:53` is absent from the table entirely, coming instead from the separate
+  "DNS access" section. The external-mode-only `Internet:80,443` and
+  `AzureTrafficManager:443` inbound rules are deliberately absent.
 - **Service endpoints on by default.** This landing zone force-tunnels
   `0.0.0.0/0` to a hub firewall, and Learn "strongly recommend[s] enabling
   service endpoints directly from the API Management subnet to dependent
@@ -195,11 +204,20 @@ templates, because a deployment can be entirely healthy and still unreachable:
 following are green:
 
 - `az bicep build` / `az bicep lint` on `main.bicep` and both platform templates
-- compiled size gate (2.957 MB against a 3.5 MB working budget)
+- compiled size gate (2.963 MB against a 3.5 MB working budget)
 - `Test-ApiManagementWorkloadIsolationContract.ps1`
 - `Test-ApiManagementClassicInjectionContract.ps1` (new; mutation-verified —
   reverting to External mode produces 4 failures, reintroducing a private
-  endpoint produces 1)
+  endpoint produces 1). The NSG assertions parse the **compiled ARM body** and
+  bind tag, port and direction per rule, rather than grepping the Bicep source.
+  That rewrite was forced by a failed mutation round: the original text-grep
+  form survived widening the 3443 inbound source tag to `*`, flipping that rule
+  to `Outbound`, and adding an inbound `*` → `VirtualNetwork:443` rule, because
+  it could not bind a tag to the same rule as a port. All four of those
+  mutations, plus deleting a required rule, now fail the contract. The public IP
+  assertions are mutation-verified the same way (dropping the public IP from the
+  gateway, `Standard`→`Basic`, `Static`→`Dynamic`, and dropping zone
+  pass-through all fail).
 - `Invoke-PreflightChecks.Tests.ps1` — 73 tests
 - `Test-GitHubEnvironment.ps1` — 13 suites
 - `Validate-CopilotAssets.ps1`
@@ -210,6 +228,34 @@ on the undelegated subnet with these NSG rules; that the `ApiManagement` UDR
 bypass is correctly configured on the hub route table; that private DNS resolves
 from a spoke to the gateway; that the gateway reaches the Foundry private
 endpoint; and that Premium automatic zone redundancy applies as expected.
+
+### Known coverage gap: the NSG is not inspected at runtime
+
+Worth stating plainly, because the previous design did not have this gap. Under
+Standard v2 the public-access control was a **service property**
+(`publicNetworkAccess: 'Disabled'`) that Azure enforced itself, regardless of
+any NSG. Under classic injection the control of the public VIP **is the NSG** —
+there is no service-level equivalent, since `publicNetworkAccess` cannot be
+`Disabled` on an injected instance at all (§4).
+
+`Assert-GatewayInjection` checks `virtualNetworkType`, subnet identity and the
+absence of a private endpoint. **Nothing — offline or at runtime — reads the
+injection subnet's NSG or its rules.** So a gateway whose subnet NSG was widened
+out of band, or which was deployed onto an operator-owned subnet carrying the
+wrong rules, passes every check this repository performs.
+
+**Accepted, with the mitigation named rather than implied.** The
+infrastructure-as-code path is covered: the rule set is a single shared module
+consumed by both gateway paths, and the mutation-verified contract test above
+fails on exactly the widenings that would matter. What is *not* covered is drift
+introduced outside this template, and the `deploySubnets: false` BYO-subnet case
+where the operator owns the NSG entirely — see the `injectionNsgManaged` gateway
+fact, which reports which side owns it.
+
+Closing this at runtime would mean adding subnet → NSG → rule ARM reads to
+`Gateway.psm1`, widening its transport contract. That is deliberately deferred,
+not overlooked. Until it is done, **Azure Policy or equivalent drift detection on
+the injection subnet's NSG is the operator's control, not this template's.**
 
 ## Open items
 

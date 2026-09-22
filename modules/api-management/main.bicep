@@ -42,6 +42,17 @@ param applicationInsightsResourceId string
 @description('Existing Log Analytics workspace for owned service diagnostics. This does not create competing AMPLS/DNS topology.')
 param logAnalyticsWorkspaceResourceId string
 
+@description('Existing Standard SKU public IP to associate with the gateway. Azure REQUIRES one whenever availability zone support is enabled on an injected instance, which means whenever the tier is Premium. Leave empty on Premium to have a zone-redundant one created automatically. Ignored on Developer, which has no availability zones and, since May 2024, needs no public IP to be injected in internal mode. In Internal mode this address carries management operations only, NOT API requests, so it does not expose the data plane.')
+param publicIpAddressResourceId string = ''
+
+// Kept in step with platform/api-management/main.bicep, which exposes the same
+// knob. A public IP carrying `zones` cannot deploy into a region that has no
+// availability zones, so a hardcoded [1,2,3] would make Premium undeployable
+// there. Set this to [] for such a region; the gateway is not zone redundant
+// there either, so a regional address is the correct pairing.
+@description('Availability zones for the automatically created public IP. Must match the zone redundancy of the gateway itself. Set to an empty list ONLY when deploying into a region with no availability zone support, where a zonal public IP cannot be created.')
+param publicIpAvailabilityZones int[] = [1, 2, 3]
+
 @description('Deployment tags, merged with the reserved gateway ownership marker.')
 param tags object = {}
 
@@ -60,6 +71,26 @@ var ownedTags = union(tags, {
   'ailz-environment': environmentName
   'ailz-owner': owner
 })
+
+// Only Premium has availability zones, and Azure requires a public IP whenever
+// zone support is enabled on an injected instance. See the comment block on the
+// gateway module below.
+var _needsPublicIp = configuration.sku == 'Premium'
+var _createPublicIp = _needsPublicIp && empty(publicIpAddressResourceId)
+var _effectivePublicIpResourceId = !empty(publicIpAddressResourceId)
+  ? publicIpAddressResourceId
+  : (_createPublicIp ? gatewayPublicIp!.outputs.resourceId : '')
+
+module gatewayPublicIp '../networking/api-management-public-ip.bicep' = if (_createPublicIp) {
+  name: '${owner}-pip'
+  params: {
+    name: '${const.abbrs.networking.publicIPAddress}${name}'
+    location: location
+    domainNameLabel: toLower(name)
+    availabilityZones: publicIpAvailabilityZones
+    tags: ownedTags
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Network topology: classic VNet injection, Internal mode
@@ -106,6 +137,13 @@ module gateway 'br/public:avm/res/api-management/service:0.14.4' = {
     customProperties: {}
     virtualNetworkType: 'Internal'
     subnetResourceId: integrationSubnetResourceId
+    // Required by Azure for a zone-redundant injected instance. Learn:
+    // "When you enable availability zone support on an API Management instance
+    // that's deployed in an external or internal virtual network, you must
+    // specify a public IP address resource for the instance to use. In an
+    // internal virtual network, the public IP address is used only for
+    // management operations, not for API requests."
+    publicIpAddressResourceId: empty(_effectivePublicIpResourceId) ? null : _effectivePublicIpResourceId
     publicNetworkAccess: 'Enabled'
     privateEndpoints: []
     diagnosticSettings: [
@@ -201,6 +239,9 @@ output facts object = union(workload.outputs.facts, {
   subnetDelegated: false
   privateEndpointSupported: false
   publicNetworkAccess: 'Enabled'
+  publicIpAddressResourceId: _effectivePublicIpResourceId
+  publicIpAddressCreated: _createPublicIp
+  publicIpRequiredForZoneRedundancy: _needsPublicIp
   publicNetworkAccessRationale: 'Classic injected instances cannot hold a private endpoint, and Learn permits disabling public network access only on instances that have one. Enabled is the sole legal value. Inbound privacy comes from virtualNetworkType Internal - no API Management endpoint is registered on public DNS - and the public VIP serves control-plane 3443 only, restricted by NSG to the ApiManagement service tag.'
   privateCompletionRequired: false
   foundryIntegration: false
@@ -208,6 +249,7 @@ output facts object = union(workload.outputs.facts, {
   avmVersion: '0.14.4'
   operatorObligations: [
     'DNS A record: create a private DNS zone named exactly "${name}.azure-api.net" holding an apex (@) A record pointing at the gatewayPrivateIpAddress output, linked to every VNet that must reach the gateway. Internal mode has no public DNS registration: "The endpoints remain inaccessible until you configure DNS for the VNet."'
+    'Re-check that A record after ANY availability zone change on Premium. Learn: changing the availability zone configuration "changes the public virtual IP (VIP) address and, if the instance is deployed in internal virtual network mode, the private VIP address."'
     'NEVER create a private DNS zone for the apex domain "azure-api.net". Learn: "Do not create a Private DNS zone or forward lookup zone for azure-api.net." It is a shared public Azure domain and an apex private zone breaks resolution for other Azure services.'
     'Forced tunnelling: if the injection subnet routes 0.0.0.0/0 to a hub firewall, add a user-defined route for the ApiManagement service tag with next hop type Internet, or control-plane connectivity is lost and deployment fails.'
     'Backend resolution: the injection subnet must resolve the Foundry account privatelink zone so the gateway can reach the private-endpoint-only backend.'

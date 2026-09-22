@@ -21,8 +21,27 @@ targetScope = 'resourceGroup'
 // connectivity, because the load balancer used internally by API Management is
 // secure by default and rejects all inbound traffic."
 //
-// Every rule below is marked "External & Internal" in the Learn required-ports
-// table. The two External-ONLY rules are deliberately ABSENT, because this
+// Rule provenance, stated precisely, because "required" is not uniform across
+// this set and flattening it would misrepresent Learn. The required-ports table
+// bolds the Purpose cell of every configuration "required for successful
+// deployment and operation of the API Management service"; entries "labeled
+// 'optional' enable specific features ... They are not required for the overall
+// health of the service."
+//
+//   - SEVEN of the nine rules below are bold AND marked "External & Internal",
+//     so they are genuinely required for an Internal-mode instance:
+//     ApiManagement:3443 in, AzureLoadBalancer:6390 in, Storage:443,
+//     Sql:1433, AzureKeyVault:443, AzureMonitor:1886+443, Internet:80.
+//     (Learn separately notes 6390 is not required on Developer, where a single
+//     compute unit sits behind the LB, but "becomes critical" on Premium.)
+//   - AllowMicrosoftEntraIdOutbound is marked "(optional)" in that table. It is
+//     required by THIS workload, because the inbound API policy is
+//     validate-azure-ad-token. That is a workload decision, not a Learn one.
+//   - AllowDnsOutbound does not appear in the table at all. It comes from the
+//     separate "DNS access" section: "Outbound access on port 53 is required
+//     for communication with DNS servers."
+//
+// The two bold External-ONLY rules are deliberately ABSENT, because this
 // gateway is always injected in Internal mode and adding either would expose the
 // data plane to the internet:
 //
