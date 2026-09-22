@@ -1,0 +1,218 @@
+<policies>
+  <inbound>
+    <set-variable name="stop-new-requests" value="{{__OWNER__-stop}}" />
+    <set-variable name="configuration" value="@(Encoding.UTF8.GetString(Convert.FromBase64String(&quot;{{__OWNER__-configuration}}&quot;)))" />
+    <validate-azure-ad-token tenant-id="{{__OWNER__-tenant}}" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="A valid gateway access token is required." output-token-variable-name="validated-jwt">
+      <audiences>
+        <audience>{{__OWNER__-audience}}</audience>
+      </audiences>
+      <required-claims>
+        <claim name="tid" match="all">
+          <value>{{__OWNER__-tenant}}</value>
+        </claim>
+      </required-claims>
+    </validate-azure-ad-token>
+    <set-variable name="caller-id" value="@{
+      var jwt = (Jwt)context.Variables[&quot;validated-jwt&quot;];
+      var oid = jwt.Claims.GetValueOrDefault(&quot;oid&quot;, &quot;&quot;);
+      var tid = jwt.Claims.GetValueOrDefault(&quot;tid&quot;, &quot;&quot;);
+      var config = JObject.Parse((string)context.Variables[&quot;configuration&quot;]);
+      if (!Regex.IsMatch(oid, &quot;^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$&quot;) ||
+          !String.Equals(tid, (string)config[&quot;tenantId&quot;], StringComparison.OrdinalIgnoreCase)) { return &quot;&quot;; }
+      return oid.ToLowerInvariant();
+    }" />
+    <set-variable name="mapping" value="@{
+      var config = JObject.Parse((string)context.Variables[&quot;configuration&quot;]);
+      var oid = (string)context.Variables[&quot;caller-id&quot;];
+      var matches = ((JArray)config[&quot;callerMappings&quot;]).Where(m =&gt; String.Equals((string)m[&quot;objectId&quot;], oid, StringComparison.OrdinalIgnoreCase)).ToArray();
+      if (matches.Length != 1) { return &quot;{}&quot;; }
+      var mapping = matches[0];
+      if (mapping[&quot;tokensPerMinute&quot;] == null || mapping[&quot;tokenQuota&quot;] == null ||
+          mapping[&quot;tokensPerMinute&quot;].Type != JTokenType.Integer || mapping[&quot;tokenQuota&quot;].Type != JTokenType.Integer ||
+          (long)mapping[&quot;tokensPerMinute&quot;] &lt;= 0 || (long)mapping[&quot;tokenQuota&quot;] &lt;= 0 ||
+          !new [] { &quot;Hourly&quot;, &quot;Daily&quot;, &quot;Weekly&quot;, &quot;Monthly&quot;, &quot;Yearly&quot; }.Contains((string)mapping[&quot;tokenQuotaPeriod&quot;])) { return &quot;{}&quot;; }
+      return mapping.ToString();
+    }" />
+    <choose>
+      <when condition="@(context.Request.PrivateEndpointConnection == null || (string)context.Variables[&quot;mapping&quot;] == &quot;{}&quot;)">
+        <trace source="__OWNER__" severity="information">
+          <message>request-rejected</message>
+          <metadata name="correlation" value="@(context.RequestId.ToString())" />
+          <metadata name="reason" value="private-caller-required" />
+        </trace>
+        <return-response>
+          <set-status code="403" reason="Forbidden" />
+          <set-body>{"error":{"code":"gateway_forbidden","message":"An approved private caller is required."}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+    <set-variable name="project" value="@((string)JObject.Parse((string)context.Variables[&quot;mapping&quot;])[&quot;project&quot;])" />
+    <set-variable name="request-check" value="@{
+      if (context.Request.Method != &quot;POST&quot; || context.Request.Url.Path != &quot;/__API_PATH__/v1/responses&quot; ||
+          !String.IsNullOrEmpty(context.Request.Url.QueryString)) { return &quot;route-forbidden&quot;; }
+      var allowedHeaders = new [] {
+        &quot;authorization&quot;, &quot;content-type&quot;, &quot;content-length&quot;, &quot;accept&quot;, &quot;accept-encoding&quot;, &quot;user-agent&quot;, &quot;host&quot;, &quot;connection&quot;,
+        &quot;x-forwarded-for&quot;, &quot;keep-alive&quot;, &quot;transfer-encoding&quot;,
+        &quot;traceparent&quot;, &quot;tracestate&quot;, &quot;x-correlation-id&quot;,
+        &quot;api-key&quot;, &quot;ocp-apim-subscription-key&quot;, &quot;x-project-id&quot;, &quot;x-project&quot;, &quot;x-ms-project-name&quot;, &quot;x-tenant-id&quot;,
+        &quot;x-caller-id&quot;, &quot;x-model&quot;, &quot;x-backend-url&quot;, &quot;x-stop-new-requests&quot;, &quot;x-ms-client-request-id&quot;,
+        &quot;x-ms-model-mesh-model-name&quot;, &quot;x-ms-model-id&quot;, &quot;x-ms-deployment-name&quot;, &quot;x-azureai-target-url&quot;,
+        &quot;x-ms-azureai-target-url&quot;, &quot;x-apim-backend-id&quot;, &quot;x-original-url&quot;, &quot;x-rewrite-url&quot; };
+      if (context.Request.Headers.Keys.Any(h =&gt; !allowedHeaders.Contains(h.ToLowerInvariant()))) { return &quot;header-forbidden&quot;; }
+      var contentType = context.Request.Headers.GetValueOrDefault(&quot;Content-Type&quot;, &quot;&quot;).Split(';')[0].Trim();
+      if (!String.Equals(contentType, &quot;application/json&quot;, StringComparison.OrdinalIgnoreCase) || context.Request.Body == null) { return &quot;invalid-body&quot;; }
+      var text = context.Request.Body.As&lt;string&gt;(preserveContent: true);
+      if (Encoding.UTF8.GetByteCount(text) &gt; 65536) { return &quot;body-too-large&quot;; }
+      JToken token;
+      try { token = JToken.Parse(text); }
+      catch (Exception error) when (error.Source == &quot;Newtonsoft.Json&quot;) { return &quot;invalid-json&quot;; }
+      if (token.Type != JTokenType.Object) { return &quot;invalid-body&quot;; }
+      var body = (JObject)token;
+      var allowed = new [] { &quot;model&quot;, &quot;input&quot;, &quot;max_output_tokens&quot;, &quot;stream&quot;, &quot;store&quot; };
+      if (body.Properties().Any(p =&gt; !allowed.Contains(p.Name))) { return &quot;unsupported-body-field&quot;; }
+      if (body[&quot;model&quot;] == null || body[&quot;model&quot;].Type != JTokenType.String ||
+          body[&quot;input&quot;] == null || body[&quot;input&quot;].Type != JTokenType.String || String.IsNullOrWhiteSpace((string)body[&quot;input&quot;]) ||
+          body[&quot;max_output_tokens&quot;] == null || body[&quot;max_output_tokens&quot;].Type != JTokenType.Integer) { return &quot;invalid-body&quot;; }
+      var mapping = JObject.Parse((string)context.Variables[&quot;mapping&quot;]);
+      if (!((JArray)mapping[&quot;models&quot;]).Any(m =&gt; String.Equals((string)m, (string)body[&quot;model&quot;], StringComparison.Ordinal))) { return &quot;model-forbidden&quot;; }
+      var maximum = (decimal)body[&quot;max_output_tokens&quot;];
+      if (maximum &lt;= 0 || maximum &gt; Math.Min((long)mapping[&quot;tokensPerMinute&quot;], (long)mapping[&quot;tokenQuota&quot;])) { return &quot;invalid-output-limit&quot;; }
+      if (body[&quot;stream&quot;] != null &amp;&amp; body[&quot;stream&quot;].Type != JTokenType.Boolean) { return &quot;unsupported-stream&quot;; }
+      if (body[&quot;store&quot;] != null &amp;&amp; (body[&quot;store&quot;].Type != JTokenType.Boolean || (bool)body[&quot;store&quot;])) { return &quot;storage-forbidden&quot;; }
+      return &quot;approved&quot;;
+    }" />
+    <choose>
+      <when condition="@((string)context.Variables[&quot;request-check&quot;] != &quot;approved&quot;)">
+        <trace source="__OWNER__" severity="information">
+          <message>request-rejected</message>
+          <metadata name="correlation" value="@(context.RequestId.ToString())" />
+          <metadata name="caller" value="@((string)context.Variables[&quot;caller-id&quot;])" />
+          <metadata name="project" value="@((string)context.Variables[&quot;project&quot;])" />
+          <metadata name="reason" value="@((string)context.Variables[&quot;request-check&quot;])" />
+        </trace>
+        <return-response>
+          <set-status code="403" reason="Forbidden" />
+          <set-body>{"error":{"code":"gateway_request_rejected","message":"Only the approved text Responses request contract is permitted."}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+    <set-variable name="model" value="@((string)context.Request.Body.As&lt;JObject&gt;(preserveContent: true)[&quot;model&quot;])" />
+    <set-variable name="environment" value="@((string)JObject.Parse((string)context.Variables[&quot;configuration&quot;])[&quot;environment&quot;])" />
+    <set-variable name="counter-key" value="@{
+      var jwt = (Jwt)context.Variables[&quot;validated-jwt&quot;];
+      return String.Join(&quot;|&quot;, &quot;__OWNER__&quot;, (string)context.Variables[&quot;environment&quot;],
+        jwt.Claims.GetValueOrDefault(&quot;tid&quot;, &quot;&quot;).ToLowerInvariant(), (string)context.Variables[&quot;caller-id&quot;],
+        (string)context.Variables[&quot;project&quot;], (string)context.Variables[&quot;model&quot;]);
+    }" />
+    <choose>
+      <when condition="@((string)context.Variables[&quot;stop-new-requests&quot;] != &quot;false&quot;)">
+        <trace source="__OWNER__" severity="information">
+          <message>request-rejected</message>
+          <metadata name="correlation" value="@(context.RequestId.ToString())" />
+          <metadata name="caller" value="@((string)context.Variables[&quot;caller-id&quot;])" />
+          <metadata name="project" value="@((string)context.Variables[&quot;project&quot;])" />
+          <metadata name="model" value="@((string)context.Variables[&quot;model&quot;])" />
+          <metadata name="reason" value="stop-new-requests" />
+        </trace>
+        <return-response>
+          <set-status code="503" reason="Service Unavailable" />
+          <set-body>{"error":{"code":"gateway_stopped","message":"New inference requests are stopped by the gateway owner."}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+    <choose>
+      __TOKEN_LIMITS__
+      <otherwise>
+        <trace source="__OWNER__" severity="information">
+          <message>request-rejected</message>
+          <metadata name="correlation" value="@(context.RequestId.ToString())" />
+          <metadata name="caller" value="@((string)context.Variables[&quot;caller-id&quot;])" />
+          <metadata name="project" value="@((string)context.Variables[&quot;project&quot;])" />
+          <metadata name="model" value="@((string)context.Variables[&quot;model&quot;])" />
+          <metadata name="reason" value="mapping-policy-mismatch" />
+        </trace>
+        <return-response>
+          <set-status code="403" reason="Forbidden" />
+          <set-body>{"error":{"code":"gateway_mapping_missing","message":"No governed limit is configured."}}</set-body>
+        </return-response>
+      </otherwise>
+    </choose>
+    <llm-emit-token-metric namespace="ailz-inference">
+      <dimension name="environment" value="@((string)context.Variables[&quot;environment&quot;])" />
+      <dimension name="caller" value="@((string)context.Variables[&quot;caller-id&quot;])" />
+      <dimension name="project" value="@((string)context.Variables[&quot;project&quot;])" />
+      <dimension name="model" value="@((string)context.Variables[&quot;model&quot;])" />
+    </llm-emit-token-metric>
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Ocp-Apim-Subscription-Key" exists-action="delete" />
+    <set-header name="x-project-id" exists-action="delete" />
+    <set-header name="x-project" exists-action="delete" />
+    <set-header name="x-ms-project-name" exists-action="delete" />
+    <set-header name="x-tenant-id" exists-action="delete" />
+    <set-header name="x-caller-id" exists-action="delete" />
+    <set-header name="x-model" exists-action="delete" />
+    <set-header name="x-backend-url" exists-action="delete" />
+    <set-header name="x-stop-new-requests" exists-action="delete" />
+    <set-header name="x-ms-client-request-id" exists-action="delete" />
+    <set-header name="x-ms-model-mesh-model-name" exists-action="delete" />
+    <set-header name="x-ms-model-id" exists-action="delete" />
+    <set-header name="x-ms-deployment-name" exists-action="delete" />
+    <set-header name="x-azureai-target-url" exists-action="delete" />
+    <set-header name="x-ms-azureai-target-url" exists-action="delete" />
+    <set-header name="x-apim-backend-id" exists-action="delete" />
+    <set-header name="x-original-url" exists-action="delete" />
+    <set-header name="x-rewrite-url" exists-action="delete" />
+    <set-header name="traceparent" exists-action="delete" />
+    <set-header name="tracestate" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <set-header name="Host" exists-action="override">
+      <value>@((string)JObject.Parse((string)context.Variables["configuration"])["backendHost"])</value>
+    </set-header>
+    <set-header name="X-Forwarded-For" exists-action="override">
+      <value>@(context.Request.IpAddress)</value>
+    </set-header>
+    <set-header name="x-correlation-id" exists-action="override">
+      <value>@(context.RequestId.ToString())</value>
+    </set-header>
+    <set-body>@{
+      var body = context.Request.Body.As&lt;JObject&gt;(preserveContent: true);
+      body["store"] = false;
+      return body.ToString();
+    }</set-body>
+    <set-backend-service backend-id="__OWNER__-foundry" />
+    <rewrite-uri template="/v1/responses" copy-unmatched-params="false" />
+    <authentication-managed-identity resource="https://cognitiveservices.azure.com" ignore-error="false" />
+  </inbound>
+  <backend>
+    <forward-request buffer-response="false" fail-on-error-status-code="false" />
+  </backend>
+  <outbound>
+    <set-header name="x-correlation-id" exists-action="override">
+      <value>@(context.RequestId.ToString())</value>
+    </set-header>
+    <trace source="__OWNER__" severity="information">
+      <message>request-completed</message>
+      <metadata name="correlation" value="@(context.RequestId.ToString())" />
+      <metadata name="caller" value="@((string)context.Variables[&quot;caller-id&quot;])" />
+      <metadata name="project" value="@((string)context.Variables[&quot;project&quot;])" />
+      <metadata name="model" value="@((string)context.Variables[&quot;model&quot;])" />
+      <metadata name="status" value="@(context.Response == null ? &quot;unavailable&quot; : context.Response.StatusCode.ToString())" />
+      <metadata name="tokens" value="@(context.Variables.ContainsKey(&quot;consumed-tokens&quot;) ? context.Variables[&quot;consumed-tokens&quot;].ToString() : &quot;unavailable&quot;)" />
+    </trace>
+  </outbound>
+  <on-error>
+    <set-header name="x-correlation-id" exists-action="override">
+      <value>@(context.RequestId.ToString())</value>
+    </set-header>
+    <trace source="__OWNER__" severity="information">
+      <message>request-rejected</message>
+      <metadata name="correlation" value="@(context.RequestId.ToString())" />
+      <metadata name="caller" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;caller-id&quot;, &quot;unauthenticated&quot;))" />
+      <metadata name="project" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;project&quot;, &quot;unmapped&quot;))" />
+      <metadata name="model" value="@(context.Variables.GetValueOrDefault&lt;string&gt;(&quot;model&quot;, &quot;unapproved&quot;))" />
+      <metadata name="status" value="@(context.Response == null ? &quot;unavailable&quot; : context.Response.StatusCode.ToString())" />
+      <metadata name="reason" value="policy-or-backend-rejection" />
+      <metadata name="tokens" value="@(context.Variables.ContainsKey(&quot;consumed-tokens&quot;) ? context.Variables[&quot;consumed-tokens&quot;].ToString() : &quot;unavailable&quot;)" />
+    </trace>
+  </on-error>
+</policies>

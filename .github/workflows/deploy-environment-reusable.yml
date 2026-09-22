@@ -1,0 +1,239 @@
+name: Verified private environment deployment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      release_run_id:
+        required: true
+        type: string
+      configuration_sha:
+        required: true
+        type: string
+      prior_promotion_run_id:
+        required: false
+        default: '0'
+        type: string
+    secrets:
+      AILZ_GITHUB_READ_TOKEN:
+        description: Optional short-lived read-only GitHub installation token for approved org/repository inventory
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  select:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      runner_group: ${{ steps.select.outputs.runner_group }}
+      runner_labels: ${{ steps.select.outputs.runner_labels }}
+      preview_client_id: ${{ steps.select.outputs.preview_client_id }}
+      deploy_client_id: ${{ steps.select.outputs.deploy_client_id }}
+      tenant_id: ${{ steps.select.outputs.tenant_id }}
+      subscription_id: ${{ steps.select.outputs.subscription_id }}
+      bundle_fingerprint: ${{ steps.select.outputs.bundle_fingerprint }}
+      profile_hash: ${{ steps.select.outputs.profile_hash }}
+      selection_hash: ${{ steps.select.outputs.selection_hash }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify trusted source, protections and private runner readiness
+        id: select
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN || github.token }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          CONFIGURATION_SHA: ${{ inputs.configuration_sha }}
+          PRIOR_PROMOTION_RUN_ID: ${{ inputs.prior_promotion_run_id }}
+        run: |
+          ./scripts/github/Select-Release.ps1 `
+            -Repository $env:GITHUB_REPOSITORY -Environment $env:TARGET_ENVIRONMENT `
+            -ConfigurationSha $env:CONFIGURATION_SHA -ReleaseRunId $env:RELEASE_RUN_ID `
+            -PriorPromotionRunId $env:PRIOR_PROMOTION_RUN_ID `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'selection') -RequireWorkflowContext
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ailz-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/selection/profile.json
+            ${{ runner.temp }}/selection/selected.json
+            ${{ runner.temp }}/selection/platform.json
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(vars.AILZ_ARTIFACT_RETENTION_DAYS || '14') }}
+
+  preview:
+    needs: [select]
+    if: github.event_name == 'workflow_dispatch' && needs.select.result == 'success'
+    environment: ${{ inputs.environment }}-preview
+    runs-on:
+      group: ${{ needs.select.outputs.runner_group }}
+      labels: ${{ fromJSON(needs.select.outputs.runner_labels) }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    outputs:
+      preview_hash: ${{ steps.preview.outputs.preview_hash }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ailz-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/selection
+
+      - name: Verify selected payload before Azure authentication
+        id: verify
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN || github.token }}
+          PROFILE_HASH: ${{ needs.select.outputs.profile_hash }}
+          BUNDLE_FINGERPRINT: ${{ needs.select.outputs.bundle_fingerprint }}
+          SELECTION_HASH: ${{ needs.select.outputs.selection_hash }}
+        run: |
+          ./scripts/github/Verify-SelectedRelease.ps1 `
+            -SelectionDirectory (Join-Path $env:RUNNER_TEMP 'selection') `
+            -ExpectedProfileHash $env:PROFILE_HASH -ExpectedBundleFingerprint $env:BUNDLE_FINGERPRINT `
+            -ExpectedSelectionHash $env:SELECTION_HASH `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'verified') -RequireWorkflowContext
+
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ needs.select.outputs.preview_client_id }}
+          tenant-id: ${{ needs.select.outputs.tenant_id }}
+          subscription-id: ${{ needs.select.outputs.subscription_id }}
+          audience: api://AzureADTokenExchange
+
+      - name: Resolve and record constrained What-If
+        id: preview
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN || github.token }}
+        run: |
+          $verified = Join-Path $env:RUNNER_TEMP 'verified'
+          $bundle = Join-Path $verified 'bundle'
+          & (Join-Path $bundle 'payload/scripts/github/Invoke-EnvironmentDeployment.ps1') `
+            -Phase Preview -ProfilePath (Join-Path $verified 'profile.json') `
+            -SelectionPath (Join-Path $verified 'selected.json') -BundlePath $bundle `
+            -PlatformInputsPath (Join-Path $verified 'platform.json') `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'preview')
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ailz-preview-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/preview
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(vars.AILZ_ARTIFACT_RETENTION_DAYS || '14') }}
+
+  deploy:
+    needs: [select, preview]
+    if: github.event_name == 'workflow_dispatch' && needs.preview.result == 'success'
+    environment: ${{ inputs.environment }}
+    runs-on:
+      group: ${{ needs.select.outputs.runner_group }}
+      labels: ${{ fromJSON(needs.select.outputs.runner_labels) }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ailz-selection-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/selection
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ailz-preview-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/preview
+
+      - name: Reverify immutable inputs and promotion evidence after approval
+        id: verify
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN || github.token }}
+          PROFILE_HASH: ${{ needs.select.outputs.profile_hash }}
+          BUNDLE_FINGERPRINT: ${{ needs.select.outputs.bundle_fingerprint }}
+          SELECTION_HASH: ${{ needs.select.outputs.selection_hash }}
+        run: |
+          ./scripts/github/Verify-SelectedRelease.ps1 `
+            -SelectionDirectory (Join-Path $env:RUNNER_TEMP 'selection') `
+            -ExpectedProfileHash $env:PROFILE_HASH -ExpectedBundleFingerprint $env:BUNDLE_FINGERPRINT `
+            -ExpectedSelectionHash $env:SELECTION_HASH `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'verified') -RequireWorkflowContext
+          & (Join-Path $env:RUNNER_TEMP 'verified/bundle/payload/scripts/github/Install-ReleaseTools.ps1') `
+            -Destination (Join-Path $env:RUNNER_TEMP 'ailz-tools')
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value (Join-Path $env:RUNNER_TEMP 'ailz-tools')
+
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ needs.select.outputs.deploy_client_id }}
+          tenant-id: ${{ needs.select.outputs.tenant_id }}
+          subscription-id: ${{ needs.select.outputs.subscription_id }}
+          audience: api://AzureADTokenExchange
+
+      - name: Import the exact image and deploy approved infrastructure
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN || github.token }}
+          APPROVED_PREVIEW_HASH: ${{ needs.preview.outputs.preview_hash }}
+        run: |
+          $verified = Join-Path $env:RUNNER_TEMP 'verified'
+          $bundle = Join-Path $verified 'bundle'
+          & (Join-Path $bundle 'payload/scripts/github/Invoke-EnvironmentDeployment.ps1') `
+            -Phase Deploy -ProfilePath (Join-Path $verified 'profile.json') `
+            -SelectionPath (Join-Path $verified 'selected.json') -BundlePath $bundle `
+            -PlatformInputsPath (Join-Path $verified 'platform.json') `
+            -PreviewDirectory (Join-Path $env:RUNNER_TEMP 'preview') `
+            -ApprovedPreviewHash $env:APPROVED_PREVIEW_HASH -Execute `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'infrastructure')
+
+      - name: Refresh the deployment login before private completion
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ needs.select.outputs.deploy_client_id }}
+          tenant-id: ${{ needs.select.outputs.tenant_id }}
+          subscription-id: ${{ needs.select.outputs.subscription_id }}
+          audience: api://AzureADTokenExchange
+
+      - name: Complete private configuration without paid model calls
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN || github.token }}
+          APPROVED_PREVIEW_HASH: ${{ needs.preview.outputs.preview_hash }}
+        run: |
+          $verified = Join-Path $env:RUNNER_TEMP 'verified'
+          $bundle = Join-Path $verified 'bundle'
+          & (Join-Path $bundle 'payload/scripts/github/Invoke-EnvironmentDeployment.ps1') `
+            -Phase Complete -ProfilePath (Join-Path $verified 'profile.json') `
+            -SelectionPath (Join-Path $verified 'selected.json') -BundlePath $bundle `
+            -PlatformInputsPath (Join-Path $verified 'platform.json') `
+            -PreviewDirectory (Join-Path $env:RUNNER_TEMP 'preview') `
+            -ApprovedPreviewHash $env:APPROVED_PREVIEW_HASH -Execute `
+            -InfrastructureDirectory (Join-Path $env:RUNNER_TEMP 'infrastructure') `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'deployment')
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ailz-deployment-${{ inputs.environment }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/deployment
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(vars.AILZ_ARTIFACT_RETENTION_DAYS || '14') }}

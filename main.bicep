@@ -87,6 +87,23 @@ param appConfigLabel string = 'ai-lz'
 @description('Optional. Accelerator-specific App Configuration key-values appended verbatim to the App Configuration store. This lets a consuming accelerator publish its own settings without the landing zone needing to know about them. Values are stored as plaintext in App Configuration, so never pass secrets here (use Key Vault references instead). Each entry must have a unique name+label. On a name+label collision with a workload configuration key the landing zone already emits, the passthrough entry wins. Do not redefine reserved infrastructure keys emitted by other modules (the Cosmos identifiers COSMOS_DB_ACCOUNT_RESOURCE_ID and COSMOS_DB_ENDPOINT, and the per-app <APP>_APIKEY Key Vault references); reusing those names would create a duplicate key-value and fail the deployment. Note: this is only applied on non network-isolated deployments, where the landing zone writes App Configuration at deploy time. Network-isolated deployments configure App Configuration from the accelerator post-provision step, so pass these values through that path instead.')
 param additionalAppConfigurationSettings additionalAppConfigurationSettingType[] = []
 
+@description('Opt in to the private inference gateway. Existing deployments remain unchanged when false. Use the validated GitHub environment profile for gateway configuration and private-network prerequisites.')
+param deployApiManagement bool = false
+
+@description('Nonsecret gateway configuration resolved from the environment profile. Requires explicit caller/model mappings, positive token limits, publisher information, private DNS and a dedicated integration subnet when the gateway is enabled.')
+param apiManagementConfiguration object = {}
+
+@description('Landing-zone-scoped key that keeps every per-workload gateway resource unique when several landing zones share one API Management gateway. It keys the API name, the public API path, the backend, the logger and the named values. Defaults to a deterministic hash of this resource group, which is unique per landing zone because this template is resource-group scoped. Do NOT derive it from `resourceToken` or the CAF workload token: both hash only subscription + environment + location, so two landing zones in the same subscription, environment and region would produce the same value and collide. Must be lowercase alphanumeric to be valid as both an APIM resource name segment and a URL path segment.')
+@minLength(3)
+@maxLength(24)
+param apiManagementWorkloadKey string = take(toLower(uniqueString(resourceGroup().id)), 12)
+
+@description('Opt in to the release-owned developer application and private completion contract. This profile removes executor and application direct Foundry inference grants; privileged deployment access is configured separately by platform bootstrap.')
+param enableDeveloperExperience bool = false
+
+@description('Nonsecret developer application, managed identity, authentication and immutable release settings supplied by the shared environment resolver. Empty for existing consumers.')
+param developerExperience object = {}
+
 @description('Enable network isolation for the deployment. This will restrict public access to resources and require private endpoints where applicable.')
 param networkIsolation bool = false
 
@@ -942,7 +959,7 @@ param modelDeploymentList array
 // Container Apps params
 // ----------------------------------------------------------------------
 
-@description('List of container apps to create. Dapr is opt-in per app through `dapr.enabled=true`; apps without a `dapr` object deploy with Dapr disabled.')
+@description('List of container apps to create. Dapr is opt-in per app through `dapr.enabled=true`; apps without a `dapr` object deploy with Dapr disabled. Optional image, registry, managedIdentity and environmentVariables fields preserve an explicitly selected application artifact through infrastructure updates. Omitted image retains the legacy placeholder.')
 param containerAppsList array
 
 @description('Workload profiles.')
@@ -1225,6 +1242,25 @@ var _deployAiFoundryStorage = _deployAiFoundryAgentService && !_useExistingAiFou
 //   - the explicit tag prevents drift when Microsoft retags `:aspnetapp`.
 var _containerDummyImageName = 'mcr.microsoft.com/dotnet/samples:aspnetapp-9.0'
 
+var _apiManagementName = !empty(apiManagementConfiguration.?name ?? '')
+  ? string(apiManagementConfiguration.name)
+  : (resourceNamingMode == 'caf'
+      ? cafTrim('${const.abbrs.integration.apiManagement}${_cafNameStem}', 50)
+      : '${const.abbrs.integration.apiManagement}${resourceToken}')
+var _inferenceGatewayApiPath = 'inference/${apiManagementWorkloadKey}'
+var _inferenceGatewayEndpoint = deployApiManagement ? 'https://${_apiManagementName}.azure-api.net/${_inferenceGatewayApiPath}/v1/responses' : ''
+
+var _developerRuntimeSettings = enableDeveloperExperience ? [
+  { name: 'INFERENCE_ACCESS_MODE', value: 'gateway', label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'INFERENCE_GATEWAY_ENDPOINT', value: _inferenceGatewayEndpoint, label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'INFERENCE_GATEWAY_AUDIENCE', value: apiManagementConfiguration.audience, label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'SMOKE_API_AUDIENCE', value: developerExperience.application.audience, label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'SMOKE_ALLOWED_OBJECT_IDS', value: string(developerExperience.developerObjectIds), label: appConfigLabel, contentType: 'application/json' }
+  { name: 'SMOKE_ALLOWED_GROUP_IDS', value: string(developerExperience.developerGroupObjectIds), label: appConfigLabel, contentType: 'application/json' }
+  { name: 'SMOKE_MODEL_DEPLOYMENT', value: developerExperience.application.modelDeployment, label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'SMOKE_MAX_OUTPUT_TOKENS', value: string(developerExperience.application.maxOutputTokens), label: appConfigLabel, contentType: 'text/plain' }
+] : []
+
 // ----------------------------------------------------------------------
 // Networking vars
 // ----------------------------------------------------------------------
@@ -1447,7 +1483,24 @@ var baseSubnets = [
       }
 ]
 
-var subnets = baseSubnets
+module apiManagementNsg 'modules/networking/network-security-group.bicep' = if (deployApiManagement && (!useExistingVNet || deploySubnets)) {
+  name: 'apiManagementIntegrationNsg'
+  params: {
+    name: '${const.abbrs.networking.networkSecurityGroup}${_apiManagementName}'
+    location: location
+  }
+}
+
+var subnets = concat(baseSubnets, deployApiManagement ? [
+  {
+    name: apiManagementConfiguration.integrationSubnetName
+    addressPrefix: apiManagementConfiguration.integrationSubnetPrefix
+    delegation: 'Microsoft.Web/serverFarms'
+    networkSecurityGroupResourceId: (!useExistingVNet || deploySubnets) ? apiManagementNsg!.outputs.id : ''
+    routeTableResourceId: _effectiveRouteTableId
+    serviceEndpoints: []
+  }
+] : [])
 
 module virtualNetworkSubnets 'modules/networking/subnets.bicep' = if (_networkIsolation && useExistingVNet && deploySubnets && deployNsgs) {
   name: 'virtualNetworkSubnetsDeployment'
@@ -2282,16 +2335,8 @@ module aiFoundry 'modules/ai-foundry/main.bicep' = if (deployAiFoundry) {
     location: location
     tags: deploymentTags
 
-    // Gate this on `_networkIsolation` to mirror the sibling `aiFoundryStorageAccount`
-    // module at L2220. When network isolation is off, the spoke VNet is not deployed,
-    // `virtualNetworkResourceId` resolves to '', and `varPeSubnetId` collapses to the
-    // bogus literal '/subnets/pe-subnet'. Passing that down to the four AI Foundry-
-    // bundled sub-modules (Cosmos, Key Vault, AI Search, Storage) makes each one's
-    // `privateNetworkingEnabled = !empty(privateEndpointSubnetResourceId)` evaluate
-    // true (the string is non-empty but invalid), and ARM template validation fails
-    // with `databaseAccount_privateEndpoints[0]` / `keyVault_privateEndpoints[0]` ...
-    // `'reference' is not valid: all function arguments should be string literals.`.
-    // See issue #63 for the full diagnosis.
+    // Use the shared subnet binding; a nonempty synthetic ID would incorrectly
+    // enable private endpoints in the Foundry child modules.
     privateEndpointSubnetResourceId: _networkIsolation ? varPeSubnetId : ''
 
     aiFoundryConfiguration: {
@@ -2371,9 +2416,7 @@ module aiFoundry 'modules/ai-foundry/main.bicep' = if (deployAiFoundry) {
 }
 
 
-var varPeSubnetId = empty(existingVnetResourceId!)
-  ? '${virtualNetworkResourceId}/subnets/pe-subnet'
-  : '${existingVnetResourceId!}/subnets/pe-subnet'
+var varPeSubnetId = _peSubnetId
 
 var varAfNetworkingOverride = _networkIsolation
   ? (policyManagedPrivateDns
@@ -2832,10 +2875,14 @@ module containerApps 'br/public:avm/res/app/container-app:0.18.1' = [
       dapr: _containerAppDaprConfigs[index]
 
       managedIdentities: {
-        systemAssigned: (_useUAI) ? false : true
+        systemAssigned: _useUAI || !empty(app.?managedIdentity.?resourceId ?? '') ? false : true
         #disable-next-line BCP318
-        userAssignedResourceIds: (_useUAI) ? [containerAppsUAI[index].id] : []
+        userAssignedResourceIds: !empty(app.?managedIdentity.?resourceId ?? '')
+          ? [app.managedIdentity.resourceId]
+          : (_useUAI ? [containerAppsUAI[index].id] : [])
       }
+
+      registries: app.?registry != null ? [app.registry] : null
 
       scaleSettings: {
         minReplicas: app.min_replicas
@@ -2845,7 +2892,7 @@ module containerApps 'br/public:avm/res/app/container-app:0.18.1' = [
       containers: [
         {
           name: app.service_name
-          image: _containerDummyImageName
+          image: empty(app.?image ?? '') ? _containerDummyImageName : app.image
           resources: {
             cpu: app.?cpu ?? '0.5'
             memory: app.?memory ?? '1.0Gi'
@@ -2856,16 +2903,20 @@ module containerApps 'br/public:avm/res/app/container-app:0.18.1' = [
             // Emitting an empty AZURE_CLIENT_ID alongside AZURE_TENANT_ID breaks
             // DefaultAzureCredential on the SystemAssigned path. With the var omitted,
             // ManagedIdentityCredential uses the platform-injected SystemAssigned MI.
-            _useUAI ? [
+            _useUAI || !empty(app.?managedIdentity.?resourceId ?? '') ? [
               {
                 name: 'AZURE_CLIENT_ID'
                 #disable-next-line BCP318
-                value: containerAppsUAI[index].properties.clientId
+                value: !empty(app.?managedIdentity.?resourceId ?? '')
+                  ? app.managedIdentity.clientId
+                  : containerAppsUAI[index]!.properties.clientId
               }
             ] : [],
             // Bootstrap runtime config when the consumer opts out of App Config
             // (Issue #89, `appRuntimeConfigurationMode == 'containerEnv'`).
-            _runtimeConfigIsContainerEnv ? _containerRuntimeEnvWithAdditional : []
+            _runtimeConfigIsContainerEnv ? _containerRuntimeEnvWithAdditional : [],
+            app.?environmentVariables ?? [],
+            map(_developerRuntimeSettings, setting => { name: setting.name, value: setting.value })
           )
         }
       ]
@@ -3292,6 +3343,46 @@ module storageAccount 'br/public:avm/res/storage/storage-account:0.26.2' = if (d
 // ROLE ASSIGNMENTS
 //////////////////////////////////////////////////////////////////////////
 
+module apiManagement 'modules/api-management/main.bicep' = if (deployApiManagement) {
+  name: 'apiManagementDeployment'
+  params: {
+    name: _apiManagementName
+    location: location
+    environmentName: environmentName
+    workloadKey: apiManagementWorkloadKey
+    tenantId: tenant().tenantId
+    configuration: {
+      enabled: true
+      name: _apiManagementName
+      sku: apiManagementConfiguration.sku
+      capacity: apiManagementConfiguration.capacity
+      publisherEmail: apiManagementConfiguration.publisherEmail
+      publisherName: apiManagementConfiguration.publisherName
+      audience: apiManagementConfiguration.audience
+      integrationSubnetName: apiManagementConfiguration.integrationSubnetName
+      integrationSubnetPrefix: apiManagementConfiguration.integrationSubnetPrefix
+      privateDnsZoneResourceId: apiManagementConfiguration.privateDnsZoneResourceId
+      stopNewRequests: apiManagementConfiguration.stopNewRequests
+      foundryIntegration: apiManagementConfiguration.?foundryIntegration ?? false
+      callerMappings: apiManagementConfiguration.callerMappings
+    }
+    integrationSubnetResourceId: '${virtualNetworkResourceId}/subnets/${apiManagementConfiguration.integrationSubnetName}'
+    privateEndpointSubnetResourceId: _peSubnetId
+    backendAccountResourceId: aiFoundryAccountResourceId
+    backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
+    applicationInsightsResourceId: _appInsightsResourceId
+    logAnalyticsWorkspaceResourceId: _lawResourceId
+    initialProvisioning: apiManagementConfiguration.?initialProvisioning ?? false
+    tags: union(_tags, {
+      'ailz-managed-by': 'github-dev-environment'
+      'ailz-environment': environmentName
+    })
+  }
+  dependsOn: [
+    virtualNetworkSubnets
+  ]
+}
+
 // Role assignments are centralized in this section to make it easier to view all permissions granted in this template.
 // Custom modules are used for role assignments since no published AVM module available for this at the time we created this template.
 
@@ -3364,7 +3455,7 @@ var _executorRoles = concat(
       principalType: principalType
     }
   ] : [],
-  deployAiFoundry ? concat(
+  deployAiFoundry && !enableDeveloperExperience ? concat(
     [
       {
         principalId: principalId
@@ -3443,7 +3534,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.KeyVaultSecretsUser.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: keyVault.id
             principalType: 'ServicePrincipal'
@@ -3453,26 +3544,26 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.AppConfigurationDataReader.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: appConfig.id
             principalType: 'ServicePrincipal'
           }
         ] : [],
-        (deployAiFoundry && contains(app.roles, const.roles.CognitiveServicesUser.key)) ? [
+        (deployAiFoundry && !enableDeveloperExperience && contains(app.roles, const.roles.CognitiveServicesUser.key)) ? [
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesUser.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             resourceId: aiFoundryAccountResourceId
             principalType: 'ServicePrincipal'
           }
         ] : [],
-        (deployAiFoundry && contains(app.roles, const.roles.CognitiveServicesOpenAIUser.key)) ? [
+        (deployAiFoundry && !enableDeveloperExperience && contains(app.roles, const.roles.CognitiveServicesOpenAIUser.key)) ? [
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesOpenAIUser.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             resourceId: aiFoundryAccountResourceId
             principalType: 'ServicePrincipal'
           }
@@ -3481,7 +3572,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesUser.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: speechService.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3491,7 +3582,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.AcrPull.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: containerRegistry.id
             principalType: 'ServicePrincipal'
@@ -3501,7 +3592,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.SearchIndexDataReader.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: searchService.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3511,7 +3602,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.SearchIndexDataContributor.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: searchService.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3521,7 +3612,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.StorageBlobDataContributor.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: storageAccount.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3531,7 +3622,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.StorageBlobDataReader.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: storageAccount.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3541,7 +3632,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.StorageBlobDelegator.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: storageAccount.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3630,7 +3721,7 @@ module assignCosmosDBCosmosDbBuiltInDataContributorContainerApps 'modules/securi
       #disable-next-line BCP318
       cosmosDbAccountName: cosmosDBAccount.outputs.name
       #disable-next-line BCP318
-      principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+      principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
       roleDefinitionGuid: const.roles.CosmosDBBuiltInDataContributor.guid
       scopePath: '/subscriptions/${subscription().subscriptionId}/resourceGroups/${resourceGroup().name}/providers/Microsoft.DocumentDB/databaseAccounts/${resourceNames.dbAccountName}'
     }
@@ -3670,7 +3761,7 @@ resource appConfig 'Microsoft.AppConfiguration/configurationStores@2024-05-01' =
     // here. The public surface still tracks `_publicNetworkAccess` so the
     // service follows the same Enabled/Disabled logic as the rest of the stack.
     publicNetworkAccess: _publicNetworkAccess
-    disableLocalAuth: false
+    disableLocalAuth: enableDeveloperExperience
   }
 }
 
@@ -3697,7 +3788,7 @@ module containerAppsSettings 'modules/container-apps/container-apps-list.bicep' 
         serviceName: containerAppsList[i].service_name
         canonical_name: containerAppsList[i].canonical_name
         #disable-next-line BCP318
-        principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+        principalId: !empty(containerAppsList[i].?managedIdentity.?resourceId ?? '') ? containerAppsList[i].managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
         #disable-next-line BCP318
         fqdn: containerApps[i].outputs.fqdn
       }
@@ -3792,19 +3883,19 @@ module appConfigKeyVaultPopulate 'modules/app-configuration/app-configuration.bi
   }
 }
 
+var _cosmosAppConfigurationSettings = deployCosmosDb ? [
+  #disable-next-line BCP318
+  { name: 'COSMOS_DB_ACCOUNT_RESOURCE_ID', value: cosmosDBAccount.outputs.resourceId, label: appConfigLabel, contentType: 'text/plain' }
+  #disable-next-line BCP318
+  { name: 'COSMOS_DB_ENDPOINT', value: cosmosDBAccount.outputs.endpoint, label: appConfigLabel, contentType: 'text/plain' }
+] : []
+
 module cosmosConfigKeyVaultPopulate 'modules/app-configuration/app-configuration.bicep' = if (deployCosmosDb && deployAppConfig && _runtimeConfigIsAppConfig && !_networkIsolation) {
   name: 'cosmosConfigKeyVaultPopulate'
   params: {
     #disable-next-line BCP318
     storeName: appConfig.name
-    keyValues: concat(
-      [
-        #disable-next-line BCP318
-      { name: 'COSMOS_DB_ACCOUNT_RESOURCE_ID', value: cosmosDBAccount.outputs.resourceId, label: appConfigLabel, contentType: 'text/plain' }
-      #disable-next-line BCP318
-      { name: 'COSMOS_DB_ENDPOINT',              value: cosmosDBAccount.outputs.endpoint,            label: appConfigLabel, contentType: 'text/plain' }
-      ]
-    )
+    keyValues: _cosmosAppConfigurationSettings
   }
 }
 
@@ -3821,12 +3912,7 @@ var _normalizedAdditionalAppConfigSettings = [
 // Collision keys for the passthrough, derived exactly how the app-configuration module names each key-value resource (name$label, or name when the label is empty). Used to drop any landing-zone key the passthrough overrides, so the passthrough always wins without emitting a duplicate resource name.
 var _additionalAppConfigKeys = map(_normalizedAdditionalAppConfigSettings, s => empty(s.label) ? s.name : '${s.name}$${s.label}')
 
-module appConfigPopulate 'modules/app-configuration/app-configuration.bicep' = if (deployAppConfig && _runtimeConfigIsAppConfig && !_networkIsolation) {
-  name: 'appConfigPopulate'
-  params: {
-    #disable-next-line BCP318
-    storeName: appConfig.name
-    keyValues: concat(
+var _appConfigurationSettings = concat(
       filter(
       concat(
       #disable-next-line BCP318
@@ -3961,14 +4047,84 @@ module appConfigPopulate 'modules/app-configuration/app-configuration.bicep' = i
       ),
       kv => !contains(_additionalAppConfigKeys, empty(kv.label) ? kv.name : '${kv.name}$${kv.label}')
       ),
-      _normalizedAdditionalAppConfigSettings
-    )
+      _normalizedAdditionalAppConfigSettings,
+      _developerRuntimeSettings
+)
+
+module appConfigPopulate 'modules/app-configuration/app-configuration.bicep' = if (deployAppConfig && _runtimeConfigIsAppConfig && !_networkIsolation) {
+  name: 'appConfigPopulate'
+  params: {
+    #disable-next-line BCP318
+    storeName: appConfig.name
+    keyValues: _appConfigurationSettings
   }
 }
+
+var _observabilityPropertyByKey = {
+  APPLICATIONINSIGHTS_CONNECTION_STRING: 'ConnectionString'
+  APPLICATIONINSIGHTS__INSTRUMENTATIONKEY: 'InstrumentationKey'
+}
+var _privateCompletionSettings = map(
+  concat(_appConfigurationSettings, _cosmosAppConfigurationSettings),
+  setting => {
+    name: setting.name
+    label: setting.label
+    contentType: setting.contentType
+    value: contains(_observabilityPropertyByKey, setting.name) ? '' : setting.value
+    sourceResourceId: contains(_observabilityPropertyByKey, setting.name) ? _appInsightsResourceId : ''
+    sourceProperty: !empty(_appInsightsResourceId) ? (_observabilityPropertyByKey[?setting.name] ?? '') : ''
+  }
+)
+
+var _developerApplications = _deployContainerApps ? map(containerAppsSettings!.outputs.containerAppsList, (app, index) => {
+  name: app.name
+  resourceId: resourceId('Microsoft.App/containerApps', app.name)
+  fqdn: app.fqdn
+  image: containerAppsList[index].?image ?? ''
+  principalId: app.principalId
+  identityResourceId: containerAppsList[index].?managedIdentity.?resourceId ?? ''
+}) : []
 
 //////////////////////////////////////////////////////////////////////////
 // OUTPUTS
 //////////////////////////////////////////////////////////////////////////
+
+@description('Private inference gateway route. Empty when the opt-in gateway is disabled; never an implicit direct-Foundry fallback.')
+output INFERENCE_GATEWAY_ENDPOINT string = deployApiManagement ? _inferenceGatewayEndpoint : ''
+
+@description('Entra audience required by the opt-in inference gateway. Empty when disabled.')
+output INFERENCE_GATEWAY_AUDIENCE string = deployApiManagement ? string(apiManagementConfiguration.audience) : ''
+
+@description('Nonsecret, opt-in completion inputs from actual deployed resources. Observability credentials are references, not values. An output does not assert developer readiness.')
+output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
+  schemaVersion: 1
+  environment: environmentName
+  tenantId: tenant().tenantId
+  subscriptionId: subscription().subscriptionId
+  resourceGroup: resourceGroup().name
+  release: developerExperience.release
+  appConfiguration: {
+    endpoint: deployAppConfig ? appConfig!.properties.endpoint : ''
+    resourceId: deployAppConfig ? appConfig.id : ''
+    settings: _privateCompletionSettings
+  }
+  applications: _developerApplications
+  gateway: {
+    accessMode: 'gateway'
+    resourceId: deployApiManagement ? resourceId('Microsoft.ApiManagement/service', _apiManagementName) : ''
+    privateEndpointResourceId: deployApiManagement ? apiManagement!.outputs.privateEndpointResourceId : ''
+    endpoint: _inferenceGatewayEndpoint
+    audience: apiManagementConfiguration.audience
+    backendResourceId: aiFoundryAccountResourceId
+    backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
+  }
+  workspace: {
+    repository: developerExperience.application.workspaceRepository
+    ref: developerExperience.application.workspaceRef
+  }
+  registryResourceId: developerExperience.application.registryResourceId
+  vnetResourceId: virtualNetworkResourceId
+} : {}
 
 // ──────────────────────────────────────────────────────────────────────
 // General / Deployment

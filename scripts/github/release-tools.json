@@ -1,0 +1,32 @@
+{
+  "verifiedOn": "2026-09-16",
+  "bicep": "0.42.1",
+  "bicepLinuxSha256": "aed90eb2c69a6ee2bd70dc0d4354408ac4d04fd9911d3ec8e0cd74ad173e7139",
+  "buildx": "v0.37.1",
+  "buildkitImage": "moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3",
+  "psScriptAnalyzer": "1.25.0",
+  "actionlint": {
+    "version": "1.7.12",
+    "source": "https://github.com/rhysd/actionlint/releases/tag/v1.7.12",
+    "linux_amd64": {
+      "file": "actionlint_1.7.12_linux_amd64.tar.gz",
+      "sha256": "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+    },
+    "windows_amd64": {
+      "file": "actionlint_1.7.12_windows_amd64.zip",
+      "sha256": "6e7241b51e6817ea6a047693d8e6fed13b31819c9a0dd6c5a726e1592d22f6e9"
+    }
+  },
+  "oras": {
+    "version": "1.3.4",
+    "source": "https://github.com/oras-project/oras/releases/tag/v1.3.4",
+    "linux_amd64": {
+      "file": "oras_1.3.4_linux_amd64.tar.gz",
+      "sha256": "f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454"
+    },
+    "windows_amd64": {
+      "file": "oras_1.3.4_windows_amd64.zip",
+      "sha256": "ffdb6aa40267686b5d507da1f21a57fc502a9a7c86b90c54557d335644c99dbd"
+    }
+  }
+}

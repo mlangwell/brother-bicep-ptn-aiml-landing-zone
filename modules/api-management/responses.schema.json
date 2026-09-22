@@ -1,0 +1,16 @@
+{
+  "definitions": {
+    "ResponsesRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "input", "max_output_tokens"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "input": { "type": "string", "minLength": 1 },
+        "max_output_tokens": { "type": "integer", "minimum": 1 },
+        "stream": { "type": "boolean" },
+        "store": { "type": "boolean", "enum": [false] }
+      }
+    }
+  }
+}

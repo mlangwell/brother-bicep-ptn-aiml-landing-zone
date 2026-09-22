@@ -1,0 +1,17 @@
+{
+  "if": {
+    "allOf": [
+      {
+        "field": "type",
+        "equals": "Microsoft.CognitiveServices/accounts/deployments"
+      },
+      {
+        "field": "Microsoft.CognitiveServices/accounts/deployments/sku.name",
+        "notIn": "[parameters('allowedDeploymentSkus')]"
+      }
+    ]
+  },
+  "then": {
+    "effect": "[parameters('effect')]"
+  }
+}

@@ -22,6 +22,13 @@ Azure Landing Zone hub. Use
 [Deploy-AilzIntegrated.ps1](Deploy-AilzIntegrated.ps1) to configure the `azd`
 environment, preview the infrastructure changes, and provision the deployment.
 
+An additive, opt-in [GitHub development environment path](docs/github-development.md)
+adds typed dev/test/prod profiles, protected artifact promotion, a private APIM
+gateway and a small authenticated inference starter. Infrastructure success is
+not developer readiness: private completion, human SSO and the live acceptance
+gates are separate. The existing wrapper, `azd` hooks and Azure DevOps assets
+remain supported and unchanged.
+
 The script configures this topology automatically:
 
 - `DEPLOYMENT_MODE=ailz-integrated`
@@ -29,6 +36,37 @@ The script configures this topology automatically:
 - `DEPLOY_AZURE_FIREWALL=false`
 - Spoke-to-hub peering using the supplied hub VNet resource ID
 - Spoke egress through the supplied hub firewall or NVA private IP
+
+## Quickstart: let Copilot find your values and deploy
+
+Assembling the deployment command by hand is the step most people get wrong. It
+means collecting a dozen resource IDs across two or three subscriptions without
+a typo. Two prompts in
+[Deploy with GitHub Copilot](docs/copilot-deploy-prompt.md) do it for you:
+
+1. **Discover.** Copilot uses the Azure CLI to find your hub VNet, firewall
+   private IP, Private DNS zones and observability resources, then writes a
+   filled-in `config.json`. It only reads from Azure and changes nothing.
+2. **Deploy.** Copilot validates that file, checks your spoke range does not
+   overlap the hub, builds the correct command, runs a preview, and stops for
+   your approval before provisioning.
+
+[config.json.example](config.json.example) is the template behind both. It is a
+commented worksheet covering the four required values, subscription and resource
+group targeting, hub observability reuse, Private DNS strategy for a
+policy-managed landing zone, the spoke address range, and the optional feature
+flags. You can fill it in by hand instead:
+
+```powershell
+Copy-Item config.json.example config.json
+code config.json
+```
+
+`config.json` is git-ignored because it holds subscription and hub identifiers.
+Commit changes to `config.json.example` only.
+
+Prefer to drive the script directly? The rest of this document is the full
+parameter reference, and it remains the authoritative description of the script.
 
 ## Prerequisites
 
@@ -363,6 +401,8 @@ underlying deployment error.
 
 ## Related documentation
 
+- [Deployment worksheet](config.json.example) and
+  [Deploy with GitHub Copilot](docs/copilot-deploy-prompt.md)
 - [How to deploy Azure AI Landing Zones](https://azure.github.io/AI-Landing-Zones/bicep/how-to-deploy/#ai-landing-zone-integrated-deployment)
 - [AILZ parameter reference](https://azure.github.io/AI-Landing-Zones/bicep/parameterization/)
 - [Hub-and-spoke topology](https://azure.github.io/AI-Landing-Zones/bicep/hub-and-spoke/)

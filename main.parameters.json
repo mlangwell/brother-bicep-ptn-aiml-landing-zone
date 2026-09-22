@@ -46,6 +46,10 @@
     "foundryIqAiServicesEndpoint":         { "value": "${FOUNDRY_IQ_AI_SERVICES_ENDPOINT=}" },
 
     "additionalAppConfigurationSettings":  { "value": [] },
+    "deployApiManagement":                 { "value": "${DEPLOY_API_MANAGEMENT=false}" },
+    "apiManagementConfiguration":          { "value": {} },
+    "enableDeveloperExperience":           { "value": "${ENABLE_DEVELOPER_EXPERIENCE=false}" },
+    "developerExperience":                 { "value": {} },
 
     "aiSearchResourceId":                  { "value": null },
     "aiFoundryStorageAccountResourceId":   { "value": null },

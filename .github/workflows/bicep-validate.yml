@@ -20,6 +20,15 @@ on:
       - '.github/scripts/Validate-CopilotAssets.ps1'
       - 'tests/scripts/Validate-CopilotAssets.Tests.ps1'
       - '.github/workflows/bicep-validate.yml'
+      - 'scripts/**'
+      - 'tests/github/**'
+      - 'environments/**'
+      - 'platform/**'
+      - 'samples/developer-smoke/**'
+      - '.github/workflows/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'azure.yaml'
   push:
     branches:
       - main
@@ -42,10 +51,18 @@ on:
       - '.github/scripts/Validate-CopilotAssets.ps1'
       - 'tests/scripts/Validate-CopilotAssets.Tests.ps1'
       - '.github/workflows/bicep-validate.yml'
+      - 'scripts/**'
+      - 'tests/github/**'
+      - 'environments/**'
+      - 'platform/**'
+      - 'samples/developer-smoke/**'
+      - '.github/workflows/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'azure.yaml'
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   validate-copilot-assets:
@@ -53,6 +70,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install YAML parser
         shell: pwsh
@@ -71,15 +90,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Bicep CLI
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64 -o bicep
-          chmod +x bicep
-          sudo mv bicep /usr/local/bin/bicep
-          bicep --version
+          mkdir -p "$HOME/.azure/bin"
+          curl -fsSL https://github.com/Azure/bicep/releases/download/v0.42.1/bicep-linux-x64 -o "$HOME/.azure/bin/bicep"
+          echo "aed90eb2c69a6ee2bd70dc0d4354408ac4d04fd9911d3ec8e0cd74ad173e7139  $HOME/.azure/bin/bicep" | sha256sum --check --status
+          chmod +x "$HOME/.azure/bin/bicep"
+          echo "$HOME/.azure/bin" >> "$GITHUB_PATH"
+          az config set bicep.use_binary_from_path=true
+          "$HOME/.azure/bin/bicep" --version
 
       - name: Compile main.bicep and check size
         shell: pwsh
@@ -91,11 +115,15 @@ jobs:
         shell: pwsh
         run: pwsh ./tests/scripts/Measure-MainJsonSize.Tests.ps1
 
+      - name: Lint Bicep
+        shell: pwsh
+        run: |
+          az bicep lint --file main.bicep
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Validate hosted-agent resource contract
         shell: pwsh
         run: |
-          az bicep uninstall
-          az bicep install --version v0.42.1
           pwsh ./tests/contracts/Test-HostedAgentContract.ps1
 
       - name: Validate ACR Task agent pool firewall contract
@@ -122,15 +150,116 @@ jobs:
         shell: pwsh
         run: pwsh ./tests/contracts/Test-CosmosDeploymentNameContract.ps1
 
+      - name: Validate API Management workload isolation
+        shell: pwsh
+        run: pwsh ./tests/contracts/Test-ApiManagementWorkloadIsolationContract.ps1
+
       - name: Run deterministic preflight tests
         shell: pwsh
         run: pwsh ./tests/scripts/Invoke-PreflightChecks.Tests.ps1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13.14'
+
+      - name: Install pinned validation and OCI tools
+        shell: pwsh
+        run: |
+          Install-Module powershell-yaml -RequiredVersion 0.4.12 -Scope CurrentUser -Force
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          $tools = Join-Path $env:RUNNER_TEMP 'ailz-tools'
+          ./scripts/github/Install-ReleaseTools.ps1 -Destination $tools -IncludeWorkflowValidator
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $tools
+
+      - name: Lint new PowerShell surfaces
+        shell: pwsh
+        run: pwsh ./scripts/github/Test-CodeStyle.ps1
+
+      - name: Test environment, bootstrap, gateway, completion and delivery
+        shell: pwsh
+        run: pwsh ./scripts/github/Test-GitHubEnvironment.ps1 -TemplatePath ./main.json -RequireOras
+
+      - name: Test the starter without model calls
+        shell: pwsh
+        run: |
+          $venv = Join-Path $env:RUNNER_TEMP 'smoke-venv'
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $python = Join-Path $venv 'bin/python'
+          & $python -m pip install --require-virtualenv --require-hashes --only-binary=:all: -r ./samples/developer-smoke/requirements-test.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh ./samples/developer-smoke/Test-Smoke.ps1 -PythonExecutable $python
 
       - name: Upload main.json artifact
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: main-json-${{ github.run_id }}
+          name: main-json-${{ github.run_id }}-${{ github.run_attempt }}
           path: main.json
           if-no-files-found: warn
           retention-days: 14
+
+  release-bundle:
+    name: Build immutable release bundle
+    needs: [validate-copilot-assets, build-and-measure]
+    if: github.event_name == 'push' && github.repository == github.event.repository.full_name && github.ref == (vars.AILZ_RELEASE_REF || format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: main-json-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compiled
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.37.1
+          driver-opts: image=moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./samples/developer-smoke
+          platforms: linux/amd64
+          push: false
+          provenance: false
+          sbom: false
+          build-args: SOURCE_COMMIT=${{ github.sha }}
+          outputs: |
+            type=oci,dest=${{ runner.temp }}/image.oci.tar
+            type=docker,dest=${{ runner.temp }}/image.docker.tar,name=ailz-developer-smoke:ci
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Verify the packaged image without network or model access
+        shell: pwsh
+        run: |
+          docker load --input (Join-Path $env:RUNNER_TEMP 'image.docker.tar')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/github/Test-ReleaseImage.ps1 -Image ailz-developer-smoke:ci -OciArchivePath (Join-Path $env:RUNNER_TEMP 'image.oci.tar') -ExpectedSourceSha $env:GITHUB_SHA
+
+      - name: Bind sources, compiled inputs and the OCI digest
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+        run: |
+          ./scripts/github/New-ReleaseBundle.ps1 `
+            -SourceRoot $env:GITHUB_WORKSPACE `
+            -CompiledTemplatePath (Join-Path $env:RUNNER_TEMP 'compiled/main.json') `
+            -OciArchivePath (Join-Path $env:RUNNER_TEMP 'image.oci.tar') `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'ailz-release') `
+            -Repository $env:SOURCE_REPOSITORY -RunId $env:GITHUB_RUN_ID `
+            -RunAttempt $env:GITHUB_RUN_ATTEMPT -SourceSha $env:SOURCE_SHA -Ref $env:SOURCE_REF
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ailz-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ailz-release
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(vars.AILZ_ARTIFACT_RETENTION_DAYS || '14') }}

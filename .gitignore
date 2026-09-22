@@ -349,6 +349,16 @@ paket-files/
 # Python Tools for Visual Studio (PTVS)
 **/__pycache__/
 *.pyc
+.venv/
+
+# Private operator profiles; never use these as a published release default.
+environments/*.local.json
+
+# Operator deployment worksheet created from config.json.example. It holds
+# subscription IDs, hub resource IDs and may hold an Application Insights
+# connection string. Never commit it; commit config.json.example instead.
+config.json
+!config.json.example
 
 # Cake - Uncomment if you are using it
 #tools/**
