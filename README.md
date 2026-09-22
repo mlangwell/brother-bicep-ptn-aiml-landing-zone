@@ -29,6 +29,7 @@ The script configures this topology automatically:
 - `DEPLOY_AZURE_FIREWALL=false`
 - Spoke-to-hub peering using the supplied hub VNet resource ID
 - Spoke egress through the supplied hub firewall or NVA private IP
+- Optional internal Developer-tier API Management in a dedicated spoke subnet
 
 ## Prerequisites
 
@@ -62,7 +63,12 @@ The script has four required parameters. The remaining parameters are optional.
 | `ExistingLogAnalyticsWorkspaceResourceId` | No | Full resource ID of a hub-managed Log Analytics workspace to reuse. Leave it out to deploy a new workspace. | `/subscriptions/.../providers/Microsoft.OperationalInsights/workspaces/<name>` |
 | `ExistingApplicationInsightsResourceId` | No | Full resource ID of an existing Application Insights component to reuse. It must be supplied together with `ExistingApplicationInsightsConnectionString`. Leave both out to deploy a new component. | `/subscriptions/.../providers/Microsoft.Insights/components/<name>` |
 | `ExistingApplicationInsightsConnectionString` | No | Connection string belonging to the reused Application Insights component. Store it in a PowerShell variable before invoking the script so it is not typed directly into the command. | `$applicationInsightsConnectionString` |
+| `DeployApiManagement` | No | Deploy a Developer-tier API Management service with internal VNet injection into the AILZ spoke. Disabled by default. | `-DeployApiManagement` |
+| `ApiManagementPublisherEmail` | Conditional | Publisher contact email. Required when `DeployApiManagement` is enabled. | `api-owners@contoso.com` |
+| `ApiManagementPublisherName` | No | Publisher display name. Defaults to `AI Landing Zone`. | `Contoso API Team` |
+| `ApiManagementIngressSourceAddressPrefixes` | No | Hub firewall private IP CIDRs allowed to reach the internal APIM gateway after DNAT. Defaults to `EgressNextHopIp/32`; pass every firewall instance IP when the hub uses multiple addresses. | `@("10.100.0.4/32")` |
 | `AdditionalEnvironmentVariables` | No | PowerShell hashtable containing additional `azd` environment values supported by `main.parameters.json`, such as subscription, resource group, private DNS zone IDs, or feature flags. Values persist in the selected local `azd` environment. | `@{ AZURE_SUBSCRIPTION_ID = "<id>" }` |
+| `PreviewOutput` | No | Preview detail level. `Full` displays ARM What-If changes plus every nested compiled resource declaration. `Slim` (default) displays the original condensed `azd provision --preview` summary. | `Full` |
 | `PreviewOnly` | No | Switch that stops after `azd provision --preview`. Without it, the script displays the preview and then asks you to type `DEPLOY` before provisioning. | `-PreviewOnly` |
 
 ### Find the required values
@@ -123,13 +129,26 @@ Replace the example values, then run:
 ```
 
 The script signs in when needed, creates or selects the named `azd`
-environment, sets the integrated-topology values, runs the repository's
-preflight hook, and displays the Azure deployment preview. `-PreviewOnly`
-guarantees that this invocation does not provision resources.
+environment, sets the integrated-topology values, and displays two preview
+sections:
 
-Review the preview for deleted or replaced resources, unexpected role
+- `ARM What-If resource changes` is Azure's evaluated change set for resources
+  ARM expands during What-If.
+- `Complete compiled nested resource inventory` recursively lists every
+  resource declaration in the compiled template, including resources such as
+  Microsoft Foundry accounts, projects, model deployments, capability hosts,
+  and connections that ARM may omit when nested deployments exceed What-If's
+  expansion depth. `INCLUDED` entries are unconditional; `CONDITIONAL` entries
+  remain subject to their template or parent-module conditions.
+
+`-PreviewOnly` guarantees that this invocation does not provision resources.
+Pass `-PreviewOutput Slim` when the condensed `azd` resource summary is
+preferred. Omitting `-PreviewOutput` uses `Full`.
+
+Review both sections for deleted or replaced resources, unexpected role
 assignments, public network access, incorrect regions, and changes outside the
-intended resource group.
+intended resource group. Treat ARM What-If as the authoritative evaluated
+change set and the compiled inventory as the exhaustive declaration audit.
 
 ### 2. Provision the deployment
 
@@ -163,6 +182,53 @@ See the [hub-and-spoke deployment walkthrough](https://azure.github.io/AI-Landin
 for the post-deployment network checks.
 
 ## Optional configuration
+
+### Deploy API Management
+
+Enable API Management and provide its publisher contact email:
+
+```powershell
+./Deploy-AilzIntegrated.ps1 `
+  -EnvironmentName "ailz-dev" `
+  -Location "eastus2" `
+  -HubVnetResourceId $hubVnetResourceId `
+  -EgressNextHopIp $egressNextHopIp `
+  -DeployApiManagement `
+  -ApiManagementPublisherEmail "api-owners@contoso.com" `
+  -PreviewOnly
+```
+
+The deployment uses the Developer SKU and internal VNet mode. It creates the
+dedicated `api-management-subnet` at `192.168.3.128/27`, an NSG for required
+Azure control-plane and load-balancer traffic plus HTTPS from the approved hub
+firewall CIDRs, and a dedicated route table. The default route sends workload
+and APIM dependency egress to the hub firewall. The required `ApiManagement`
+service-tag route sends control-plane responses directly to the Internet to
+keep TCP 3443 symmetric; this is the sole intentional forced-tunneling
+exception. Set `-ApiManagementPublisherName` to override the default publisher
+name.
+
+The platform team must complete these hub-owned changes before the gateway is
+usable:
+
+1. Configure hub firewall DNAT for TCP 443 to the APIM private VIP. Azure
+  Firewall source-NATs DNAT traffic, so the APIM NSG permits the firewall
+  private IP `/32` by default. Pass
+  `-ApiManagementIngressSourceAddressPrefixes` when multiple firewall private
+  IPs can source the traffic.
+2. Permit the documented APIM VNet dependency service tags, ports, and FQDNs
+  in the hub firewall policy. See the [APIM VNet configuration
+  reference](https://learn.microsoft.com/azure/api-management/virtual-network-reference).
+3. Publish A records that resolve the APIM gateway, management, portal,
+  developer portal, and SCM host names to its private VIP in DNS visible from
+  the hub and spoke.
+4. Validate that direct spoke access to TCP 443 is denied and that requests
+  succeed only through the hub firewall listener.
+
+Disabling `DeployApiManagement` does not delete existing resources because ARM
+deployments are incremental. After exporting any APIM data-plane configuration,
+delete the APIM service and its dedicated subnet, NSG, and route table through
+an approved cleanup change.
 
 ### Select the subscription and resource group
 
@@ -322,10 +388,15 @@ az resource show --ids "<resource-id>" --output table
 ### Preflight reports overlapping CIDR ranges
 
 The default spoke range in this checkout is `192.168.0.0/21`. Choose a range
-that does not overlap the hub or any connected network. The
-`vnetAddressPrefixes` parameter is not currently exposed as an `azd` environment
-variable, so add this entry inside the `parameters` object in
-[main.parameters.json](main.parameters.json):
+that does not overlap the hub or any connected network. Changing only
+`vnetAddressPrefixes` is not sufficient: every subnet prefix must remain inside
+the new VNet range, must not overlap another subnet, and must meet the sizing
+requirements of the Azure service that uses it.
+
+The VNet and subnet parameters are not currently exposed as `azd` environment
+variables. Add the complete address plan inside the `parameters` object in
+[main.parameters.json](main.parameters.json). This example preserves the
+default subnet sizes and relative allocations in a `10.200.0.0/21` spoke:
 
 ```json
 "vnetAddressPrefixes": {
@@ -333,10 +404,44 @@ variable, so add this entry inside the `parameters` object in
     "10.200.0.0/21"
   ]
 },
+"agentSubnetPrefix": {
+  "value": "10.200.0.0/24"
+},
+"acaEnvironmentSubnetPrefix": {
+  "value": "10.200.1.0/24"
+},
+"peSubnetPrefix": {
+  "value": "10.200.2.0/26"
+},
+"azureBastionSubnetPrefix": {
+  "value": "10.200.2.64/26"
+},
+"azureFirewallSubnetPrefix": {
+  "value": "10.200.2.128/26"
+},
+"gatewaySubnetPrefix": {
+  "value": "10.200.2.192/26"
+},
+"azureAppGatewaySubnetPrefix": {
+  "value": "10.200.3.0/27"
+},
+"jumpboxSubnetPrefix": {
+  "value": "10.200.3.64/27"
+},
+"devopsBuildAgentsSubnetPrefix": {
+  "value": "10.200.3.96/27"
+},
+"apiManagementSubnetPrefix": {
+  "value": "10.200.3.128/27"
+},
 ```
 
-Keep enough address space for the template's subnets, rerun with `-PreviewOnly`,
-and confirm that preflight accepts the new range before provisioning.
+The API Management subnet uses `/27` as this repository's conservative sizing
+policy; its network address is not fixed and may be moved to any aligned,
+non-overlapping block inside the spoke. Keep enough unused address space for
+future subnets and service growth. Rerun with `-PreviewOnly`, confirm that
+preflight accepts the complete address plan, and review the resulting VNet and
+subnet changes before provisioning.
 
 ### Authorization or role-assignment failure
 
