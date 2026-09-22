@@ -50,6 +50,13 @@ Before running the script, confirm that you have:
 
 Open PowerShell 7 in the repository root before following the steps below.
 
+## Copilot Prompt
+Instead of executing everything on your own, you can run the following copilot prompt by entering it into either the Copilot CLI or Copilot Chat.
+
+`/Deploy-AILZ-with-APIM`
+
+There will be questions that surface after running the prompt that must be answered to run the script. 
+
 ## Deployment script parameters
 
 The script has four required parameters. The remaining parameters are optional.

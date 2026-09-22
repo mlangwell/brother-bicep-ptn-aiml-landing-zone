@@ -17,6 +17,7 @@
 .DS_Store
 Thumbs.db
 .idea/
+/run-output
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
