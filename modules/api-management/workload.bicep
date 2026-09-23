@@ -25,8 +25,9 @@ import { renderPolicy, gatewayNamedValues } from './policy.bicep'
 @maxLength(50)
 param apiManagementName string
 
-@description('Configured environment, used in ownership markers and token counter isolation.')
-param environmentName 'dev' | 'test' | 'prod'
+@description('Environment name used in ownership markers and token counter isolation. The GitHub environment pipeline passes dev, test or prod; the azd path passes the azd environment name.')
+@minLength(1)
+param environmentName string
 
 @description('Landing-zone-scoped key that makes every resource in this module unique within a shared gateway.')
 @minLength(3)

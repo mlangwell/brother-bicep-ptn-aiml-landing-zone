@@ -63,163 +63,259 @@ param location string = resourceGroup().location
 @description('Tags applied to the network security group.')
 param tags object = {}
 
+@description('Hub firewall source CIDRs allowed to reach the gateway on TCP 443: the post-SNAT source range, which is the hub AzureFirewallSubnet prefix for Azure Firewall. When non-empty, the NSG allows inbound 443 only from these CIDRs and from directCallerAddressPrefixes, and denies all other inbound traffic (ADR-002). Empty keeps the base injection rule set, which is what platform/api-management/network.bicep deploys today.')
+param ingressSourceAddressPrefixes string[] = []
+
+@description('Subnet CIDRs inside the same spoke that may call the gateway on TCP 443 directly, without traversing the hub firewall. Used only when ingressSourceAddressPrefixes is non-empty.')
+param directCallerAddressPrefixes string[] = []
+
+@description('Address prefix of the injection subnet. It scopes the UDP 4290 rate-limit counter sync rule, which multi-unit Premium needs once DenyAllInbound overrides AllowVnetInBound. Used only when ingressSourceAddressPrefixes is non-empty.')
+param subnetAddressPrefix string = ''
+
+// The base rule set is a literal variable, so the compiled template keeps every
+// rule as a literal object that contract tests can assert field by field.
+var injectionRules = [
+  {
+    // REQUIRED. Without this the service cannot be created or managed, and
+    // an existing instance drops off the Azure portal and PowerShell.
+    // This is the ONLY inbound path from outside the VNet, it is
+    // control-plane only, and it is restricted to Azure's own API
+    // Management control-plane addresses via the service tag.
+    name: 'AllowApiManagementControlPlaneInbound'
+    properties: {
+      description: 'Required: API Management management endpoint (3443) from the ApiManagement service tag. Control plane only - this is not a data-plane path.'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Inbound'
+      priority: 100
+      sourceAddressPrefix: 'ApiManagement'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'VirtualNetwork'
+      destinationPortRange: '3443'
+    }
+  }
+  {
+    // Learn marks this optional on Developer (a single compute unit sits
+    // behind the LB) but CRITICAL on Premium: "failure of the health probe
+    // from load balancer then blocks all inbound access to the control
+    // plane and data plane." Always present so dev/test rehearse prod.
+    name: 'AllowAzureLoadBalancerInbound'
+    properties: {
+      description: 'Required on Premium, harmless on Developer: Azure infrastructure load balancer health probe (6390). If this probe fails on Premium, ALL inbound control-plane and data-plane access is blocked.'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Inbound'
+      priority: 110
+      sourceAddressPrefix: 'AzureLoadBalancer'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'VirtualNetwork'
+      destinationPortRange: '6390'
+    }
+  }
+  {
+    name: 'AllowStorageOutbound'
+    properties: {
+      description: 'Required: hard dependency on Azure Storage (443).'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Outbound'
+      priority: 100
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'Storage'
+      destinationPortRange: '443'
+    }
+  }
+  {
+    name: 'AllowSqlOutbound'
+    properties: {
+      description: 'Required: hard dependency on Azure SQL endpoints (1433).'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Outbound'
+      priority: 110
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'Sql'
+      destinationPortRange: '1433'
+    }
+  }
+  {
+    name: 'AllowKeyVaultOutbound'
+    properties: {
+      description: 'Required: hard dependency on Azure Key Vault (443).'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Outbound'
+      priority: 120
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'AzureKeyVault'
+      destinationPortRange: '443'
+    }
+  }
+  {
+    name: 'AllowAzureMonitorOutbound'
+    properties: {
+      description: 'Required: publish diagnostics, metrics, Resource Health and Application Insights telemetry (1886, 443).'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Outbound'
+      priority: 130
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'AzureMonitor'
+      destinationPortRanges: [
+        '1886'
+        '443'
+      ]
+    }
+  }
+  {
+    // Port 80 only, and deliberately so: this is CRL/OCSP certificate chain
+    // validation (mscrl.microsoft.com, crl.microsoft.com, oneocsp.microsoft.com,
+    // cacerts.digicert.com, crl3.digicert.com, csp.digicert.com), which is
+    // plain HTTP by design. This is NOT general internet egress.
+    name: 'AllowCertificateValidationOutbound'
+    properties: {
+      description: 'Required: validation and management of Microsoft-managed and customer-managed certificates (CRL/OCSP over HTTP, port 80). Not a general internet egress rule.'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Outbound'
+      priority: 140
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'Internet'
+      destinationPortRange: '80'
+    }
+  }
+  {
+    // Learn marks this "(optional)" because it is only needed for Entra ID,
+    // Microsoft Graph and Key Vault integration. This gateway's inbound
+    // policy is validate-azure-ad-token, so for this workload it is REQUIRED.
+    name: 'AllowMicrosoftEntraIdOutbound'
+    properties: {
+      description: 'Required by this workload: the inbound API policy uses validate-azure-ad-token, which needs Microsoft Entra ID and Microsoft Graph (443). Learn lists this as optional only because gateways that do not authenticate callers against Entra do not need it.'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Outbound'
+      priority: 150
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'AzureActiveDirectory'
+      destinationPortRange: '443'
+    }
+  }
+  {
+    // Learn, "DNS access": "Outbound access on port 53 is required for
+    // communication with DNS servers." Protocol is '*' because DNS uses both
+    // UDP and TCP; destination is '*' because the resolver may be the Azure
+    // platform resolver, a custom DNS server in a peered VNet, or an
+    // on-premises forwarder reached over ExpressRoute.
+    name: 'AllowDnsOutbound'
+    properties: {
+      description: 'Required: DNS resolution (53, UDP and TCP). Internal mode has no Azure-provided public name resolution for the gateway, and the gateway must resolve the backend Foundry private endpoint, so a working resolver path is mandatory.'
+      protocol: '*'
+      access: 'Allow'
+      direction: 'Outbound'
+      priority: 160
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: '*'
+      destinationPortRange: '53'
+    }
+  }
+]
+
+// ---------------------------------------------------------------------------
+// Ingress restriction (ADR-002). Enabled by passing ingressSourceAddressPrefixes.
+// ---------------------------------------------------------------------------
+// Gateway ingress traverses the hub firewall. The firewall source-NATs DNAT and
+// application-rule traffic to a back-end instance IP in AzureFirewallSubnet,
+// not to its frontend private IP, so the allowed source is that subnet's range.
+// Callers inside the same spoke never traverse the firewall; Learn recommends
+// NSGs, not UDR hairpins, for segmentation inside a virtual network, so named
+// in-spoke caller subnets get their own rule. DenyAllInbound then overrides the
+// default AllowVnetInBound rule, which would otherwise admit every peered and
+// on-premises network. That also blocks VirtualNetwork-to-VirtualNetwork UDP
+// 4290, which Learn lists for syncing rate-limit counters between units, so
+// the rule below restores it within the injection subnet only.
+// Source: https://learn.microsoft.com/azure/api-management/virtual-network-reference
+var restrictedIngressRules = [
+  {
+    name: 'AllowHttpsFromHubFirewall'
+    properties: {
+      description: 'Allow API gateway ingress that traversed the hub firewall (its post-SNAT source range).'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Inbound'
+      priority: 120
+      sourceAddressPrefixes: ingressSourceAddressPrefixes
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'VirtualNetwork'
+      destinationPortRange: '443'
+    }
+  }
+  {
+    name: 'AllowRateLimitSyncInbound'
+    properties: {
+      description: 'Sync rate-limit counters between gateway units (UDP 4290), within the injection subnet only. Needed by multi-unit Premium; harmless on Developer.'
+      protocol: 'Udp'
+      access: 'Allow'
+      direction: 'Inbound'
+      priority: 140
+      sourceAddressPrefix: empty(subnetAddressPrefix) ? 'VirtualNetwork' : subnetAddressPrefix
+      sourcePortRange: '*'
+      destinationAddressPrefix: empty(subnetAddressPrefix) ? 'VirtualNetwork' : subnetAddressPrefix
+      destinationPortRange: '4290'
+    }
+  }
+  {
+    name: 'DenyAllInbound'
+    properties: {
+      description: 'Deny inbound traffic that did not traverse the approved hub firewall path or come from a named in-spoke caller.'
+      protocol: '*'
+      access: 'Deny'
+      direction: 'Inbound'
+      priority: 4096
+      sourceAddressPrefix: '*'
+      sourcePortRange: '*'
+      destinationAddressPrefix: '*'
+      destinationPortRange: '*'
+    }
+  }
+]
+
+var directCallerRules = [
+  {
+    name: 'AllowHttpsFromLandingZoneCallers'
+    properties: {
+      description: 'Allow API gateway calls from named subnets inside this spoke, which never traverse the hub firewall.'
+      protocol: 'Tcp'
+      access: 'Allow'
+      direction: 'Inbound'
+      priority: 130
+      sourceAddressPrefixes: directCallerAddressPrefixes
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'VirtualNetwork'
+      destinationPortRange: '443'
+    }
+  }
+]
+
+var restrictIngress = !empty(ingressSourceAddressPrefixes)
+var effectiveRules = concat(
+  injectionRules,
+  restrictIngress ? restrictedIngressRules : [],
+  restrictIngress && !empty(directCallerAddressPrefixes) ? directCallerRules : []
+)
+
 resource networkSecurityGroup 'Microsoft.Network/networkSecurityGroups@2024-07-01' = {
   name: name
   location: location
   tags: tags
   properties: {
-    securityRules: [
-      {
-        // REQUIRED. Without this the service cannot be created or managed, and
-        // an existing instance drops off the Azure portal and PowerShell.
-        // This is the ONLY inbound path from outside the VNet, it is
-        // control-plane only, and it is restricted to Azure's own API
-        // Management control-plane addresses via the service tag.
-        name: 'AllowApiManagementControlPlaneInbound'
-        properties: {
-          description: 'Required: API Management management endpoint (3443) from the ApiManagement service tag. Control plane only - this is not a data-plane path.'
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Inbound'
-          priority: 100
-          sourceAddressPrefix: 'ApiManagement'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'VirtualNetwork'
-          destinationPortRange: '3443'
-        }
-      }
-      {
-        // Learn marks this optional on Developer (a single compute unit sits
-        // behind the LB) but CRITICAL on Premium: "failure of the health probe
-        // from load balancer then blocks all inbound access to the control
-        // plane and data plane." Always present so dev/test rehearse prod.
-        name: 'AllowAzureLoadBalancerInbound'
-        properties: {
-          description: 'Required on Premium, harmless on Developer: Azure infrastructure load balancer health probe (6390). If this probe fails on Premium, ALL inbound control-plane and data-plane access is blocked.'
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Inbound'
-          priority: 110
-          sourceAddressPrefix: 'AzureLoadBalancer'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'VirtualNetwork'
-          destinationPortRange: '6390'
-        }
-      }
-      {
-        name: 'AllowStorageOutbound'
-        properties: {
-          description: 'Required: hard dependency on Azure Storage (443).'
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          priority: 100
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'Storage'
-          destinationPortRange: '443'
-        }
-      }
-      {
-        name: 'AllowSqlOutbound'
-        properties: {
-          description: 'Required: hard dependency on Azure SQL endpoints (1433).'
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          priority: 110
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'Sql'
-          destinationPortRange: '1433'
-        }
-      }
-      {
-        name: 'AllowKeyVaultOutbound'
-        properties: {
-          description: 'Required: hard dependency on Azure Key Vault (443).'
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          priority: 120
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'AzureKeyVault'
-          destinationPortRange: '443'
-        }
-      }
-      {
-        name: 'AllowAzureMonitorOutbound'
-        properties: {
-          description: 'Required: publish diagnostics, metrics, Resource Health and Application Insights telemetry (1886, 443).'
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          priority: 130
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'AzureMonitor'
-          destinationPortRanges: [
-            '1886'
-            '443'
-          ]
-        }
-      }
-      {
-        // Port 80 only, and deliberately so: this is CRL/OCSP certificate chain
-        // validation (mscrl.microsoft.com, crl.microsoft.com, oneocsp.microsoft.com,
-        // cacerts.digicert.com, crl3.digicert.com, csp.digicert.com), which is
-        // plain HTTP by design. This is NOT general internet egress.
-        name: 'AllowCertificateValidationOutbound'
-        properties: {
-          description: 'Required: validation and management of Microsoft-managed and customer-managed certificates (CRL/OCSP over HTTP, port 80). Not a general internet egress rule.'
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          priority: 140
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'Internet'
-          destinationPortRange: '80'
-        }
-      }
-      {
-        // Learn marks this "(optional)" because it is only needed for Entra ID,
-        // Microsoft Graph and Key Vault integration. This gateway's inbound
-        // policy is validate-azure-ad-token, so for this workload it is REQUIRED.
-        name: 'AllowMicrosoftEntraIdOutbound'
-        properties: {
-          description: 'Required by this workload: the inbound API policy uses validate-azure-ad-token, which needs Microsoft Entra ID and Microsoft Graph (443). Learn lists this as optional only because gateways that do not authenticate callers against Entra do not need it.'
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          priority: 150
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'AzureActiveDirectory'
-          destinationPortRange: '443'
-        }
-      }
-      {
-        // Learn, "DNS access": "Outbound access on port 53 is required for
-        // communication with DNS servers." Protocol is '*' because DNS uses both
-        // UDP and TCP; destination is '*' because the resolver may be the Azure
-        // platform resolver, a custom DNS server in a peered VNet, or an
-        // on-premises forwarder reached over ExpressRoute.
-        name: 'AllowDnsOutbound'
-        properties: {
-          description: 'Required: DNS resolution (53, UDP and TCP). Internal mode has no Azure-provided public name resolution for the gateway, and the gateway must resolve the backend Foundry private endpoint, so a working resolver path is mandatory.'
-          protocol: '*'
-          access: 'Allow'
-          direction: 'Outbound'
-          priority: 160
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '53'
-        }
-      }
-    ]
+    securityRules: effectiveRules
   }
 }
 
@@ -230,14 +326,4 @@ output id string = networkSecurityGroup.id
 output name string = networkSecurityGroup.name
 
 @description('Rule names emitted by this module, in declaration order. Contract tests assert against this list so a silently dropped rule fails the build rather than the deployment.')
-output ruleNames array = [
-  'AllowApiManagementControlPlaneInbound'
-  'AllowAzureLoadBalancerInbound'
-  'AllowStorageOutbound'
-  'AllowSqlOutbound'
-  'AllowKeyVaultOutbound'
-  'AllowAzureMonitorOutbound'
-  'AllowCertificateValidationOutbound'
-  'AllowMicrosoftEntraIdOutbound'
-  'AllowDnsOutbound'
-]
+output ruleNames array = map(effectiveRules, rule => rule.name)

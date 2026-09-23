@@ -87,10 +87,7 @@ param appConfigLabel string = 'ai-lz'
 @description('Optional. Accelerator-specific App Configuration key-values appended verbatim to the App Configuration store. This lets a consuming accelerator publish its own settings without the landing zone needing to know about them. Values are stored as plaintext in App Configuration, so never pass secrets here (use Key Vault references instead). Each entry must have a unique name+label. On a name+label collision with a workload configuration key the landing zone already emits, the passthrough entry wins. Do not redefine reserved infrastructure keys emitted by other modules (the Cosmos identifiers COSMOS_DB_ACCOUNT_RESOURCE_ID and COSMOS_DB_ENDPOINT, and the per-app <APP>_APIKEY Key Vault references); reusing those names would create a duplicate key-value and fail the deployment. Note: this is only applied on non network-isolated deployments, where the landing zone writes App Configuration at deploy time. Network-isolated deployments configure App Configuration from the accelerator post-provision step, so pass these values through that path instead.')
 param additionalAppConfigurationSettings additionalAppConfigurationSettingType[] = []
 
-@description('Opt in to the private inference gateway. Existing deployments remain unchanged when false. Use the validated GitHub environment profile for gateway configuration and private-network prerequisites.')
-param deployApiManagement bool = false
-
-@description('Nonsecret gateway configuration resolved from the environment profile. Requires explicit caller/model mappings, positive token limits, publisher information, private DNS and a dedicated integration subnet when the gateway is enabled.')
+@description('Optional structured gateway configuration, resolved from the GitHub environment profile. Leave empty to deploy the gateway alone from the flat apiManagement* parameters. When supplied it must be a complete gatewayConfiguration (modules/api-management/types.bicep): it selects the SKU and capacity and adds this landing zone\'s workload API, with explicit caller/model mappings and token limits. Its publisher and integration-subnet fields take precedence over the flat parameters.')
 param apiManagementConfiguration object = {}
 
 @description('Landing-zone-scoped key that keeps every per-workload gateway resource unique when several landing zones share one API Management gateway. It keys the API name, the public API path, the backend, the logger and the named values. Defaults to a deterministic hash of this resource group, which is unique per landing zone because this template is resource-group scoped. Do NOT derive it from `resourceToken` or the CAF workload token: both hash only subscription + environment + location, so two landing zones in the same subscription, environment and region would produce the same value and collide. Must be lowercase alphanumeric to be valid as both an APIM resource name segment and a URL path segment.')
@@ -214,6 +211,7 @@ param azureAppGatewaySubnetName string = 'AppGatewaySubnet'
 param jumpboxSubnetName string = 'jumpbox-subnet'
 param acaEnvironmentSubnetName string = 'aca-environment-subnet'
 param devopsBuildAgentsSubnetName string = 'devops-build-agents-subnet'
+param apiManagementSubnetName string = 'api-management-subnet'
 
 @description('Address prefixes for the virtual network.')
 param vnetAddressPrefixes array = [
@@ -255,6 +253,9 @@ param jumpboxSubnetPrefix string = '192.168.3.64/27' // 192.168.3.64–192.168.3
 @description('DevOps Build Agents subnet — /27 (32 IPs)')
 param devopsBuildAgentsSubnetPrefix string = '192.168.3.96/27' // 192.168.3.96–192.168.3.127
 
+@description('API Management subnet — /27 (32 IPs), dedicated to the VNet-injected service. apiManagementConfiguration.integrationSubnetPrefix takes precedence when supplied.')
+param apiManagementSubnetPrefix string = '192.168.3.128/27' // 192.168.3.128–192.168.3.159
+
 // ----------------------------------------------------------------------
 // Feature-flagging Params (as booleans with a default of true)
 // ----------------------------------------------------------------------
@@ -273,6 +274,21 @@ param deployAiFoundrySubnet bool = true
 
 @description('Deploy Azure App Configuration for centralized feature-flag and configuration management.')
 param deployAppConfig bool = true
+
+@description('Deploy an Azure API Management gateway with internal (classic) VNet injection into a dedicated injection subnet. The tier is Developer unless apiManagementConfiguration selects Premium. This template creates the gateway only in the ailz-integrated, network-isolated topology with a hub VNet: either a new spoke with a hub egress next hop, where the template owns the subnet, NSG and route table, or a prepared spoke (useExistingVNet with deploySubnets=false), where an administrator owns them. Alternatively, existingApiManagementResourceId binds this landing zone to a platform-owned gateway. Disabled by default.')
+param deployApiManagement bool = false
+
+@description('Publisher email for Azure API Management. Required when deployApiManagement is true, unless apiManagementConfiguration supplies publisherEmail.')
+param apiManagementPublisherEmail string = ''
+
+@description('Publisher name for Azure API Management. apiManagementConfiguration.publisherName takes precedence when supplied.')
+param apiManagementPublisherName string = 'AI Landing Zone'
+
+@description('Hub firewall source CIDRs allowed to reach the internal API Management gateway on TCP 443. Required when this template creates the gateway. Azure Firewall source-NATs DNAT and application-rule traffic to a back-end instance IP in AzureFirewallSubnet, not to its frontend private IP. Pass the hub AzureFirewallSubnet prefix; Deploy-AilzIntegrated.ps1 looks it up by default.')
+param apiManagementIngressSourceAddressPrefixes array = []
+
+@description('Subnet CIDRs inside this spoke that may call the gateway on TCP 443 directly, without traversing the hub firewall. Default is none. The Container Apps environment subnet is added automatically when enableDeveloperExperience is true, because the developer application calls the gateway from it. Traffic from outside the spoke must still arrive through the hub firewall.')
+param apiManagementDirectCallerAddressPrefixes array = []
 
 @description('How the landing zone should provide runtime configuration to the external Container Apps. ``appConfig`` (default) preserves the existing behavior: an Azure App Configuration store is populated with deployment outputs and each Container App receives an ``APP_CONFIG_ENDPOINT`` env var plus the ``App Configuration Data Reader`` RBAC. ``containerEnv`` skips the App Configuration population and instead injects a small set of bootstrap env vars (tenant, subscription, resource group, location, resource token, network/identity flags, plus the names of the deployed resources) directly on every Container App so consumers can resolve endpoints via SDK without going through App Configuration. ``none`` deploys the Container App shells with only the identity bootstrap env vars (``AZURE_TENANT_ID`` and ``AZURE_CLIENT_ID`` when applicable); callers are expected to supply runtime configuration through their own mechanism. Secrets are always sourced from secure parameters or Key Vault references regardless of mode. Set ``deployAppConfig=false`` to skip the store entirely when the mode is ``containerEnv`` or ``none``.')
 @allowed([
@@ -397,7 +413,7 @@ param existingJumpboxResourceId string?
 @description('DEPRECATED (v2.0.0). Legacy v1.x consolidated switch for jumpbox + Bastion + NAT Gateway. Provided as a transitional fallback so v1.x parameter files continue to deploy unmodified — explicit `deployJumpbox` / `deployBastion` / `deployNatGateway` values ALWAYS take precedence over this flag. Will be REMOVED in v3.0.0; migrate to the three component-specific flags.')
 param deployVM bool?
 
-@description('Deploy the virtual network subnets. NOTE for API Management: setting this to `false` alongside `useExistingVNet: true` does NOT stop the gateway being deployed — it only stops this template creating the gateway\'s injection subnet and its network security group. The pre-existing subnet must then be undelegated and already carry the required classic-injection NSG rules (see `modules/networking/api-management-injection-nsg.bicep`), or the internal load balancer rejects all inbound traffic and the gateway fails. The `injectionNsgManaged` gateway fact reports which side owns the NSG.')
+@description('Deploy the virtual network subnets. NOTE for API Management: with `useExistingVNet: true` and this set to `false` (the prepared-spoke shape), the gateway is STILL deployed, into an administrator-prepared injection subnet that this template does not create. That subnet must be undelegated, must already carry the rule set in `modules/networking/api-management-injection-nsg.bicep` including the hub-firewall-only ingress rules, and must route the ApiManagement service tag to Internet when 0.0.0.0/0 goes to a firewall. Otherwise the gateway fails. The `injectionNsgManaged` gateway fact reports which side owns the NSG.')
 param deploySubnets bool = true
 
 @description('Will deploy network security groups.')
@@ -796,6 +812,9 @@ param bingSearchName string = '${const.abbrs.ai.bing}${resourceToken}'
 @description('Name of the Azure App Configuration store for centralized settings.')
 param appConfigName string = '${const.abbrs.configuration.appConfiguration}${resourceToken}'
 
+@description('Optional override for the globally unique Azure API Management service name.')
+param apiManagementName string = '${const.abbrs.integration.apiManagement}${resourceToken}'
+
 @description('Name of the Application Insights instance for monitoring.')
 param appInsightsName string = '${const.abbrs.managementGovernance.applicationInsights}${resourceToken}'
 
@@ -899,6 +918,7 @@ var _legacyResourceNames = {
   aiFoundryCosmosDbName: '${const.abbrs.databases.cosmosDBDatabase}${const.abbrs.ai.aiFoundry}${resourceToken}'
   bingSearchName: '${const.abbrs.ai.bing}${resourceToken}'
   appConfigName: '${const.abbrs.configuration.appConfiguration}${resourceToken}'
+  apiManagementName: '${const.abbrs.integration.apiManagement}${resourceToken}'
   appInsightsName: '${const.abbrs.managementGovernance.applicationInsights}${resourceToken}'
   containerEnvName: '${const.abbrs.containers.containerAppsEnvironment}${resourceToken}'
   containerRegistryName: '${const.abbrs.containers.containerRegistry}${resourceToken}'
@@ -920,6 +940,7 @@ var _cafResourceNames = {
   aiFoundryCosmosDbName: cafTrim('cosmos-aif-${_cafNameStem}', 44)
   bingSearchName: cafTrim('bing-${_cafNameStem}', 64)
   appConfigName: cafTrim('appcs-${_cafNameStem}', 50)
+  apiManagementName: cafTrim('apim-${_cafNameStem}', 50)
   appInsightsName: cafTrim('appi-${_cafNameStem}', 64)
   containerEnvName: cafTrim('cae-${_cafNameStem}', 32)
   containerRegistryName: cafTrim('cr${_cafCompactStem}', 50)
@@ -941,6 +962,7 @@ var resourceNames = {
   aiFoundryCosmosDbName: !empty(aiFoundryCosmosDbName) && !(resourceNamingMode == 'caf' && aiFoundryCosmosDbName == _legacyResourceNames.aiFoundryCosmosDbName) ? aiFoundryCosmosDbName : (resourceNamingMode == 'caf' ? _cafResourceNames.aiFoundryCosmosDbName : _legacyResourceNames.aiFoundryCosmosDbName)
   bingSearchName: !empty(bingSearchName) && !(resourceNamingMode == 'caf' && bingSearchName == _legacyResourceNames.bingSearchName) ? bingSearchName : (resourceNamingMode == 'caf' ? _cafResourceNames.bingSearchName : _legacyResourceNames.bingSearchName)
   appConfigName: !empty(appConfigName) && !(resourceNamingMode == 'caf' && appConfigName == _legacyResourceNames.appConfigName) ? appConfigName : (resourceNamingMode == 'caf' ? _cafResourceNames.appConfigName : _legacyResourceNames.appConfigName)
+  apiManagementName: !empty(apiManagementName) && !(resourceNamingMode == 'caf' && apiManagementName == _legacyResourceNames.apiManagementName) ? apiManagementName : (resourceNamingMode == 'caf' ? _cafResourceNames.apiManagementName : _legacyResourceNames.apiManagementName)
   appInsightsName: !empty(appInsightsName) && !(resourceNamingMode == 'caf' && appInsightsName == _legacyResourceNames.appInsightsName) ? appInsightsName : (resourceNamingMode == 'caf' ? _cafResourceNames.appInsightsName : _legacyResourceNames.appInsightsName)
   containerEnvName: !empty(containerEnvName) && !(resourceNamingMode == 'caf' && containerEnvName == _legacyResourceNames.containerEnvName) ? containerEnvName : (resourceNamingMode == 'caf' ? _cafResourceNames.containerEnvName : _legacyResourceNames.containerEnvName)
   containerRegistryName: !empty(containerRegistryName) && !(resourceNamingMode == 'caf' && containerRegistryName == _legacyResourceNames.containerRegistryName) ? containerRegistryName : (resourceNamingMode == 'caf' ? _cafResourceNames.containerRegistryName : _legacyResourceNames.containerRegistryName)
@@ -1233,6 +1255,19 @@ var _useExistingAiFoundryStorage = !empty(aiFoundryStorageAccountResourceId)
 var _useExistingAiFoundryCosmos = !empty(aiFoundryCosmosDBAccountResourceId)
 var _deployAiFoundrySearch = _deployAiFoundryAgentService && !_useExistingAiFoundrySearch
 var _deployAiFoundryStorage = _deployAiFoundryAgentService && !_useExistingAiFoundryStorage
+// API Management topology gate (ADR-001, ADR-002). This template creates a
+// gateway only in the ailz-integrated, network-isolated topology with a hub
+// VNet, in one of two network shapes:
+//   1. New spoke (the Deploy-AilzIntegrated.ps1 path): the template owns the
+//      injection subnet, its NSG and a dedicated route table, so it also needs
+//      the hub egress next hop and must own the spoke routing.
+//   2. Prepared spoke (the GitHub environment pipeline path): useExistingVNet
+//      with deploySubnets=false. An administrator owns the injection subnet,
+//      its NSG and its route table (see the operator obligation on
+//      apiManagementSubnets below).
+// Other topologies create no gateway; preflight reports them.
+var _apiManagementTopologySupported = _networkIsolation && deploymentMode == 'ailz-integrated' && !deployAzureFirewall && _hasHubVnet && ((!useExistingVNet && _hasExternalEgress && !_hasExistingRouteTable) || (useExistingVNet && !deploySubnets))
+var _apiManagementIngressSourceAddressPrefixes = apiManagementIngressSourceAddressPrefixes
 
 
 // ----------------------------------------------------------------------
@@ -1250,9 +1285,7 @@ var _containerDummyImageName = 'mcr.microsoft.com/dotnet/samples:aspnetapp-9.0'
 
 var _apiManagementName = !empty(apiManagementConfiguration.?name ?? '')
   ? string(apiManagementConfiguration.name)
-  : (resourceNamingMode == 'caf'
-      ? cafTrim('${const.abbrs.integration.apiManagement}${_cafNameStem}', 50)
-      : '${const.abbrs.integration.apiManagement}${resourceToken}')
+  : resourceNames.apiManagementName
 
 // ----------------------------------------------------------------------
 // Shared platform gateway (BYO) derivations
@@ -1266,20 +1299,36 @@ var _apiManagementName = !empty(apiManagementConfiguration.?name ?? '')
 // Cross-RG-safe: the gateway's principal ID is supplied as a parameter and is
 // never read off an `existing` reference.
 var _hasExistingApiManagement = !empty(existingApiManagementResourceId ?? '')
-var _createApiManagement      = deployApiManagement && !_hasExistingApiManagement
+var _createApiManagement      = deployApiManagement && !_hasExistingApiManagement && _apiManagementTopologySupported
 var _apimSegments             = _hasExistingApiManagement ? split(existingApiManagementResourceId!, '/') : ['']
 var _apimSubscriptionId       = length(_apimSegments) >= 3 ? _apimSegments[2] : subscription().subscriptionId
 var _apimResourceGroupName    = length(_apimSegments) >= 5 ? _apimSegments[4] : resourceGroup().name
 var _effectiveApiManagementName = _hasExistingApiManagement ? last(_apimSegments) : _apiManagementName
 var _apiManagementPrincipalId = existingApiManagementPrincipalId ?? ''
 
+// One gateway implementation, two input surfaces (ADR-002). The flat
+// apiManagement* parameters deploy the gateway alone. A non-empty
+// apiManagementConfiguration also selects the tier and adds this landing
+// zone's workload API; its fields take precedence where both are set.
+var _apiManagementWorkloadEnabled = !empty(apiManagementConfiguration)
+var _apiManagementGatewayBound    = _createApiManagement || (deployApiManagement && _hasExistingApiManagement)
+var _apiManagementSku             = apiManagementConfiguration.?sku ?? 'Developer'
+var _apiManagementCapacity        = apiManagementConfiguration.?capacity ?? 1
+var _apiManagementPublisherEmail  = apiManagementConfiguration.?publisherEmail ?? apiManagementPublisherEmail
+var _apiManagementPublisherName   = apiManagementConfiguration.?publisherName ?? apiManagementPublisherName
+var _apiManagementSubnetName      = apiManagementConfiguration.?integrationSubnetName ?? apiManagementSubnetName
+var _apiManagementSubnetPrefix    = apiManagementConfiguration.?integrationSubnetPrefix ?? apiManagementSubnetPrefix
+// The developer application calls the gateway from the Container Apps subnet,
+// inside the spoke, so that subnet is a named direct caller (ADR-002).
+var _apiManagementDirectCallerAddressPrefixes = union(apiManagementDirectCallerAddressPrefixes, enableDeveloperExperience ? [acaEnvironmentSubnetPrefix] : [])
+
 var _inferenceGatewayApiPath = 'inference/${apiManagementWorkloadKey}'
-var _inferenceGatewayEndpoint = deployApiManagement ? 'https://${_effectiveApiManagementName}.azure-api.net/${_inferenceGatewayApiPath}/v1/responses' : ''
+var _inferenceGatewayEndpoint = _apiManagementGatewayBound && _apiManagementWorkloadEnabled ? 'https://${_effectiveApiManagementName}.azure-api.net/${_inferenceGatewayApiPath}/v1/responses' : ''
 
 var _developerRuntimeSettings = enableDeveloperExperience ? [
   { name: 'INFERENCE_ACCESS_MODE', value: 'gateway', label: appConfigLabel, contentType: 'text/plain' }
   { name: 'INFERENCE_GATEWAY_ENDPOINT', value: _inferenceGatewayEndpoint, label: appConfigLabel, contentType: 'text/plain' }
-  { name: 'INFERENCE_GATEWAY_AUDIENCE', value: apiManagementConfiguration.audience, label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'INFERENCE_GATEWAY_AUDIENCE', value: apiManagementConfiguration.?audience ?? '', label: appConfigLabel, contentType: 'text/plain' }
   { name: 'SMOKE_API_AUDIENCE', value: developerExperience.application.audience, label: appConfigLabel, contentType: 'text/plain' }
   { name: 'SMOKE_ALLOWED_OBJECT_IDS', value: string(developerExperience.developerObjectIds), label: appConfigLabel, contentType: 'application/json' }
   { name: 'SMOKE_ALLOWED_GROUP_IDS', value: string(developerExperience.developerGroupObjectIds), label: appConfigLabel, contentType: 'application/json' }
@@ -1307,6 +1356,8 @@ var _caEnvSubnetId = _networkIsolation ? '${virtualNetworkResourceId}/subnets/${
 var _jumpbxSubnetId = _networkIsolation ? '${virtualNetworkResourceId}/subnets/${jumpboxSubnetName}' : ''
 #disable-next-line BCP318
 var _agentSubnetId = _networkIsolation ? '${virtualNetworkResourceId}/subnets/${agentSubnetName}' : ''
+#disable-next-line BCP318
+var _apiManagementSubnetId = _createApiManagement ? '${virtualNetworkResourceId}/subnets/${_apiManagementSubnetName}' : ''
 
 var _peLocation = !empty(privateEndpointLocation) ? privateEndpointLocation : location
 var _defaultPeResourceGroupName = useExistingVNet && !sideBySideDeploy ? varExistingVnetResourceGroupName : resourceGroup().name
@@ -1405,6 +1456,28 @@ module appGwNsg 'modules/networking/appgw-nsg.bicep' = if (_publicIngressEnabled
   }
 }
 
+// API Management injection-subnet NSG (ADR-002). This entry point keeps the
+// fail-closed contract from ADR-001, requiring at least one hub firewall source
+// CIDR, and takes its rules from the shared module that
+// platform/api-management/network.bicep also uses, so the two paths cannot
+// drift. Inbound TCP 443 is allowed only from the hub firewall's post-SNAT
+// source range and from named in-spoke caller subnets; all other inbound
+// traffic is denied.
+//
+// The condition is written inline on purpose: the workload-isolation contract
+// asserts that `_createApiManagement` appears in the compiled condition.
+module apiManagementNsg 'modules/networking/api-management-nsg.bicep' = if (_createApiManagement && !useExistingVNet) {
+  name: 'apiManagementNsgDeployment'
+  params: {
+    name: cafTrim('nsg-${resourceNames.vnetName}-${_apiManagementSubnetName}', 80)
+    location: location
+    ingressSourceAddressPrefixes: _apiManagementIngressSourceAddressPrefixes
+    directCallerAddressPrefixes: _apiManagementDirectCallerAddressPrefixes
+    subnetAddressPrefix: _apiManagementSubnetPrefix
+    tags: _tags
+  }
+}
+
 var _deployAcrTaskAgentPool = deployContainerRegistry && _networkIsolation && deployAcrTaskAgentPool
 
 // Public Ingress (#49) — only effective in network-isolated mode with Container
@@ -1425,6 +1498,23 @@ resource routeTable 'Microsoft.Network/routeTables@2024-07-01' = if (_createRout
     disableBgpRoutePropagation: true
   }
 }
+
+// Dedicated API Management route table (ADR-001). The shared spoke table sends
+// 0.0.0.0/0 to the hub firewall with no exception, which would break the
+// gateway's control plane; this one adds the ApiManagement -> Internet route.
+resource apiManagementRouteTable 'Microsoft.Network/routeTables@2024-07-01' = if (_createApiManagement && !useExistingVNet && _createRouteTable) {
+  name: '${const.abbrs.networking.routeTable}${resourceToken}-apim'
+  location: location
+  tags: _tags
+  properties: {
+    disableBgpRoutePropagation: true
+  }
+}
+
+#disable-next-line BCP318
+var _apiManagementRouteTableId = _hasExistingRouteTable
+  ? hubIntegrationExistingRouteTableResourceId!
+  : (_createApiManagement && !useExistingVNet && _createRouteTable ? apiManagementRouteTable.id : '')
 
 // Base subnets that are always included
 var baseSubnets = [
@@ -1509,64 +1599,38 @@ var baseSubnets = [
       }
 ]
 
-// The injection subnet and its NSG belong to whoever owns the gateway. On the
-// BYO path the gateway lives in the platform VNet, so the landing zone must not
-// carve a subnet out of its own spoke for a service it does not own.
+// API Management injection subnet (ADR-001, ADR-002). The template creates it
+// only in the new-spoke shape. On the shared-gateway path the subnet belongs to
+// the platform VNet, so the landing zone carves nothing out of its spoke.
 //
-// This NSG is NOT the shared empty-rule helper. Classic VNet injection requires
-// explicit rules, because "the load balancer used internally by API Management
-// is secure by default and rejects all inbound traffic". The rule set is shared
-// with platform/api-management/network.bicep so the two gateway creation paths
-// cannot drift apart.
+// OPERATOR OBLIGATION - prepared spoke (useExistingVNet with deploySubnets=false).
+// The gateway is still deployed there, into an administrator-prepared subnet
+// that this template does not touch. That subnet MUST be undelegated. It MUST
+// carry the rule set from modules/networking/api-management-injection-nsg.bicep,
+// including the hub-firewall-only ingress rules. Its route table MUST carry an
+// ApiManagement -> Internet route whenever 0.0.0.0/0 goes to a firewall.
+// Otherwise the gateway fails. Learn, virtual-network-injection-resources: "A
+// network security group (NSG) is required to explicitly allow inbound
+// connectivity, because the load balancer used internally by API Management is
+// secure by default and rejects all inbound traffic." The injectionNsgManaged
+// gateway fact reports which side owns the NSG.
 //
-// OPERATOR OBLIGATION - BYO virtual network without subnet management.
-// This template manages the injection NSG only when it also manages the subnet.
-// With `useExistingVNet: true` AND `deploySubnets: false` the gateway below is
-// STILL deployed, into a subnet this template does not create, so the NSG is
-// the operator's responsibility. That pre-existing subnet MUST be undelegated
-// and MUST already carry this exact rule set, or the gateway will fail: Learn,
-// virtual-network-reference, "It is required to assign a Network Security Group
-// to your VNet in order for the Azure Load Balancer to work", and
-// virtual-network-injection-resources, "A network security group (NSG) is
-// required to explicitly allow inbound connectivity, because the load balancer
-// used internally by API Management is secure by default and rejects all
-// inbound traffic." This mirrors `deployInjectionSubnet: false` on
-// platform/api-management/main.bicep. The `injectionNsgManaged` gateway fact
-// reports which side owns it, so the obligation is visible after deployment
-// rather than only in this comment.
+// Delegation: this subnet MUST NOT be delegated. Classic VNet injection
+// requires an undelegated subnet. Learn: "The subnet used to connect to the API
+// Management instance shouldn't have any delegations enabled."
 //
-// The condition below is deliberately written inline rather than hoisted into a
-// variable: Test-ApiManagementWorkloadIsolationContract.ps1 asserts on the
-// COMPILED condition of this resource and must be able to see
-// `_createApiManagement` in it. A variable would compile to
-// `[variables('...')]` and silently blind that check.
-module apiManagementNsg 'modules/networking/api-management-injection-nsg.bicep' = if (_createApiManagement && (!useExistingVNet || deploySubnets)) {
-  name: 'apiManagementIntegrationNsg'
-  params: {
-    name: '${const.abbrs.networking.networkSecurityGroup}${_apiManagementName}'
-    location: location
-  }
-}
-
-// NOTE on delegation: this subnet MUST NOT be delegated. Classic VNet injection
-// requires an undelegated subnet - Learn: "The subnet used to connect to the API
-// Management instance shouldn't have any delegations enabled." The previous
-// Microsoft.Web/serverFarms delegation belonged to the v2 outbound-integration
-// model and is fatal here.
-//
-// NOTE on routing: _effectiveRouteTableId may send 0.0.0.0/0 to the hub
-// firewall. When it does, that route table MUST also carry a route for the
-// ApiManagement service tag with next hop type Internet, or the gateway's
-// control-plane responses cannot map back symmetrically and the deployment
-// fails. Service endpoints below keep the hard dependencies off the tunnelled
-// path, as Learn strongly recommends for force-tunnelled injection subnets.
-var subnets = concat(baseSubnets, _createApiManagement ? [
+// Routing: the dedicated API Management route table sends 0.0.0.0/0 to the hub
+// firewall and carries the ApiManagement -> Internet route that keeps the
+// control plane symmetric. The service endpoints keep the gateway's hard
+// dependencies off the tunnelled path, which Learn strongly recommends for
+// force-tunnelled injection subnets.
+var apiManagementSubnets = _createApiManagement && !useExistingVNet ? [
   {
-    name: apiManagementConfiguration.integrationSubnetName
-    addressPrefix: apiManagementConfiguration.integrationSubnetPrefix
+    name: _apiManagementSubnetName
+    addressPrefix: _apiManagementSubnetPrefix
+    networkSecurityGroupResourceId: apiManagementNsg!.outputs.resourceId
+    routeTableResourceId: _apiManagementRouteTableId
     delegation: ''
-    networkSecurityGroupResourceId: (!useExistingVNet || deploySubnets) ? apiManagementNsg!.outputs.id : ''
-    routeTableResourceId: _effectiveRouteTableId
     serviceEndpoints: [
       'Microsoft.Storage'
       'Microsoft.Sql'
@@ -1574,7 +1638,9 @@ var subnets = concat(baseSubnets, _createApiManagement ? [
       'Microsoft.EventHub'
     ]
   }
-] : [])
+] : []
+
+var subnets = concat(baseSubnets, apiManagementSubnets)
 
 module virtualNetworkSubnets 'modules/networking/subnets.bicep' = if (_networkIsolation && useExistingVNet && deploySubnets && deployNsgs) {
   name: 'virtualNetworkSubnetsDeployment'
@@ -1690,8 +1756,6 @@ resource testVmBastionHost 'Microsoft.Network/bastionHosts@2024-07-01' = if (_de
   dependsOn: [
     #disable-next-line BCP321
     !useExistingVNet ? virtualNetwork : null
-    #disable-next-line BCP321
-    useExistingVNet ? virtualNetworkSubnets : null
   ]
 }
 
@@ -1739,6 +1803,29 @@ resource defaultRoute 'Microsoft.Network/routeTables/routes@2024-07-01' = if (_c
     addressPrefix: '0.0.0.0/0'
     nextHopType: 'VirtualAppliance'
     nextHopIpAddress: _defaultRouteNextHopIp
+  }
+}
+
+resource apiManagementDefaultRoute 'Microsoft.Network/routeTables/routes@2024-07-01' = if (_createApiManagement && !useExistingVNet && _createDefaultRoute) {
+  parent: apiManagementRouteTable
+  name: 'default-to-egress'
+  properties: {
+    addressPrefix: '0.0.0.0/0'
+    nextHopType: 'VirtualAppliance'
+    nextHopIpAddress: hubIntegrationEgressNextHopIp!
+  }
+}
+
+// Learn, api-management-using-with-internal-vnet: without a UDR for the
+// ApiManagement service tag with next hop Internet, force-tunnelled control
+// plane responses "won't symmetrically map back" and management connectivity
+// is lost. This is the only forced-tunnelling exception on the subnet.
+resource apiManagementControlPlaneRoute 'Microsoft.Network/routeTables/routes@2024-07-01' = if (_createApiManagement && !useExistingVNet && _createRouteTable) {
+  parent: apiManagementRouteTable
+  name: 'api-management-control-plane'
+  properties: {
+    addressPrefix: 'ApiManagement'
+    nextHopType: 'Internet'
   }
 }
 
@@ -3425,34 +3512,43 @@ module apiManagement 'modules/api-management/main.bicep' = if (_createApiManagem
     environmentName: environmentName
     workloadKey: apiManagementWorkloadKey
     tenantId: tenant().tenantId
-    configuration: {
+    sku: _apiManagementSku
+    capacity: _apiManagementCapacity
+    publisherEmail: _apiManagementPublisherEmail
+    publisherName: _apiManagementPublisherName
+    workloadConfiguration: _apiManagementWorkloadEnabled ? {
       enabled: true
       name: _apiManagementName
-      sku: apiManagementConfiguration.sku
-      capacity: apiManagementConfiguration.capacity
-      publisherEmail: apiManagementConfiguration.publisherEmail
-      publisherName: apiManagementConfiguration.publisherName
+      sku: _apiManagementSku
+      capacity: _apiManagementCapacity
+      publisherEmail: _apiManagementPublisherEmail
+      publisherName: _apiManagementPublisherName
       audience: apiManagementConfiguration.audience
-      integrationSubnetName: apiManagementConfiguration.integrationSubnetName
-      integrationSubnetPrefix: apiManagementConfiguration.integrationSubnetPrefix
+      integrationSubnetName: _apiManagementSubnetName
+      integrationSubnetPrefix: _apiManagementSubnetPrefix
       privateDnsZoneResourceId: apiManagementConfiguration.privateDnsZoneResourceId
       stopNewRequests: apiManagementConfiguration.stopNewRequests
       foundryIntegration: apiManagementConfiguration.?foundryIntegration ?? false
       callerMappings: apiManagementConfiguration.callerMappings
-    }
-    integrationSubnetResourceId: '${virtualNetworkResourceId}/subnets/${apiManagementConfiguration.integrationSubnetName}'
+    } : null
+    // The GitHub environment pipeline adopts only gateways carrying its own
+    // marker, so a gateway created from the flat azd parameters must not claim it.
+    managedBy: _apiManagementWorkloadEnabled ? 'github-dev-environment' : 'ai-landing-zone'
+    integrationSubnetResourceId: _apiManagementSubnetId
     backendAccountResourceId: aiFoundryAccountResourceId
     backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
     applicationInsightsResourceId: _appInsightsResourceId
     logAnalyticsWorkspaceResourceId: _lawResourceId
     initialProvisioning: apiManagementConfiguration.?initialProvisioning ?? false
-    tags: union(_tags, {
-      'ailz-managed-by': 'github-dev-environment'
-      'ailz-environment': environmentName
-    })
+    tags: _tags
   }
+  // The gateway must not start injecting until the subnet carries the dedicated
+  // route table with the ApiManagement -> Internet route (ADR-001).
   dependsOn: [
-    virtualNetworkSubnets
+    #disable-next-line BCP321
+    !useExistingVNet ? virtualNetwork : null
+    apiManagementDefaultRoute
+    apiManagementControlPlaneRoute
   ]
 }
 
@@ -3462,7 +3558,7 @@ module apiManagement 'modules/api-management/main.bicep' = if (_createApiManagem
 // The gateway is owned by the platform template and may sit in a different
 // resource group, so these children are deployed AT the gateway's scope. The
 // previous current-resource-group `existing` lookup could not reach it.
-module apiManagementWorkload 'modules/api-management/workload.bicep' = if (deployApiManagement && _hasExistingApiManagement) {
+module apiManagementWorkload 'modules/api-management/workload.bicep' = if (deployApiManagement && _hasExistingApiManagement && _apiManagementWorkloadEnabled) {
   name: 'apiManagementWorkloadDeployment'
   scope: resourceGroup(_apimSubscriptionId, _apimResourceGroupName)
   params: {
@@ -4226,11 +4322,11 @@ var _developerApplications = _deployContainerApps ? map(containerAppsSettings!.o
 // OUTPUTS
 //////////////////////////////////////////////////////////////////////////
 
-@description('Private inference gateway route. Empty when the opt-in gateway is disabled; never an implicit direct-Foundry fallback.')
+@description('Private inference gateway route. Empty unless a gateway is bound and apiManagementConfiguration adds the workload API; never an implicit direct-Foundry fallback.')
 output INFERENCE_GATEWAY_ENDPOINT string = deployApiManagement ? _inferenceGatewayEndpoint : ''
 
-@description('Entra audience required by the opt-in inference gateway. Empty when disabled.')
-output INFERENCE_GATEWAY_AUDIENCE string = deployApiManagement ? string(apiManagementConfiguration.audience) : ''
+@description('Entra audience required by the inference gateway workload API. Empty when no workload API is deployed.')
+output INFERENCE_GATEWAY_AUDIENCE string = _apiManagementGatewayBound && _apiManagementWorkloadEnabled ? string(apiManagementConfiguration.audience) : ''
 
 @description('Nonsecret, opt-in completion inputs from actual deployed resources. Observability credentials are references, not values. An output does not assert developer readiness.')
 output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
@@ -4248,7 +4344,7 @@ output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
   applications: _developerApplications
   gateway: {
     accessMode: 'gateway'
-    resourceId: deployApiManagement
+    resourceId: _apiManagementGatewayBound
       ? (_hasExistingApiManagement
           ? existingApiManagementResourceId!
           : resourceId('Microsoft.ApiManagement/service', _apiManagementName))
@@ -4259,15 +4355,15 @@ output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
     // is delivered by Internal mode, and the completion evidence that matters
     // is therefore the gateway hostname plus the private VIP the operator must
     // publish in DNS, not a private endpoint approval.
-    hostName: deployApiManagement ? '${_effectiveApiManagementName}.azure-api.net' : ''
+    hostName: _apiManagementGatewayBound ? '${_effectiveApiManagementName}.azure-api.net' : ''
     privateIpAddress: _createApiManagement ? apiManagement!.outputs.gatewayPrivateIpAddress : ''
-    networkModel: deployApiManagement ? 'classic-vnet-injection' : ''
-    // False means this template did NOT create the injection NSG, so the
-    // operator owns it on the pre-existing subnet. Classic injection cannot
-    // work without one, so this is a live obligation, not a preference.
-    injectionNsgManaged: _createApiManagement && (!useExistingVNet || deploySubnets)
+    networkModel: _apiManagementGatewayBound ? 'classic-vnet-injection' : ''
+    // False means the NSG is not template-managed: either the gateway is
+    // platform-owned, or it sits in an administrator-prepared subnet whose NSG
+    // is the operator's live obligation (see apiManagementSubnets).
+    injectionNsgManaged: _createApiManagement && !useExistingVNet
     endpoint: _inferenceGatewayEndpoint
-    audience: apiManagementConfiguration.audience
+    audience: apiManagementConfiguration.?audience ?? ''
     backendResourceId: aiFoundryAccountResourceId
     backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
   }

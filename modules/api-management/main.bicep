@@ -11,8 +11,9 @@ param name string
 @description('Approved gateway and integration VNet region.')
 param location string
 
-@description('Configured environment used in ownership markers and token counter isolation.')
-param environmentName 'dev' | 'test' | 'prod'
+@description('Environment name used in ownership markers and token counter isolation. The GitHub environment pipeline passes dev, test or prod; the azd path passes the azd environment name.')
+@minLength(1)
+param environmentName string
 
 @description('Landing-zone-scoped key that makes every per-workload gateway resource unique. One shared gateway hosts many landing zones, so the API name, API path, backend, logger and named values are all keyed by this value. Must be lowercase alphanumeric so it is valid as both an APIM resource name segment and a URL path segment; the shared environment resolver enforces the character contract.')
 @minLength(3)
@@ -24,8 +25,27 @@ param workloadKey string
 @maxLength(36)
 param tenantId string
 
-@description('Frozen, validated P1 gateway configuration. This module only accepts enabled, ordinary APIM integration.')
-param configuration gatewayConfiguration
+@description('Classic tier that supports VNet injection. Developer has no SLA and a single unit; Premium is the production tier.')
+param sku 'Developer' | 'Premium' = 'Developer'
+
+@description('Number of gateway units. Developer supports exactly one.')
+@minValue(1)
+param capacity int = 1
+
+@description('Publisher contact email for the gateway.')
+@minLength(1)
+param publisherEmail string
+
+@description('Publisher display name for the gateway.')
+@minLength(1)
+param publisherName string
+
+@description('Frozen, validated gateway configuration for this landing zone\'s workload API: caller mappings, token limits and audience. Null deploys the gateway alone, with no workload API and no backend or telemetry role assignments.')
+param workloadConfiguration gatewayConfiguration?
+
+@description('Value of the ailz-managed-by ownership tag. The GitHub environment pipeline refuses to adopt a gateway that does not carry its own marker, so the azd path must not claim it.')
+@minLength(1)
+param managedBy string = 'github-dev-environment'
 
 @description('Dedicated UNDELEGATED injection subnet with the API Management NSG rule set, routes, DNS and egress; never the app or agent subnet. Classic VNet injection forbids subnet delegation - Learn: "The subnet used to connect to the API Management instance shouldn\'t have any delegations enabled."')
 param integrationSubnetResourceId string
@@ -67,22 +87,25 @@ param initialProvisioning bool = false
 // code path serves a platform-owned gateway in another resource group.
 var owner = 'ailz-inference-${environmentName}-${workloadKey}'
 var ownedTags = union(tags, {
-  'ailz-managed-by': 'github-dev-environment'
+  'ailz-managed-by': managedBy
   'ailz-environment': environmentName
   'ailz-owner': owner
 })
+var deployWorkload = workloadConfiguration != null
+var backendSubscriptionId = !empty(backendAccountResourceId) ? split(backendAccountResourceId, '/')[2] : subscription().subscriptionId
+var telemetrySubscriptionId = !empty(applicationInsightsResourceId) ? split(applicationInsightsResourceId, '/')[2] : subscription().subscriptionId
 
 // Only Premium has availability zones, and Azure requires a public IP whenever
 // zone support is enabled on an injected instance. See the comment block on the
 // gateway module below.
-var _needsPublicIp = configuration.sku == 'Premium'
+var _needsPublicIp = sku == 'Premium'
 var _createPublicIp = _needsPublicIp && empty(publicIpAddressResourceId)
 var _effectivePublicIpResourceId = !empty(publicIpAddressResourceId)
   ? publicIpAddressResourceId
   : (_createPublicIp ? gatewayPublicIp!.outputs.resourceId : '')
 
 module gatewayPublicIp '../networking/api-management-public-ip.bicep' = if (_createPublicIp) {
-  name: '${owner}-pip'
+  name: take('${owner}-pip', 64)
   params: {
     name: '${const.abbrs.networking.publicIPAddress}${name}'
     location: location
@@ -117,15 +140,15 @@ module gatewayPublicIp '../networking/api-management-public-ip.bicep' = if (_cre
 // Do not reintroduce privateEndpoints or a public-disable sequence here: on
 // this topology they are invalid, not merely redundant.
 module gateway 'br/public:avm/res/api-management/service:0.14.4' = {
-  name: '${owner}-service'
+  name: take('${owner}-service', 64)
   params: {
     name: name
     location: location
     tags: ownedTags
-    sku: configuration.sku
-    skuCapacity: configuration.capacity
-    publisherEmail: configuration.publisherEmail
-    publisherName: configuration.publisherName
+    sku: sku
+    skuCapacity: capacity
+    publisherEmail: publisherEmail
+    publisherName: publisherName
     managedIdentities: { systemAssigned: true }
     enableTelemetry: false
     enableDeveloperPortal: false
@@ -158,20 +181,23 @@ module gateway 'br/public:avm/res/api-management/service:0.14.4' = {
   }
 }
 
-module backendAndTelemetryRoles '../security/resource-role-assignment.bicep' = {
-  name: '${owner}-roles'
+// The gateway identity needs backend inference and telemetry rights only when
+// it serves this landing zone's workload API. A gateway deployed alone gets no
+// role assignments.
+module backendAndTelemetryRoles '../security/resource-role-assignment.bicep' = if (deployWorkload) {
+  name: take('${owner}-roles', 64)
   params: {
     name: owner
     roleAssignments: [
       {
         resourceId: backendAccountResourceId
-        roleDefinitionId: subscriptionResourceId(split(backendAccountResourceId, '/')[2], 'Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesOpenAIUser.guid)
+        roleDefinitionId: subscriptionResourceId(backendSubscriptionId, 'Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesOpenAIUser.guid)
         principalId: gateway.outputs.systemAssignedMIPrincipalId!
         principalType: 'ServicePrincipal'
       }
       {
         resourceId: applicationInsightsResourceId
-        roleDefinitionId: subscriptionResourceId(split(applicationInsightsResourceId, '/')[2], 'Microsoft.Authorization/roleDefinitions', const.roles.MonitoringMetricsPublisher.guid)
+        roleDefinitionId: subscriptionResourceId(telemetrySubscriptionId, 'Microsoft.Authorization/roleDefinitions', const.roles.MonitoringMetricsPublisher.guid)
         principalId: gateway.outputs.systemAssignedMIPrincipalId!
         principalType: 'ServicePrincipal'
       }
@@ -182,14 +208,14 @@ module backendAndTelemetryRoles '../security/resource-role-assignment.bicep' = {
 // Per-workload children live in their own module so the same code path serves
 // both a landing-zone-created gateway (this module, same resource group) and a
 // shared platform gateway (main.bicep, scoped to the platform resource group).
-module workload './workload.bicep' = {
-  name: '${owner}-workload'
+module workload './workload.bicep' = if (deployWorkload) {
+  name: take('${owner}-workload', 64)
   params: {
     apiManagementName: name
     environmentName: environmentName
     workloadKey: workloadKey
     tenantId: tenantId
-    configuration: configuration
+    configuration: workloadConfiguration!
     backendAccountResourceId: backendAccountResourceId
     backendEndpoint: backendEndpoint
     applicationInsightsResourceId: applicationInsightsResourceId
@@ -223,14 +249,14 @@ output gatewayPrivateIpAddress string = length(deployedGateway.properties.?priva
 @description('Backend and monitoring principal, with roles assigned only at the supplied resource scopes.')
 output principalId string = gateway.outputs.systemAssignedMIPrincipalId!
 
-@description('The only governed inference route; never a fallback to a direct backend endpoint. Workload-scoped so landing zones sharing this gateway each get a distinct route.')
-output inferenceEndpoint string = workload.outputs.inferenceEndpoint
+@description('The only governed inference route; never a fallback to a direct backend endpoint. Workload-scoped so landing zones sharing this gateway each get a distinct route. Empty when the gateway is deployed alone.')
+output inferenceEndpoint string = deployWorkload ? workload!.outputs.inferenceEndpoint : ''
 
-@description('Entra audience of the owned API.')
-output audience string = configuration.audience
+@description('Entra audience of the owned API. Empty when the gateway is deployed alone.')
+output audience string = workloadConfiguration.?audience ?? ''
 
 @description('Nonsecret resource ownership and operational prerequisites. The parent must reconcile only these resources, reject conflicts and preserve unrelated estates.')
-output facts object = union(workload.outputs.facts, {
+output facts object = union(deployWorkload ? workload!.outputs.facts : {}, {
   serviceResourceId: gateway.outputs.resourceId
   hostName: '${name}.azure-api.net'
   networkModel: 'classic-vnet-injection'

@@ -182,13 +182,25 @@ try {
     # ---------------------------------------------------------------------
     # The NSG must carry the required rules; a rule-less NSG blocks everything.
     # ---------------------------------------------------------------------
+    # The landing zone reaches the shared rule set through the fail-closed
+    # entry point (ADR-002), which requires at least one hub firewall source.
+    $lzNsgFile = Join-Path $RepositoryRoot 'modules\networking\api-management-nsg.bicep'
+    $lzNsgSource = Get-Content -LiteralPath $lzNsgFile -Raw
     Assert-True `
-        -Condition ($mainSource -match 'modules/networking/api-management-injection-nsg\.bicep') `
-        -Message 'The landing zone uses the rule-carrying injection NSG, not the empty shared NSG helper'
+        -Condition ($mainSource -match "(?m)^module apiManagementNsg 'modules/networking/api-management-nsg\.bicep'" -and
+            $lzNsgSource -match "(?m)^module rules 'api-management-injection-nsg\.bicep'") `
+        -Message 'The landing zone uses the rule-carrying injection NSG through its fail-closed entry point, not the empty shared NSG helper'
 
     Assert-True `
         -Condition ($platformNetworkSource -match 'api-management-injection-nsg\.bicep') `
         -Message 'The platform path shares the same authoritative NSG rule set, so the two paths cannot drift'
+
+    $lzNsgTemplate = Build-Template -Path $lzNsgFile -OutFile (Join-Path $scratch 'landing-zone-nsg.json') |
+        ConvertFrom-Json -Depth 100
+    Assert-True `
+        -Condition ($lzNsgTemplate.parameters.ingressSourceAddressPrefixes.minLength -eq 1 -and
+            $null -eq $lzNsgTemplate.parameters.ingressSourceAddressPrefixes.PSObject.Properties['defaultValue']) `
+        -Message 'The landing-zone entry point fails closed: it requires at least one hub firewall source CIDR and has no default'
 
     # ---------------------------------------------------------------------
     # NSG rules, asserted STRUCTURALLY against the compiled ARM body.
@@ -199,6 +211,10 @@ try {
     # internet-exposing mutations: widening the 3443 source tag to '*',
     # flipping that rule to Outbound, and adding an inbound '*' -> :443 rule.
     # Parsing the compiled template and asserting per rule closes that gap.
+    #
+    # The rule groups are literal variables, so the compiled template keeps
+    # every rule as a literal object. The resource and the ruleNames output are
+    # both built from the one composed variable, which the checks below pin.
     $nsgTemplate = Build-Template -Path $nsgFile -OutFile (Join-Path $scratch 'injection-nsg.json') |
         ConvertFrom-Json -Depth 100
     # Bicep emits `resources` as either an array or a symbolic-name-keyed object
@@ -215,11 +231,24 @@ try {
     Assert-True `
         -Condition ($null -ne $nsgResource) `
         -Message 'The compiled injection NSG template emits a network security group'
-    $rules = @($nsgResource.properties.securityRules)
 
     Assert-True `
-        -Condition ($rules.Count -ge 9) `
-        -Message "The injection NSG declares its full rule set (found $($rules.Count))"
+        -Condition ([string]$nsgResource.properties.securityRules -ceq "[variables('effectiveRules')]") `
+        -Message 'The NSG deploys exactly the composed rule list'
+
+    $composition = [string]$nsgTemplate.variables.effectiveRules
+    Assert-True `
+        -Condition ($composition -ceq "[concat(variables('injectionRules'), if(variables('restrictIngress'), variables('restrictedIngressRules'), createArray()), if(and(variables('restrictIngress'), not(empty(parameters('directCallerAddressPrefixes')))), variables('directCallerRules'), createArray()))]" -and
+            [string]$nsgTemplate.variables.restrictIngress -ceq "[not(empty(parameters('ingressSourceAddressPrefixes')))]") `
+        -Message 'The composed list is the base rules, plus the ingress restriction only when hub firewall sources are supplied, plus direct callers only on top of it'
+
+    $rules = @($nsgTemplate.variables.injectionRules)
+    $ingressRules = @($nsgTemplate.variables.restrictedIngressRules)
+    $callerRules = @($nsgTemplate.variables.directCallerRules)
+
+    Assert-True `
+        -Condition ($rules.Count -ge 9 -and @($rules | Where-Object { $_ -is [string] }).Count -eq 0) `
+        -Message "The injection NSG declares its full base rule set as literal rules (found $($rules.Count))"
 
     function Get-Rule {
         param([string]$Name)
@@ -299,13 +328,100 @@ try {
         -Condition (@($inboundRules | Where-Object { [string]$_.properties.sourceAddressPrefix -ceq 'AzureTrafficManager' }).Count -eq 0) `
         -Message 'No AzureTrafficManager rule, which applies only to external multi-region deployments'
 
-    # The module advertises its rule names in an output. That claim is only
-    # meaningful if something checks it against the rules actually declared.
-    $declaredNames = @($rules | ForEach-Object { [string]$_.name } | Sort-Object)
-    $advertisedNames = @($nsgTemplate.outputs.ruleNames.value | ForEach-Object { [string]$_ } | Sort-Object)
+    # ---------------------------------------------------------------------
+    # Ingress restriction (ADR-002): hub firewall only, plus named in-spoke
+    # callers, plus intra-subnet rate-limit sync, then deny everything else.
+    # ---------------------------------------------------------------------
+    function Get-GroupRule {
+        param([object[]]$Group, [string]$Name)
+        return ($Group | Where-Object { [string]$_.name -ceq $Name } | Select-Object -First 1)
+    }
+    $firewallRule = Get-GroupRule $ingressRules 'AllowHttpsFromHubFirewall'
+    $syncRule = Get-GroupRule $ingressRules 'AllowRateLimitSyncInbound'
+    $denyRule = Get-GroupRule $ingressRules 'DenyAllInbound'
+    $callerRule = Get-GroupRule $callerRules 'AllowHttpsFromLandingZoneCallers'
+
     Assert-True `
-        -Condition (($declaredNames -join '|') -ceq ($advertisedNames -join '|')) `
-        -Message 'The ruleNames output matches the rules actually declared, so a dropped rule cannot be misreported to the operator'
+        -Condition ($ingressRules.Count -eq 3 -and $callerRules.Count -eq 1) `
+        -Message 'The ingress restriction adds exactly the firewall, rate-limit sync and deny rules, and one direct-caller rule'
+
+    Assert-True `
+        -Condition ($null -ne $firewallRule -and
+            [string]$firewallRule.properties.direction -ceq 'Inbound' -and [string]$firewallRule.properties.access -ceq 'Allow' -and
+            [string]$firewallRule.properties.protocol -ceq 'Tcp' -and [string]$firewallRule.properties.destinationPortRange -ceq '443' -and
+            [string]$firewallRule.properties.sourceAddressPrefixes -ceq "[parameters('ingressSourceAddressPrefixes')]" -and
+            -not $firewallRule.properties.PSObject.Properties['sourceAddressPrefix']) `
+        -Message 'AllowHttpsFromHubFirewall admits TCP 443 only from the supplied hub firewall sources'
+
+    Assert-True `
+        -Condition ($null -ne $callerRule -and
+            [string]$callerRule.properties.direction -ceq 'Inbound' -and [string]$callerRule.properties.access -ceq 'Allow' -and
+            [string]$callerRule.properties.protocol -ceq 'Tcp' -and [string]$callerRule.properties.destinationPortRange -ceq '443' -and
+            [string]$callerRule.properties.sourceAddressPrefixes -ceq "[parameters('directCallerAddressPrefixes')]" -and
+            -not $callerRule.properties.PSObject.Properties['sourceAddressPrefix']) `
+        -Message 'AllowHttpsFromLandingZoneCallers admits TCP 443 only from the named in-spoke caller subnets'
+
+    Assert-True `
+        -Condition ($null -ne $syncRule -and
+            [string]$syncRule.properties.direction -ceq 'Inbound' -and [string]$syncRule.properties.access -ceq 'Allow' -and
+            [string]$syncRule.properties.protocol -ceq 'Udp' -and [string]$syncRule.properties.destinationPortRange -ceq '4290' -and
+            [string]$syncRule.properties.sourceAddressPrefix -match "parameters\('subnetAddressPrefix'\)" -and
+            [string]$syncRule.properties.destinationAddressPrefix -match "parameters\('subnetAddressPrefix'\)") `
+        -Message 'AllowRateLimitSyncInbound keeps UDP 4290 counter sync within the injection subnet'
+
+    Assert-True `
+        -Condition ($null -ne $denyRule -and
+            [string]$denyRule.properties.direction -ceq 'Inbound' -and [string]$denyRule.properties.access -ceq 'Deny' -and
+            [int]$denyRule.properties.priority -eq 4096 -and [string]$denyRule.properties.sourceAddressPrefix -ceq '*' -and
+            [string]$denyRule.properties.destinationPortRange -ceq '*' -and [string]$denyRule.properties.protocol -ceq '*') `
+        -Message 'DenyAllInbound denies every other inbound flow at priority 4096, overriding AllowVnetInBound'
+
+    $allInbound = @(@($rules) + @($ingressRules) + @($callerRules) | Where-Object { [string]$_.properties.direction -ceq 'Inbound' })
+    $allowPriorities = @($allInbound | Where-Object { [string]$_.properties.access -ceq 'Allow' } | ForEach-Object { [int]$_.properties.priority })
+    Assert-True `
+        -Condition (@($allowPriorities | Where-Object { $_ -ge 4096 }).Count -eq 0 -and
+            @($allowPriorities | Sort-Object -Unique).Count -eq $allowPriorities.Count) `
+        -Message 'Every inbound Allow rule has a unique priority ahead of DenyAllInbound'
+
+    # The module advertises its rule names in an output. That claim is only
+    # meaningful if it is derived from the same list the NSG deploys.
+    Assert-True `
+        -Condition ([string]$nsgTemplate.outputs.ruleNames.value -ceq "[map(variables('effectiveRules'), lambda('rule', lambdaVariables('rule').name))]") `
+        -Message 'The ruleNames output is derived from the deployed rule list, so a dropped rule cannot be misreported to the operator'
+
+    $declaredNames = @(@($rules) + @($ingressRules) + @($callerRules) | ForEach-Object { [string]$_.name })
+    Assert-True `
+        -Condition (@($declaredNames | Sort-Object -Unique).Count -eq $declaredNames.Count) `
+        -Message 'Rule names are unique across the base and ingress rule groups'
+
+    # ---------------------------------------------------------------------
+    # Forced tunnelling (ADR-001). The shared spoke route table sends 0.0.0.0/0
+    # to the hub firewall, which breaks the control plane: "When the traffic is
+    # force tunneled, the responses won't symmetrically map back ... and
+    # connectivity to the management endpoint is lost." The landing-zone
+    # subnet therefore binds a dedicated table carrying the ApiManagement ->
+    # Internet route, and the gateway waits for that route before injecting.
+    # ---------------------------------------------------------------------
+    $mainTemplate = Build-Template -Path $mainFile -OutFile (Join-Path $scratch 'main.json') |
+        ConvertFrom-Json -Depth 200
+    $controlPlaneRoute = $mainTemplate.resources.apiManagementControlPlaneRoute
+    Assert-True `
+        -Condition ($null -ne $controlPlaneRoute -and
+            [string]$controlPlaneRoute.properties.addressPrefix -ceq 'ApiManagement' -and
+            [string]$controlPlaneRoute.properties.nextHopType -ceq 'Internet' -and
+            [string]$controlPlaneRoute.name -match '-apim' -and
+            @($controlPlaneRoute.dependsOn) -contains 'apiManagementRouteTable') `
+        -Message 'The dedicated API Management route table returns the ApiManagement service tag straight to the Internet'
+
+    Assert-True `
+        -Condition (@($mainTemplate.resources.apiManagement.dependsOn) -contains 'apiManagementControlPlaneRoute' -and
+            @($mainTemplate.resources.apiManagement.dependsOn) -contains 'apiManagementDefaultRoute') `
+        -Message 'The gateway waits for both API Management routes before injecting'
+
+    $vnetSubnets = [string]($mainTemplate.resources.virtualNetwork.properties.parameters.subnets | ConvertTo-Json -Depth 30 -Compress)
+    Assert-True `
+        -Condition ($vnetSubnets -match '_apiManagementRouteTableId' -and $vnetSubnets -match 'Microsoft\.Storage' -and $vnetSubnets -match 'Microsoft\.Sql') `
+        -Message 'The injection subnet binds the dedicated route table and the dependency service endpoints'
 
     # ---------------------------------------------------------------------
     # Public IP: required by Azure for a zone-redundant injected instance.

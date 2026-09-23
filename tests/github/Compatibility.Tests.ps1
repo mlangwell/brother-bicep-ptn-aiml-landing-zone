@@ -76,12 +76,13 @@ try {
     }
     $foundryPe = Get-ComparableJson $template.resources.aiFoundry.properties.parameters.privateEndpointSubnetResourceId
     Assert-Contract ($foundryPe -match "parameters\('peSubnetName'\)" -and $foundryPe -notmatch '/subnets/pe-subnet') 'Foundry private endpoints must honor the configured PE subnet name.'
-    # The gateway is now created only when this landing zone owns it. That is a
-    # strict narrowing of the original default-off flag: _createApiManagement is
-    # and(deployApiManagement, not(_hasExistingApiManagement)), so it can never
-    # be true while deployApiManagement is false.
+    # The gateway is created only when this landing zone owns it, and only in a
+    # supported topology (ADR-002). That is a strict narrowing of the original
+    # default-off flag: _createApiManagement is and(deployApiManagement,
+    # not(_hasExistingApiManagement), _apiManagementTopologySupported), so it
+    # can never be true while deployApiManagement is false.
     Assert-Contract ($template.resources.apiManagement.condition -ceq "[variables('_createApiManagement')]") 'The gateway resource must be gated by the default-off flag.'
-    Assert-Contract ($template.variables._createApiManagement -ceq "[and(parameters('deployApiManagement'), not(variables('_hasExistingApiManagement')))]") 'Gateway creation must remain default-off and additionally suppressed when an existing gateway is supplied.'
+    Assert-Contract ($template.variables._createApiManagement -ceq "[and(and(parameters('deployApiManagement'), not(variables('_hasExistingApiManagement'))), variables('_apiManagementTopologySupported'))]") 'Gateway creation must remain default-off, suppressed when an existing gateway is supplied, and limited to a supported topology.'
     Assert-Contract ($template.parameters.existingApiManagementResourceId.ContainsKey('nullable') -or $template.parameters.existingApiManagementResourceId.type -ceq 'string') 'Consuming a shared gateway must be an additive, optional parameter.'
     Assert-Contract ($template.resources.apiManagementNsg.condition -match "variables\('_createApiManagement'\)") 'The gateway NSG must also be default-off.'
     Assert-Contract ($template.resources.appConfig.properties.disableLocalAuth -ceq "[parameters('enableDeveloperExperience')]") 'App Configuration authentication must change only in the opt-in developer profile.'

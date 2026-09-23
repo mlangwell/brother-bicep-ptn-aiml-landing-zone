@@ -1,5 +1,5 @@
 {
-  "sourceCommit": "98505e685de460e385c15bcb6c1e0a47e33ffdf0",
+  "sourceCommit": "99c048e84acf4661ea0ec0a0ef1bb23ea29c0f3b",
   "parameters": {
     "acaEnvironmentSubnetName": {
       "type": "string",
@@ -94,6 +94,30 @@
     "allowMixedObservabilityWorkspaces": {
       "type": "bool",
       "defaultValue": false
+    },
+    "apiManagementIngressSourceAddressPrefixes": {
+      "type": "array",
+      "defaultValue": []
+    },
+    "apiManagementName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').integration.apiManagement, parameters('resourceToken'))]"
+    },
+    "apiManagementPublisherEmail": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "apiManagementPublisherName": {
+      "type": "string",
+      "defaultValue": "AI Landing Zone"
+    },
+    "apiManagementSubnetName": {
+      "type": "string",
+      "defaultValue": "api-management-subnet"
+    },
+    "apiManagementSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.3.128/27"
     },
     "appConfigLabel": {
       "type": "string",
@@ -215,6 +239,10 @@
     "deployAiFoundrySubnet": {
       "type": "bool",
       "defaultValue": true
+    },
+    "deployApiManagement": {
+      "type": "bool",
+      "defaultValue": false
     },
     "deployAppConfig": {
       "type": "bool",
@@ -901,6 +929,18 @@
     "deployAppConfig": {
       "value": "true"
     },
+    "deployApiManagement": {
+      "value": "${DEPLOY_API_MANAGEMENT=false}"
+    },
+    "apiManagementPublisherEmail": {
+      "value": "${API_MANAGEMENT_PUBLISHER_EMAIL=}"
+    },
+    "apiManagementPublisherName": {
+      "value": "${API_MANAGEMENT_PUBLISHER_NAME=AI Landing Zone}"
+    },
+    "apiManagementIngressSourceAddressPrefixes": {
+      "value": "${API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES=[]}"
+    },
     "appRuntimeConfigurationMode": {
       "value": "${APP_RUNTIME_CONFIGURATION_MODE=appConfig}"
     },
@@ -1170,6 +1210,9 @@
     "appConfigName": {
       "value": null
     },
+    "apiManagementName": {
+      "value": null
+    },
     "appInsightsName": {
       "value": null
     },
@@ -1421,7 +1464,7 @@
     "azure.yaml": "b48046de800ea725d8f9a5fec904e320b8d560c8973a6c32f8b528ab0143fd10",
     "manifest.json": "9182f38f9b088c51b5ac716be41846bd0b3fd96858d861682b88483fbf02e0dd",
     "install.ps1": "45cfdcc58aa58593ef3b961726734a272b3e73679fb9461f4ba8d5a310e98864",
-    "Deploy-AilzIntegrated.ps1": "f68b1591a59d6330e12369a3e7b9a15b482062f8617ff13fbde1e66aad709653",
+    "Deploy-AilzIntegrated.ps1": "39629d5440a1abc7a8b088378bc4340be2fe2244dbb815e4e200294ca822c989",
     "pipelines/azuredevops/cd-pipeline.yml": "4a0ff750111c1ff9149c86dc80bbfb2a628387c7f4254df9b651abca5d4fa219",
     "pipelines/azuredevops/ci-pipeline.yml": "bdad7e9517721d0ea7b1d2042d747a0eedfed875955797e2598f987147de344a",
     "pipelines/azuredevops/templates/deploy-bicep.yml": "31b00d0e98bf379806d4d006ea757ddea4dd5c4189e8b626e2acf39ccd958b83",
