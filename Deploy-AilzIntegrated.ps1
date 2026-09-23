@@ -58,6 +58,37 @@ function Invoke-Azd {
     }
 }
 
+function Get-HubFirewallSubnetPrefix {
+    param([Parameter(Mandatory)][string] $HubVnetResourceId)
+
+    # Azure Firewall source-NATs DNAT and application-rule traffic to a back-end
+    # instance IP in AzureFirewallSubnet, not to its frontend private IP, so the
+    # gateway NSG must admit that subnet's range (ADR-002). Returns $null when
+    # the hub has no readable AzureFirewallSubnet, for example with an NVA.
+    $subnetId = '{0}/subnets/AzureFirewallSubnet' -f $HubVnetResourceId.TrimEnd('/')
+    $prefix = & az network vnet subnet show --ids $subnetId --query 'addressPrefix || addressPrefixes[0]' --output tsv --only-show-errors 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$prefix)) {
+        return $null
+    }
+
+    return ([string]$prefix).Trim()
+}
+
+function Assert-ApiManagementIngressSource {
+    param([Parameter(Mandatory)][string] $SerializedValue)
+
+    try {
+        $ingressPrefixes = @($SerializedValue | ConvertFrom-Json)
+    }
+    catch {
+        throw 'API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES must be a JSON array of hub firewall source CIDRs.'
+    }
+
+    if ($ingressPrefixes.Count -eq 0) {
+        throw 'At least one hub firewall source CIDR is required when DeployApiManagement is enabled.'
+    }
+}
+
 function Get-AzdEnvironmentValues {
     param([Parameter(Mandatory)][string] $EnvironmentName)
 
@@ -391,14 +422,21 @@ if ([bool]$ExistingApplicationInsightsResourceId -ne [bool]$ExistingApplicationI
     throw 'ExistingApplicationInsightsResourceId and ExistingApplicationInsightsConnectionString must be supplied together.'
 }
 
-$effectiveApiManagementIngressSourceAddressPrefixes = @(
-    if ($ApiManagementIngressSourceAddressPrefixes.Count -gt 0) {
-        $ApiManagementIngressSourceAddressPrefixes
-    }
-    else {
-        "$EgressNextHopIp/32"
-    }
+$explicitApiManagementIngressSourceAddressPrefixes = @(
+    $ApiManagementIngressSourceAddressPrefixes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 )
+
+# With API Management enabled and no explicit ingress sources, the default is
+# resolved after sign-in from the hub's AzureFirewallSubnet (ADR-002).
+$defaultApiManagementIngressSourceAddressPrefixes = if ($explicitApiManagementIngressSourceAddressPrefixes.Count -gt 0) {
+    ConvertTo-Json -InputObject $explicitApiManagementIngressSourceAddressPrefixes -Compress
+}
+elseif (-not $DeployApiManagement) {
+    ConvertTo-Json -InputObject @("$EgressNextHopIp/32") -Compress
+}
+else {
+    ''
+}
 
 $settings = [ordered]@{
     AZURE_LOCATION                           = $Location
@@ -408,7 +446,7 @@ $settings = [ordered]@{
     DEPLOY_API_MANAGEMENT                   = $DeployApiManagement.ToString().ToLowerInvariant()
     API_MANAGEMENT_PUBLISHER_EMAIL          = $ApiManagementPublisherEmail
     API_MANAGEMENT_PUBLISHER_NAME           = $ApiManagementPublisherName
-    API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES = ConvertTo-Json -InputObject $effectiveApiManagementIngressSourceAddressPrefixes -Compress
+    API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES = $defaultApiManagementIngressSourceAddressPrefixes
     HUB_INTEGRATION_HUB_VNET_RESOURCE_ID    = $HubVnetResourceId
     HUB_INTEGRATION_EGRESS_NEXT_HOP_IP      = $EgressNextHopIp
     HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID = ''
@@ -433,15 +471,8 @@ if ([string]$settings.DEPLOY_API_MANAGEMENT -ieq 'true') {
         throw 'ApiManagementPublisherEmail must be a valid email address when DeployApiManagement is enabled.'
     }
 
-    try {
-        $ingressPrefixes = @([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES | ConvertFrom-Json)
-    }
-    catch {
-        throw 'API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES must be a JSON array of hub firewall source CIDRs.'
-    }
-
-    if ($ingressPrefixes.Count -eq 0) {
-        throw 'At least one hub firewall source CIDR is required when DeployApiManagement is enabled.'
+    if (-not [string]::IsNullOrWhiteSpace([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)) {
+        Assert-ApiManagementIngressSource -SerializedValue ([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)
     }
 
     if (-not [string]::IsNullOrWhiteSpace([string]$settings.HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID)) {
@@ -457,6 +488,23 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "Azure CLI sign-in failed with exit code $LASTEXITCODE."
         }
+    }
+
+    if ([string]$settings.DEPLOY_API_MANAGEMENT -ieq 'true' -and
+        [string]::IsNullOrWhiteSpace([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)) {
+        $firewallSubnetPrefix = Get-HubFirewallSubnetPrefix -HubVnetResourceId $HubVnetResourceId
+        $resolvedIngressPrefixes = if ($firewallSubnetPrefix) {
+            Write-Host "API Management ingress source: hub AzureFirewallSubnet $firewallSubnetPrefix."
+            @($firewallSubnetPrefix)
+        }
+        else {
+            Write-Warning ("No AzureFirewallSubnet was readable in the hub VNet, so API Management ingress falls back to $EgressNextHopIp/32. " +
+                'Azure Firewall source-NATs gateway traffic to a back-end instance IP in AzureFirewallSubnet, not to its frontend IP. ' +
+                'If the hub uses Azure Firewall, pass -ApiManagementIngressSourceAddressPrefixes with that subnet range.')
+            @("$EgressNextHopIp/32")
+        }
+        $settings['API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES'] = ConvertTo-Json -InputObject $resolvedIngressPrefixes -Compress
+        Assert-ApiManagementIngressSource -SerializedValue ([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)
     }
 
     & azd auth login --check-status

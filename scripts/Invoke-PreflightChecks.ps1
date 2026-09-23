@@ -467,6 +467,7 @@ function Test-Topology {
         $publisherEmail = (Get-StringValue $P['apiManagementPublisherEmail']).Trim()
         $hubVnetResourceId = (Get-StringValue $P['hubIntegrationHubVnetResourceId']).Trim()
         $ingressPrefixes = Get-ArrayValue $P['apiManagementIngressSourceAddressPrefixes']
+        $directCallerPrefixes = Get-ArrayValue $P['apiManagementDirectCallerAddressPrefixes']
 
         if ($publisherEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
             Add-Finding -Severity FAIL -Code 'APIM_PUBLISHER_EMAIL_INVALID' `
@@ -474,34 +475,67 @@ function Test-Topology {
                 -Hint 'Set API_MANAGEMENT_PUBLISHER_EMAIL to the operational owner of the API Management instance.'
         }
 
-        if (-not $netIso -or $mode -ne 'ailz-integrated' -or $useExistingVNet -or $deployFw -or -not $deployNsgs -or
-            [string]::IsNullOrWhiteSpace($hubVnetResourceId) -or [string]::IsNullOrWhiteSpace($egressIp) -or
-            -not [string]::IsNullOrWhiteSpace($existingRt)) {
+        # Two supported network shapes (ADR-002): a new spoke whose injection
+        # subnet, NSG and route table this deployment owns, or a prepared spoke
+        # whose injection subnet an operator owns. These mirror
+        # _apiManagementTopologySupported in main.bicep.
+        $apimCommon = $netIso -and $mode -eq 'ailz-integrated' -and -not $deployFw -and
+            -not [string]::IsNullOrWhiteSpace($hubVnetResourceId)
+        $apimNewSpoke = $apimCommon -and -not $useExistingVNet -and $deployNsgs -and
+            -not [string]::IsNullOrWhiteSpace($egressIp) -and [string]::IsNullOrWhiteSpace($existingRt)
+        $apimPreparedSpoke = $apimCommon -and $useExistingVNet -and -not $deploySubnets
+
+        if (-not $apimNewSpoke -and -not $apimPreparedSpoke) {
             Add-Finding -Severity FAIL -Code 'APIM_TOPOLOGY_UNSUPPORTED' `
-                -Message 'API Management requires networkIsolation=true, deploymentMode=ailz-integrated, a new spoke VNet with managed NSGs and route table, a hub VNet resource ID, and a hub firewall next-hop IP.' `
-                -Hint 'Use Deploy-AilzIntegrated.ps1 with a new spoke; existing VNets and platform-owned route tables are not supported for API Management.'
+                -Message 'API Management requires networkIsolation=true, deploymentMode=ailz-integrated, a hub VNet resource ID and no local firewall. It also needs either a new spoke with managed NSGs, a hub firewall next-hop IP and no platform-owned route table, or a prepared spoke (useExistingVNet=true, deploySubnets=false) whose injection subnet an operator owns.' `
+                -Hint 'Use Deploy-AilzIntegrated.ps1 for a new spoke. API Management does not support updating subnets in an existing VNet (useExistingVNet=true with deploySubnets=true).'
+        }
+
+        if ($apimPreparedSpoke) {
+            Add-Finding -Severity WARN -Code 'APIM_PREPARED_SUBNET_OBLIGATION' `
+                -Message 'API Management will be injected into an operator-prepared subnet. This deployment does not manage that subnet, its NSG or its route table.' `
+                -Hint 'Before provisioning, confirm the subnet is undelegated and carries the rule set in modules/networking/api-management-injection-nsg.bicep, including the hub-firewall-only ingress rules. It must also route the ApiManagement service tag to Internet whenever 0.0.0.0/0 goes to a firewall.'
+        }
+        else {
+            try {
+                if ($ingressPrefixes.Count -eq 0) {
+                    throw 'At least one CIDR is required.'
+                }
+
+                foreach ($entry in $ingressPrefixes) {
+                    $cidr = (Get-StringValue $entry).Trim()
+                    if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$') {
+                        throw "'$cidr' is not an IPv4 CIDR."
+                    }
+                    Get-CidrRange -Cidr $cidr | Out-Null
+                    if ($cidr -eq '0.0.0.0/0') {
+                        throw '0.0.0.0/0 cannot enforce hub-firewall-only ingress.'
+                    }
+                }
+            }
+            catch {
+                Add-Finding -Severity FAIL -Code 'APIM_INGRESS_PREFIXES_INVALID' `
+                    -Message "apiManagementIngressSourceAddressPrefixes must be a non-empty array of restricted IPv4 CIDRs: $_" `
+                    -Hint 'Set API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES to the hub AzureFirewallSubnet prefix. Azure Firewall source-NATs gateway traffic to a back-end instance IP in that subnet, not to its frontend IP. Deploy-AilzIntegrated.ps1 looks it up by default.'
+            }
         }
 
         try {
-            if ($ingressPrefixes.Count -eq 0) {
-                throw 'At least one CIDR is required.'
-            }
-
-            foreach ($entry in $ingressPrefixes) {
+            foreach ($entry in $directCallerPrefixes) {
                 $cidr = (Get-StringValue $entry).Trim()
                 if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$') {
                     throw "'$cidr' is not an IPv4 CIDR."
                 }
                 Get-CidrRange -Cidr $cidr | Out-Null
                 if ($cidr -eq '0.0.0.0/0') {
-                    throw '0.0.0.0/0 cannot enforce hub-firewall-only ingress.'
+                    throw '0.0.0.0/0 would bypass the hub firewall for every caller.'
                 }
             }
         }
         catch {
-            Add-Finding -Severity FAIL -Code 'APIM_INGRESS_PREFIXES_INVALID' `
-                -Message "apiManagementIngressSourceAddressPrefixes must be a non-empty array of restricted IPv4 CIDRs: $_" `
-                -Hint 'For Azure Firewall DNAT, set API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES to the firewall private IPs as /32 CIDRs.'
+            Add-Finding -Severity FAIL -Code 'APIM_DIRECT_CALLER_PREFIXES_INVALID' `
+                -Message "apiManagementDirectCallerAddressPrefixes must contain only restricted IPv4 CIDRs of subnets inside this spoke: $_" `
+                -Hint 'List only in-spoke caller subnets. Callers outside the spoke must reach the gateway through the hub firewall.'
         }
     }
 
