@@ -1,6 +1,7 @@
 # ADR-001: Optional internal API Management in the spoke
 
-- Status: accepted
+- Status: accepted; superseded in part by [ADR-002](002-apim-merge-conformance.md)
+  (gateway module, NSG ingress rules, default ingress source and topology gate)
 - Date: 2026-09-21
 - Owners: AI Landing Zone maintainers
 - Related issue or pull request: none

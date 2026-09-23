@@ -11,12 +11,15 @@ configuration, not the operator profile; the parent passes it separately from
 the module's sealed gateway configuration.
 
 The authoritative service/PE ownership contract is the pair
-`ailz-managed-by=github-dev-environment` and `ailz-environment=<environment>`,
-on the exact approved resource IDs. Both are set by this module and required by
-its readers, matching P5. The additional `ailz-owner=ailz-inference-<environment>`
-namespace marker is retained; when present it must not contradict the pair.
-API/backend descriptions and named-value ownership tags remain namespace-scoped,
-so the common pair does not authorize overwriting unrelated child resources.
+`ailz-managed-by=<managedBy>` and `ailz-environment=<environment>`, on the exact
+approved resource IDs. The parent passes `managedBy=github-dev-environment` when
+a structured gateway configuration is supplied, and `ai-landing-zone` for a
+gateway deployed alone from the flat azd parameters. The GitHub environment
+readers require their own marker, so they never adopt an azd-created gateway.
+The additional `ailz-owner=ailz-inference-<environment>` namespace marker is
+retained; when present it must not contradict the pair. API/backend descriptions
+and named-value ownership tags remain namespace-scoped, so the common pair does
+not authorize overwriting unrelated child resources.
 
 ## Exact Bicep interface
 
@@ -26,9 +29,14 @@ Entry point: `modules\api-management\main.bicep`, resource-group scope.
 | --- | --- | --- |
 | `name` | string, required | Parent-resolved explicit/CAF/legacy APIM name; explicit profile name wins. |
 | `location` | string, required | Approved gateway/integration VNet region. |
-| `environmentName` | `dev \| test \| prod`, required | Ownership and counter isolation. |
+| `environmentName` | string, required | Ownership and counter isolation. The GitHub pipeline passes `dev`, `test` or `prod`; the azd path passes the azd environment name. |
+| `workloadKey` | string, required | Landing-zone-scoped key for every per-workload resource name and route. |
 | `tenantId` | string, required | Approved Entra tenant GUID. |
-| `configuration` | exported `gatewayConfiguration`, required | Unchanged enabled P1 gateway object. `foundryIntegration=true` is unsupported and rejected. |
+| `sku` | `Developer \| Premium`, `Developer` | Classic tier that supports VNet injection. |
+| `capacity` | int, `1` | Gateway units. Developer supports exactly one. |
+| `publisherEmail` / `publisherName` | string, required | Publisher contact. |
+| `workloadConfiguration` | exported `gatewayConfiguration` or null | Null deploys the gateway alone: no workload API and no backend or telemetry role assignments. Otherwise the unchanged, enabled P1 gateway object; `foundryIntegration=true` is unsupported and rejected. |
+| `managedBy` | string, `github-dev-environment` | Value of the `ailz-managed-by` ownership tag. |
 | `integrationSubnetResourceId` | string, required | Dedicated **undelegated** injection subnet with the API Management NSG rule set and approved egress/DNS. Never the app/agent subnet. Classic VNet injection forbids subnet delegation. |
 | `backendAccountResourceId` | string, required | Verified Foundry account ID. |
 | `backendEndpoint` | string, required | Verified account-named HTTPS root on `openai.azure.com` or `services.ai.azure.com`; no path, port, query, credentials or fragment. |
@@ -39,10 +47,11 @@ Entry point: `modules\api-management\main.bicep`, resource-group scope.
 
 Outputs are `serviceResourceId:string`, `gatewayHostName:string`,
 `gatewayPrivateIpAddress:string`, `principalId:string`,
-`inferenceEndpoint:string`, `audience:string`, and `facts:object`. `facts` lists
-owned IDs, source links, `operatorObligations` and pending operational
-requirements, effective `stopNewRequests` and `approvedStopNewRequests`; it does
-not assert readiness.
+`inferenceEndpoint:string`, `audience:string`, and `facts:object`.
+`inferenceEndpoint` and `audience` are empty when the gateway is deployed alone.
+`facts` lists owned IDs, source links, `operatorObligations` and pending
+operational requirements, effective `stopNewRequests` and
+`approvedStopNewRequests`; it does not assert readiness.
 
 ## Network topology: classic VNet injection, Internal mode
 
@@ -66,7 +75,12 @@ The injection subnet's NSG must carry explicit rules — a rule-less NSG blocks
 the gateway entirely, because *"the load balancer used internally by API
 Management is secure by default and rejects all inbound traffic."* Use
 `modules/networking/api-management-injection-nsg.bicep`, which is shared with
-`platform/api-management/` so the two gateway paths cannot drift.
+`platform/api-management/` so the two gateway paths cannot drift. When the
+landing zone creates the injection subnet, it reaches that rule set through
+`modules/networking/api-management-nsg.bicep`. That entry point requires hub
+firewall source CIDRs and adds the firewall-bounded ingress rules: TCP 443 from
+the firewall's post-SNAT range and from named in-spoke callers, UDP 4290 within
+the subnet, and `DenyAllInbound` ([ADR-002](../../docs/adr/002-apim-merge-conformance.md)).
 
 **Operator obligation:** Internal mode registers nothing on public DNS, so the
 gateway is unreachable until a private DNS zone named exactly

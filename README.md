@@ -29,15 +29,20 @@ not developer readiness: private completion, human SSO and the live acceptance
 gates are separate. The existing wrapper, `azd` hooks and Azure DevOps assets
 remain supported and unchanged.
 
-The APIM gateway is **per-subscription platform infrastructure**: deploy
+The APIM gateway can be created by the landing zone, or consumed from
+**per-subscription platform infrastructure**. For the shared option, deploy
 [`platform/api-management/`](platform/api-management/) **once per subscription**,
 then deploy the landing zone **many times** against it via
-`existingApiManagementResourceId`. The gateway uses classic VNet injection in
-Internal mode (Developer for sandbox/dev/test, Premium for production), so it is
-reachable only from inside the virtual network and its governed route is
+`existingApiManagementResourceId`. The landing zone creates Developer by
+default; the structured gateway configuration from the GitHub environment
+profile selects Premium and adds the governed workload API.
+
+Either way, the gateway uses classic VNet injection in Internal mode, so it is
+reachable only from inside the virtual network. Its governed route is
 `/inference/<workloadKey>/v1/responses`. Internal mode registers nothing on
 public DNS, so an operator-created private DNS zone is required before the
-gateway is reachable — see
+gateway is reachable. See
+[ADR-002](docs/adr/002-apim-merge-conformance.md) and
 [the topology ADR](docs/adr/2026-09-22-apim-classic-vnet-injection.md).
 
 The script configures this topology automatically:
@@ -122,7 +127,7 @@ The script has four required parameters. The remaining parameters are optional.
 | `DeployApiManagement` | No | Deploy a Developer-tier API Management service with internal VNet injection into the AILZ spoke. Disabled by default. | `-DeployApiManagement` |
 | `ApiManagementPublisherEmail` | Conditional | Publisher contact email. Required when `DeployApiManagement` is enabled. | `api-owners@contoso.com` |
 | `ApiManagementPublisherName` | No | Publisher display name. Defaults to `AI Landing Zone`. | `Contoso API Team` |
-| `ApiManagementIngressSourceAddressPrefixes` | No | Hub firewall private IP CIDRs allowed to reach the internal APIM gateway after DNAT. Defaults to `EgressNextHopIp/32`; pass every firewall instance IP when the hub uses multiple addresses. | `@("10.100.0.4/32")` |
+| `ApiManagementIngressSourceAddressPrefixes` | No | Hub firewall source CIDRs allowed to reach the internal APIM gateway on TCP 443. Defaults to the hub VNet's `AzureFirewallSubnet` prefix, read after sign-in, because Azure Firewall source-NATs gateway traffic to a back-end instance IP in that subnet, not to its frontend IP. Falls back to `EgressNextHopIp/32` with a warning when the hub has no readable `AzureFirewallSubnet`, such as an NVA hub. | `@("10.100.0.0/26")` |
 | `AdditionalEnvironmentVariables` | No | PowerShell hashtable containing additional `azd` environment values supported by `main.parameters.json`, such as subscription, resource group, private DNS zone IDs, or feature flags. Values persist in the selected local `azd` environment. | `@{ AZURE_SUBSCRIPTION_ID = "<id>" }` |
 | `PreviewOutput` | No | Preview detail level. `Full` displays ARM What-If changes plus every nested compiled resource declaration. `Slim` (default) displays the original condensed `azd provision --preview` summary. | `Full` |
 | `PreviewOnly` | No | Switch that stops after `azd provision --preview`. Without it, the script displays the preview and then asks you to type `DEPLOY` before provisioning. | `-PreviewOnly` |
@@ -185,8 +190,10 @@ Replace the example values, then run:
 ```
 
 The script signs in when needed, creates or selects the named `azd`
-environment, sets the integrated-topology values, and displays two preview
-sections:
+environment, sets the integrated-topology values, and displays the preview.
+With the default `-PreviewOutput Slim` this is the condensed
+`azd provision --preview` summary. With `-PreviewOutput Full` it displays two
+preview sections:
 
 - `ARM What-If resource changes` is Azure's evaluated change set for resources
   ARM expands during What-If.
@@ -198,8 +205,8 @@ sections:
   remain subject to their template or parent-module conditions.
 
 `-PreviewOnly` guarantees that this invocation does not provision resources.
-Pass `-PreviewOutput Slim` when the condensed `azd` resource summary is
-preferred. Omitting `-PreviewOutput` uses `Full`.
+Pass `-PreviewOutput Full` to add the What-If change set and the compiled
+inventory. Omitting `-PreviewOutput` uses `Slim`.
 
 Review both sections for deleted or replaced resources, unexpected role
 assignments, public network access, incorrect regions, and changes outside the
@@ -255,31 +262,55 @@ Enable API Management and provide its publisher contact email:
 ```
 
 The deployment uses the Developer SKU and internal VNet mode. It creates the
-dedicated `api-management-subnet` at `192.168.3.128/27`, an NSG for required
-Azure control-plane and load-balancer traffic plus HTTPS from the approved hub
-firewall CIDRs, and a dedicated route table. The default route sends workload
-and APIM dependency egress to the hub firewall. The required `ApiManagement`
-service-tag route sends control-plane responses directly to the Internet to
-keep TCP 3443 symmetric; this is the sole intentional forced-tunneling
-exception. Set `-ApiManagementPublisherName` to override the default publisher
-name.
+dedicated `api-management-subnet` at `192.168.3.128/27` and a dedicated route
+table. The subnet has service endpoints for Storage, SQL, Key Vault and Event
+Hubs.
+
+Its NSG allows:
+- Azure control-plane traffic and load-balancer probes;
+- HTTPS from the approved hub firewall CIDRs;
+- HTTPS from any in-spoke caller subnets you list;
+- rate-limit counter sync within the subnet.
+
+It denies all other inbound traffic. To let subnets inside the spoke call the
+gateway directly, pass their CIDRs as
+`API_MANAGEMENT_DIRECT_CALLER_ADDRESS_PREFIXES` through
+`-AdditionalEnvironmentVariables`. Callers outside the spoke always go through
+the hub firewall.
+
+The default route sends workload and APIM dependency egress to the hub
+firewall. The required `ApiManagement` service-tag route sends control-plane
+responses directly to the Internet to keep TCP 3443 symmetric; this is the sole
+intentional forced-tunneling exception. Set `-ApiManagementPublisherName` to
+override the default publisher name. Premium and the governed workload API are
+selected through the structured gateway configuration; see
+[ADR-002](docs/adr/002-apim-merge-conformance.md).
 
 The platform team must complete these hub-owned changes before the gateway is
 usable:
 
-1. Configure hub firewall DNAT for TCP 443 to the APIM private VIP. Azure
-  Firewall source-NATs DNAT traffic, so the APIM NSG permits the firewall
-  private IP `/32` by default. Pass
-  `-ApiManagementIngressSourceAddressPrefixes` when multiple firewall private
-  IPs can source the traffic.
+1. Deliver gateway traffic through the hub firewall with source NAT, so it
+  arrives from the `AzureFirewallSubnet` range that the APIM NSG admits. Use
+  either of these patterns:
+   - An application rule for the gateway FQDN. Application rules always
+     source-NAT. Clients resolve the gateway host name to its private VIP and
+     route the spoke range through the firewall.
+   - A private-IP DNAT rule on the firewall, which the Azure Firewall FAQ still
+     labels preview. Clients resolve the gateway host name to the firewall
+     listener.
+
+   Network-rule traffic to private addresses is not source-NATed. It keeps the
+   client address, so the APIM NSG denies it.
 2. Permit the documented APIM VNet dependency service tags, ports, and FQDNs
   in the hub firewall policy. See the [APIM VNet configuration
   reference](https://learn.microsoft.com/azure/api-management/virtual-network-reference).
-3. Publish A records that resolve the APIM gateway, management, portal,
-  developer portal, and SCM host names to its private VIP in DNS visible from
-  the hub and spoke.
-4. Validate that direct spoke access to TCP 443 is denied and that requests
-  succeed only through the hub firewall listener.
+3. Publish DNS for the gateway, management, portal, developer portal, and SCM
+  host names that matches the pattern above. Point them at the private VIP for
+  the application-rule pattern, or at the firewall listener for DNAT. Scope
+  zones to the exact host names; never create a private zone for
+  `azure-api.net`.
+4. Validate that direct access to TCP 443 from other spoke subnets is denied,
+  and that requests succeed through the hub firewall path.
 
 Disabling `DeployApiManagement` does not delete existing resources because ARM
 deployments are incremental. After exporting any APIM data-plane configuration,
