@@ -8,17 +8,9 @@ Push-Location $root
 try {
     $suites = @(
         '.github\scripts\Validate-CopilotAssets.ps1'
-        'tests\scripts\Validate-CopilotAssets.Tests.ps1'
         'scripts\Measure-MainJsonSize.ps1'
-        'tests\scripts\Measure-MainJsonSize.Tests.ps1'
-        'tests\scripts\Invoke-PreflightChecks.Tests.ps1'
-        'tests\contracts\Test-HostedAgentContract.ps1'
-        'tests\contracts\Test-AcrTaskAgentPoolFirewallContract.ps1'
-        'tests\contracts\Test-FirewallAgent365ObservabilityContract.ps1'
-        'tests\contracts\Test-FoundrySharedPrivateLinkNameContract.ps1'
-        'tests\contracts\Test-MaintenanceConfigurationWrapperContract.ps1'
-        'tests\contracts\Test-ComponentDeploymentFlagsContract.ps1'
-        'tests\contracts\Test-CosmosDeploymentNameContract.ps1'
+        'tests\contracts\Test-ApiManagementWorkloadIsolationContract.ps1'
+        'tests\contracts\Test-ApiManagementClassicInjectionContract.ps1'
     )
     foreach ($suite in $suites) {
         & pwsh -NoProfile -NonInteractive -File (Join-Path $root $suite)

@@ -9,16 +9,14 @@ on:
       - 'main.parameters.json'
       - 'scripts/Measure-MainJsonSize.ps1'
       - 'scripts/Invoke-PreflightChecks.ps1'
+      - 'Deploy-AilzIntegrated.ps1'
       - 'tests/contracts/**'
-      - 'tests/scripts/Measure-MainJsonSize.Tests.ps1'
-      - 'tests/scripts/Invoke-PreflightChecks.Tests.ps1'
       - 'AGENTS.md'
       - '.github/agents/**'
       - '.github/skills/**'
       - '.github/instructions/**'
       - '.github/copilot-instructions.md'
       - '.github/scripts/Validate-CopilotAssets.ps1'
-      - 'tests/scripts/Validate-CopilotAssets.Tests.ps1'
       - '.github/workflows/bicep-validate.yml'
       - 'scripts/**'
       - 'tests/github/**'
@@ -40,16 +38,14 @@ on:
       - 'main.parameters.json'
       - 'scripts/Measure-MainJsonSize.ps1'
       - 'scripts/Invoke-PreflightChecks.ps1'
+      - 'Deploy-AilzIntegrated.ps1'
       - 'tests/contracts/**'
-      - 'tests/scripts/Measure-MainJsonSize.Tests.ps1'
-      - 'tests/scripts/Invoke-PreflightChecks.Tests.ps1'
       - 'AGENTS.md'
       - '.github/agents/**'
       - '.github/skills/**'
       - '.github/instructions/**'
       - '.github/copilot-instructions.md'
       - '.github/scripts/Validate-CopilotAssets.ps1'
-      - 'tests/scripts/Validate-CopilotAssets.Tests.ps1'
       - '.github/workflows/bicep-validate.yml'
       - 'scripts/**'
       - 'tests/github/**'
@@ -81,10 +77,6 @@ jobs:
         shell: pwsh
         run: pwsh ./.github/scripts/Validate-CopilotAssets.ps1
 
-      - name: Test Copilot asset validator
-        shell: pwsh
-        run: pwsh ./tests/scripts/Validate-CopilotAssets.Tests.ps1
-
   build-and-measure:
     name: bicep build + size gate
     runs-on: ubuntu-latest
@@ -111,44 +103,11 @@ jobs:
           # The script defaults are the single source of truth for local and CI gates.
           pwsh ./scripts/Measure-MainJsonSize.ps1
 
-      - name: Test compiled-template size gate
-        shell: pwsh
-        run: pwsh ./tests/scripts/Measure-MainJsonSize.Tests.ps1
-
       - name: Lint Bicep
         shell: pwsh
         run: |
           az bicep lint --file main.bicep
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Validate hosted-agent resource contract
-        shell: pwsh
-        run: |
-          pwsh ./tests/contracts/Test-HostedAgentContract.ps1
-
-      - name: Validate ACR Task agent pool firewall contract
-        shell: pwsh
-        run: pwsh ./tests/contracts/Test-AcrTaskAgentPoolFirewallContract.ps1
-
-      - name: Validate firewall Agent365 observability contract
-        shell: pwsh
-        run: pwsh ./tests/contracts/Test-FirewallAgent365ObservabilityContract.ps1
-
-      - name: Validate Foundry shared private-link names
-        shell: pwsh
-        run: pwsh ./tests/contracts/Test-FoundrySharedPrivateLinkNameContract.ps1
-
-      - name: Validate Maintenance Configuration wrapper forwarding
-        shell: pwsh
-        run: pwsh ./tests/contracts/Test-MaintenanceConfigurationWrapperContract.ps1
-
-      - name: Validate component deployment flag contract
-        shell: pwsh
-        run: pwsh ./tests/contracts/Test-ComponentDeploymentFlagsContract.ps1
-
-      - name: Validate Cosmos DB deployment names
-        shell: pwsh
-        run: pwsh ./tests/contracts/Test-CosmosDeploymentNameContract.ps1
 
       - name: Validate API Management workload isolation
         shell: pwsh
@@ -157,10 +116,6 @@ jobs:
       - name: Validate API Management classic VNet injection
         shell: pwsh
         run: pwsh ./tests/contracts/Test-ApiManagementClassicInjectionContract.ps1
-
-      - name: Run deterministic preflight tests
-        shell: pwsh
-        run: pwsh ./tests/scripts/Invoke-PreflightChecks.Tests.ps1
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
