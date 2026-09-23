@@ -16,7 +16,7 @@ function Get-GatewayObservedState {
     $inventory = ConvertFrom-BootstrapJson -Json (& $Native 'az' @('resource', 'list', '--subscription', $scope.subscriptionId, '--resource-group', $scope.resourceGroup, '--resource-type', 'Microsoft.ApiManagement/service', '--only-show-errors', '--output', 'json'))
     $gateways = @($inventory | Where-Object { $_.name -ieq $name })
     if ($gateways.Count -eq 0) {
-        return @{ gatewayExists = $false; resourceId = $resourceId; publicNetworkAccess = ''; privateEndpointIds = @() }
+        return @{ gatewayExists = $false; resourceId = $resourceId; publicNetworkAccess = ''; provisioningState = ''; privateEndpointIds = @() }
     }
     if ($gateways.Count -ne 1 -or $gateways[0].id -ine $resourceId) { throw 'Gateway inventory is ambiguous or outside the approved environment scope.' }
     $gateway = ConvertFrom-BootstrapJson -Json (& $Native 'az' @('resource', 'show', '--ids', $resourceId, '--api-version', '2024-05-01', '--only-show-errors', '--output', 'json'))
@@ -25,6 +25,10 @@ function Get-GatewayObservedState {
     }
     $access = $gateway.properties.publicNetworkAccess
     if ($access -cnotin @('Enabled', 'Disabled')) { throw 'Gateway public-network state could not be established.' }
+    $provisioningState = [string]$gateway.properties.provisioningState
+    if ($provisioningState -cnotin @('Succeeded', 'Failed', 'Canceled')) {
+        throw 'Gateway provisioning is still in progress; wait and re-observe before planning.'
+    }
     $privateIds = @()
     if ($gateway.properties.Contains('privateEndpointConnections') -and $null -ne $gateway.properties.privateEndpointConnections) {
         foreach ($connection in $gateway.properties.privateEndpointConnections) {
@@ -35,7 +39,7 @@ function Get-GatewayObservedState {
         }
     }
     if ($access -ceq 'Disabled' -and $privateIds.Count -eq 0) { throw 'A private gateway has no approved private endpoint; repair and re-preview before deployment.' }
-    return @{ gatewayExists = $true; resourceId = $resourceId; publicNetworkAccess = $access; privateEndpointIds = @($privateIds | Sort-Object -Unique -CaseSensitive) }
+    return @{ gatewayExists = $true; resourceId = $resourceId; publicNetworkAccess = $access; provisioningState = $provisioningState; privateEndpointIds = @($privateIds | Sort-Object -Unique -CaseSensitive) }
 }
 
 function Get-DeploymentParameters {
@@ -48,9 +52,13 @@ function Get-DeploymentParameters {
     if ($parameters.parameters.deployApiManagement.value -isnot [bool]) { throw 'Gateway feature flag is not a typed boolean.' }
     if ($parameters.parameters.deployApiManagement.value) {
         if ($ObservedState.gatewayExists -and $ObservedState.publicNetworkAccess -cnotin @('Enabled', 'Disabled')) { throw 'Unknown existing gateway state.' }
+        # Classic VNet injection has no public-then-private transition and no
+        # private endpoint, so private-endpoint state cannot mark a gateway as
+        # settled. Mirror Get-GatewayDeploymentPlan (ADR-002): only an absent or
+        # interrupted creation is initial provisioning. Invoke-EnvironmentDeployment
+        # rejects any disagreement between the two planners.
         $parameters.parameters.apiManagementConfiguration.value.initialProvisioning =
-            -not $ObservedState.gatewayExists -or
-            ($ObservedState.publicNetworkAccess -ceq 'Enabled' -and $ObservedState.privateEndpointIds.Count -eq 0)
+            -not $ObservedState.gatewayExists -or $ObservedState.provisioningState -cne 'Succeeded'
     }
     return $parameters
 }

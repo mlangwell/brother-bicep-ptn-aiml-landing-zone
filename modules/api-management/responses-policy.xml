@@ -34,15 +34,15 @@
       return mapping.ToString();
     }" />
     <choose>
-      <when condition="@(context.Request.PrivateEndpointConnection == null || (string)context.Variables[&quot;mapping&quot;] == &quot;{}&quot;)">
+      <when condition="@((string)context.Variables[&quot;mapping&quot;] == &quot;{}&quot;)">
         <trace source="__OWNER__" severity="information">
           <message>request-rejected</message>
           <metadata name="correlation" value="@(context.RequestId.ToString())" />
-          <metadata name="reason" value="private-caller-required" />
+          <metadata name="reason" value="caller-not-approved" />
         </trace>
         <return-response>
           <set-status code="403" reason="Forbidden" />
-          <set-body>{"error":{"code":"gateway_forbidden","message":"An approved private caller is required."}}</set-body>
+          <set-body>{"error":{"code":"gateway_forbidden","message":"An approved caller is required."}}</set-body>
         </return-response>
       </when>
     </choose>

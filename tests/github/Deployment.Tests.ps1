@@ -20,7 +20,7 @@ $profile = @{
     identities=@{preview=@{clientId='33333333-3333-3333-3333-333333333333'};deploy=@{clientId='44444444-4444-4444-4444-444444444444'}}
 }
 $gatewayId = "/subscriptions/$($profile.azure.subscriptionId)/resourceGroups/synthetic/providers/Microsoft.ApiManagement/service/synthetic-gateway"
-$state = @{ exists=$false; owned=$true; public='Enabled'; connected=$false; calls=[Collections.Generic.List[string]]::new() }
+$state = @{ exists=$false; owned=$true; public='Enabled'; connected=$false; provisioning='Succeeded'; calls=[Collections.Generic.List[string]]::new() }
 $native = {
     param($Command, $Arguments)
     $state.calls.Add("$Command $($Arguments[0]) $($Arguments[1])")
@@ -35,7 +35,7 @@ $native = {
         return (@{
             id=$gatewayId
             tags=@{'ailz-managed-by'=$(if($state.owned){'github-dev-environment'}else{'someone-else'});'ailz-environment'='dev'}
-            properties=@{publicNetworkAccess=$state.public;privateEndpointConnections=$connections}
+            properties=@{publicNetworkAccess=$state.public;provisioningState=$state.provisioning;privateEndpointConnections=$connections}
         } | ConvertTo-Json -Depth 12 -Compress)
     }
     throw 'Unexpected Azure operation.'
@@ -46,12 +46,14 @@ $resolved = @{parameters=@{parameters=@{deployApiManagement=@{value=$true};apiMa
 $initial = Get-DeploymentParameters -Resolved $resolved -ObservedState $absent
 Assert-True ($initial.parameters.apiManagementConfiguration.value.initialProvisioning -eq $true) 'New service creation did not select the explicit initial phase.'
 Assert-True (-not $resolved.parameters.parameters.apiManagementConfiguration.value.Contains('initialProvisioning')) 'State resolution mutated the shared profile result.'
+# The only settled shape on classic VNet injection: publicNetworkAccess Enabled,
+# no private endpoint, provisioning Succeeded. It must not re-engage the initial
+# stop on every redeploy, and it must agree with Get-GatewayDeploymentPlan,
+# which Invoke-EnvironmentDeployment enforces.
 $state.exists = $true
-$state.public = 'Disabled'
-$state.connected = $true
-$private = Get-GatewayObservedState -Profile $profile -Native $native
-$steady = Get-DeploymentParameters -Resolved $resolved -ObservedState $private
-Assert-True ($steady.parameters.apiManagementConfiguration.value.initialProvisioning -eq $false) 'A second deployment could reopen the public gateway.'
+$settled = Get-GatewayObservedState -Profile $profile -Native $native
+$steady = Get-DeploymentParameters -Resolved $resolved -ObservedState $settled
+Assert-True ($settled.provisioningState -ceq 'Succeeded' -and $steady.parameters.apiManagementConfiguration.value.initialProvisioning -eq $false) 'A settled injected gateway re-entered initial provisioning, which disagrees with the gateway planner and stops the gateway on every redeploy.'
 $state.owned = $false
 Assert-Rejected { Get-GatewayObservedState -Profile $profile -Native $native } 'An existing unowned gateway was adopted.'
 $state.owned = $true
@@ -59,9 +61,12 @@ $state.public = 'Disabled'
 $state.connected = $false
 Assert-Rejected { Get-GatewayObservedState -Profile $profile -Native $native } 'A private gateway without an approved endpoint was treated as ready.'
 $state.public = 'Enabled'
+$state.provisioning = 'Updating'
+Assert-Rejected { Get-GatewayObservedState -Profile $profile -Native $native } 'A gateway still provisioning was planned instead of re-observed.'
+$state.provisioning = 'Failed'
 $partial = Get-GatewayObservedState -Profile $profile -Native $native
 $repair = Get-DeploymentParameters -Resolved $resolved -ObservedState $partial
-Assert-True ($repair.parameters.apiManagementConfiguration.value.initialProvisioning -eq $true) 'An interrupted initial creation cannot be resumed without reopening a previously private gateway.'
+Assert-True ($repair.parameters.apiManagementConfiguration.value.initialProvisioning -eq $true) 'An interrupted initial creation was not resumed as initial provisioning.'
 $account = @{ id=$profile.azure.subscriptionId;tenantId=$profile.azure.tenantId;user=@{type='servicePrincipal';name=$profile.identities.preview.clientId} }
 Assert-AzureDeploymentIdentity -Profile $profile -Phase Preview -Account $account
 $count++

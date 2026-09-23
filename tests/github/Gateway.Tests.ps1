@@ -97,6 +97,11 @@ param stoppedNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure
         $xmlText = $xmlText.Replace(('{{' + $value.displayName + '}}'), [Security.SecurityElement]::Escape([string]$value.value))
     }
     Assert-True ($xmlText -notmatch '__[A-Z_]+__|\{\{') 'Unresolved generated policy placeholder.'
+    # Classic VNet injection cannot hold a private endpoint, so
+    # context.Request.PrivateEndpointConnection is always null on this gateway.
+    # A policy that required it rejected every request (ADR-002); privacy comes
+    # from Internal mode and the injection-subnet NSG instead.
+    Assert-True ($xmlText -notmatch 'PrivateEndpointConnection') 'The policy must not require a private endpoint connection, which classic injected instances cannot have.'
     [xml]$policy = $xmlText
     Assert-True ($policy.policies.inbound.'validate-azure-ad-token'.'tenant-id' -ceq $profile.azure.tenantId) 'Tenant validation drift.'
     Assert-True ($policy.policies.inbound.'validate-azure-ad-token'.audiences.audience -ceq $profile.gateway.audience) 'Audience validation drift.'
@@ -158,7 +163,8 @@ namespace P3GatewayTests {
         public Url OriginalUrl = new Url();
         public string Method = "POST";
         public string IpAddress = "192.0.2.10";
-        public object PrivateEndpointConnection = new object();
+        // Always null on classic VNet injection, which has no private endpoint.
+        public object PrivateEndpointConnection = null;
         public Dictionary<string,string[]> Headers = new Dictionary<string,string[]>(StringComparer.OrdinalIgnoreCase);
     }
     public sealed class Response {
@@ -329,7 +335,6 @@ namespace P3GatewayTests {
         Assert-True (-not $c.Forwarded -and -not $c.IdentityUsed -and $c.Response.StatusCode -in @(400, 403)) 'Unapproved body reached inference.'
     }
     foreach ($mutation in @(
-        { param($c) $c.Request.PrivateEndpointConnection = $null },
         { param($c) $c.Request.Method = 'GET' },
         { param($c) $c.Request.Url.Path = "/$apiPath/v1/chat/completions" },
         # A sibling landing zone's route on the same shared gateway must not be
@@ -593,8 +598,10 @@ namespace P3GatewayTests {
     # The injection subnet must not be delegated, and its NSG must carry real
     # rules, because the internal load balancer rejects all inbound by default.
     $parentSource = Get-Content -LiteralPath (Join-Path $root 'main.bicep') -Raw
+    $landingZoneNsgSource = Get-Content -LiteralPath (Join-Path $root 'modules\networking\api-management-nsg.bicep') -Raw
     Assert-True ($parentSource -notmatch "delegation:\s*'Microsoft\.Web/serverFarms'") 'The injection subnet must not be delegated; Learn requires delegation None for classic injection.'
-    Assert-True ($parentSource -match 'modules/networking/api-management-injection-nsg\.bicep') 'The injection subnet must use the rule-carrying NSG, not the empty shared NSG helper.'
+    Assert-True ($parentSource -match "(?m)^module apiManagementNsg 'modules/networking/api-management-nsg\.bicep'" -and
+        $landingZoneNsgSource -match "(?m)^module rules 'api-management-injection-nsg\.bicep'") 'The injection subnet must use the rule-carrying NSG, not the empty shared NSG helper.'
     $nsgSource = Get-Content -LiteralPath (Join-Path $root 'modules\networking\api-management-injection-nsg.bicep') -Raw
     foreach ($rule in @('ApiManagement', 'AzureLoadBalancer', 'Storage', 'Sql', 'AzureKeyVault', 'AzureMonitor')) {
         Assert-True ($nsgSource -match [regex]::Escape($rule)) "The injection NSG is missing the required $rule rule."
