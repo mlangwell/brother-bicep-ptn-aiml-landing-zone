@@ -536,6 +536,14 @@ try {
     }
 
     if ($PreviewOutput -eq 'Full') {
+        # The full preview calls ARM What-If directly, so the azd preprovision
+        # hook does not run before it. Run the same preflight first, so blocking
+        # findings such as an unsupported azd or a missing hub-to-spoke peering
+        # for API Management surface before the preview is reviewed and approved.
+        & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'scripts' 'Invoke-PreflightChecks.ps1') -AzdEnv $EnvironmentName
+        if ($LASTEXITCODE -ne 0) {
+            throw "Preflight failed with exit code $LASTEXITCODE. Resolve the FAIL findings above and rerun."
+        }
         Invoke-CompletePreview -EnvironmentName $EnvironmentName
     }
     else {

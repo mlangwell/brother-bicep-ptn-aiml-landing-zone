@@ -17,7 +17,8 @@ assembling them into a long PowerShell command without a typo.
 
 1. Install [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell),
    the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli), and
-   the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd).
+   the [Azure Developer CLI](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd)
+   1.25.5 or later. The template's `azure.yaml` rejects older azd releases.
 2. Sign in to the correct tenant. Discovery can only find what your identity can
    see, so sign in as the account that has visibility of the platform/
    connectivity subscription:
@@ -228,6 +229,8 @@ STEP 1 - Validate my config before touching Azure.
 
 STEP 2 - Check my tools and Azure context.
   Run `pwsh --version`, `az version` and `azd version` and confirm each exists.
+  azd must be 1.25.5 or later; the template's azure.yaml rejects older releases.
+  If it is older, stop and tell me to upgrade it with `winget upgrade Microsoft.Azd`.
   Run `az account show --output json`. If I am not signed in, tell me to run
   `az login --tenant "<tenant-id>"` rather than signing me in to the wrong
   tenant. Compare the signed-in subscription against
@@ -303,7 +306,9 @@ STEP 7 - Stop and ask.
 
 STEP 8 - After a successful provision, remind me of the manual hub steps:
   1. Create the reverse hub-to-spoke VNet peering. This deployment only creates
-     the spoke-to-hub direction.
+     the spoke-to-hub direction. If I plan to enable API Management, this
+     peering must show Connected in both directions before I rerun with
+     `-DeployApiManagement`, or the gateway fails activation.
   2. Link hub Private DNS zones to the spoke VNet where Azure Policy does not.
   3. Confirm the hub firewall permits my spoke range.
   4. Test from a host that can reach the spoke, such as a hub jumpbox.

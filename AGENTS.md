@@ -117,6 +117,8 @@ risk:
 - API Management contracts:
   `pwsh ./tests/contracts/Test-ApiManagementWorkloadIsolationContract.ps1` and
   `pwsh ./tests/contracts/Test-ApiManagementClassicInjectionContract.ps1`
+- azd operator paths (azd floor, API Management peering gate, teardown):
+  `pwsh ./tests/contracts/Test-AzdOperationsContract.ps1`
 - GitHub environment suites:
   `pwsh ./scripts/github/Test-GitHubEnvironment.ps1 -TemplatePath ./main.json`
 - Full local gate: `npm test`

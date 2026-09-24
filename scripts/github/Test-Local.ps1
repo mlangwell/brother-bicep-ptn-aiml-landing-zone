@@ -11,6 +11,7 @@ try {
         'scripts\Measure-MainJsonSize.ps1'
         'tests\contracts\Test-ApiManagementWorkloadIsolationContract.ps1'
         'tests\contracts\Test-ApiManagementClassicInjectionContract.ps1'
+        'tests\contracts\Test-AzdOperationsContract.ps1'
     )
     foreach ($suite in $suites) {
         & pwsh -NoProfile -NonInteractive -File (Join-Path $root $suite)

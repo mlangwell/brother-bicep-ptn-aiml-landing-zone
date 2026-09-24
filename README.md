@@ -91,7 +91,13 @@ Before running the script, confirm that you have:
 
 1. [PowerShell 7 or later](https://learn.microsoft.com/powershell/scripting/install/installing-powershell).
 2. [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli).
-3. [Azure Developer CLI (`azd`)](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd).
+3. [Azure Developer CLI (`azd`)](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd)
+  1.25.5 or later. Check it with `azd version`, and upgrade with
+  `winget upgrade Microsoft.Azd` or the install page. `azure.yaml` enforces
+  this minimum. azd 1.23.4 was the first release to pass the JSON arrays in
+  `main.parameters.json` to their array parameters, such as the API Management
+  CIDR lists. Before it, provisioning fails or sends ARM a string. azd 1.25.5
+  fixed `azd down --purge` for Foundry accounts.
 4. Azure `Contributor` and `User Access Administrator` roles at the deployment
   scope.
 5. Accepted the Responsible AI terms for Azure AI services.
@@ -190,7 +196,10 @@ Replace the example values, then run:
 ```
 
 The script signs in when needed, creates or selects the named `azd`
-environment, sets the integrated-topology values, and displays the preview.
+environment, sets the integrated-topology values, runs the repository preflight,
+and displays the preview. azd runs the preflight as its `preprovision` hook for
+`-PreviewOutput Slim`, and the script runs it itself before `-PreviewOutput
+Full`. A preflight `FAIL` stops the run before anything is deployed.
 With the default `-PreviewOutput Slim` this is the condensed
 `azd provision --preview` summary. With `-PreviewOutput Full` it displays two
 preview sections:
@@ -233,7 +242,8 @@ provisioning. Any other response cancels the deployment.
 After provisioning:
 
 1. Create the reverse hub-to-spoke VNet peering. The template creates only the
-  spoke-to-hub direction.
+  spoke-to-hub direction. API Management depends on this peering, so complete it
+  before you enable the gateway; see [Deploy API Management](#deploy-api-management).
 2. Link the hub-managed private DNS zones to the spoke VNet when Azure Policy
   does not manage those links.
 3. Verify that the hub firewall permits the spoke source range and that its DNS
@@ -248,7 +258,17 @@ for the post-deployment network checks.
 
 ### Deploy API Management
 
-Enable API Management and provide its publisher contact email:
+API Management activates over the spoke's egress path. Its default route goes to
+the hub firewall, so the gateway can reach its dependencies only after the
+hub-to-spoke peering is `Connected`. Created before that, it fails with
+`ActivationFailed`. Because the template creates only the spoke-to-hub
+direction, deploy a new spoke in two passes:
+
+1. Deploy the spoke without `-DeployApiManagement`, as in [Deploy](#deploy).
+2. Have the hub owner create the hub-to-spoke peering. If you own the hub, run
+  `pwsh ./tests/scripts/Add-HubSpokePeering.ps1 -HubVnetResourceId $hubVnetResourceId`.
+  Confirm that both directions show `Connected`.
+3. Rerun the script with `-DeployApiManagement` and the publisher contact email:
 
 ```powershell
 ./Deploy-AilzIntegrated.ps1 `
@@ -260,6 +280,11 @@ Enable API Management and provide its publisher contact email:
   -ApiManagementPublisherEmail "api-owners@contoso.com" `
   -PreviewOnly
 ```
+
+Preflight enforces the order. For a new spoke it fails with
+`APIM_HUB_PEERING_MISSING` or `APIM_HUB_PEERING_NOT_CONNECTED` until the hub has a
+`Connected` peering to the spoke. It warns instead when it cannot read the hub
+VNet, or for a prepared spoke whose route table an operator owns.
 
 The deployment uses the Developer SKU and internal VNet mode. It creates the
 dedicated `api-management-subnet` at `192.168.3.128/27` and a dedicated route
@@ -396,6 +421,43 @@ These values persist in the local `azd` environment. Do not pass passwords,
 tokens, or other application secrets through `-AdditionalEnvironmentVariables`;
 store application secrets in Azure Key Vault.
 
+## Tear down
+
+Preview the teardown, then run it from the repository root:
+
+```powershell
+pwsh ./scripts/Remove-AilzEnvironment.ps1 -EnvironmentName "ailz-dev" -WhatIf
+pwsh ./scripts/Remove-AilzEnvironment.ps1 -EnvironmentName "ailz-dev"
+```
+
+`azd down` cannot tear this template down alone, because Azure AI Search
+refuses to delete a service that still has shared private links. The script:
+
+1. Checks that azd is 1.25.5 or later, before it deletes anything.
+2. Reads the subscription and resource group from the azd environment.
+3. Refuses a resource group that is not tagged `azd-env-name=<environment>`,
+  unless you pass `-AllowExternalResourceGroup`. `azd down --force` deletes
+  every resource in the group, including resources this template did not create.
+4. Shows the plan and asks you to type the resource group name. `-Force` skips
+  this prompt.
+5. Deletes each Search shared private link and waits until it is gone.
+6. Runs `azd down --force --purge`. This deletes the resource group and purges
+  its soft-deleted Key Vault, App Configuration, API Management, Foundry and Log
+  Analytics resources, which cannot then be recovered.
+7. Prints the hub-side peering that the hub owner must delete. The script never
+  changes the hub, and a `Disconnected` peering cannot be reused when the spoke
+  is redeployed.
+
+To tear down by hand instead, run the same steps in order:
+
+```powershell
+az search shared-private-link-resource list --service-name "<search-service>" --resource-group "<spoke-resource-group>" --output table
+az search shared-private-link-resource delete --name "<link-name>" --service-name "<search-service>" --resource-group "<spoke-resource-group>" --yes
+azd down --force --purge
+```
+
+Then have the hub owner delete the hub-side peering to the deleted spoke.
+
 ## Troubleshooting
 
 ### `Required command '<name>' was not found`
@@ -418,6 +480,39 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 Do not weaken the machine-wide execution policy unless your organization has
 approved that change.
+
+### `this project requires a version of azd within the range '>= 1.25.5'`
+
+The installed azd is older than this template's minimum; see the
+[prerequisites](#prerequisites). Upgrade it and rerun:
+
+```powershell
+winget upgrade Microsoft.Azd
+azd version
+```
+
+`error unmarshalling Bicep template parameters: invalid character ... after object
+key:value pair` has the same cause: an azd older than 1.23.4 reading a project
+whose `azure.yaml` does not declare the minimum. Preflight reports it as
+`AZD_VERSION_UNSUPPORTED`.
+
+### API Management fails with `ActivationFailed`
+
+`Connectivity to Monitoring failed` or `Connectivity to MetricsExtension failed`
+means the gateway could not reach its dependencies through the hub. The usual
+cause is a missing hub-to-spoke peering, not the NSG, which already allows Azure
+Monitor. A failed service must be deleted before it can be redeployed
+(`ServiceInFailedProvisioningState`). Delete it, create the peering, confirm both
+directions show `Connected`, and rerun with `-DeployApiManagement`. See
+[Deploy API Management](#deploy-api-management).
+
+### Preflight reports `APIM_HUB_PEERING_MISSING` or `APIM_HUB_PEERING_NOT_CONNECTED`
+
+The hub has no `Connected` peering to the spoke, so the gateway would fail
+activation. On a first deployment, deploy the spoke without
+`-DeployApiManagement` and have the hub-to-spoke peering created first.
+`Initiated` means one direction is missing. `Disconnected` means the spoke VNet
+was deleted or recreated: delete the hub-side peering and create it again.
 
 ### Azure sign-in opens the wrong tenant
 

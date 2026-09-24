@@ -288,6 +288,38 @@ Adopt option A with these rules.
 - The public `Azure/AI-Landing-Zones` documentation needs a coordinated update
   if this fork's behaviour is published upstream.
 
+## Addendum: live proof, 2026-09-23
+
+The proof ran pass 1 only: the gateway alone, from the flat parameters, with
+Developer x1 in a throwaway hub and spoke that were deleted afterwards.
+
+- **Ingress source (decision 4 and 5).** This was settled by changing only the
+  source of `AllowHttpsFromHubFirewall`. A jumpbox reached the gateway through
+  firewall DNAT with the whole AzureFirewallSubnet (`10.100.0.0/26`), got HTTP
+  000 with the frontend IP (`10.100.0.4/32`), and got 200 again once `/26` was
+  restored. Azure Firewall presents a back-end instance IP, so the default holds
+  and the `EgressNextHopIp/32` fallback cannot work behind Azure Firewall. NSG
+  changes took about three minutes to apply.
+- **Not verified.** GatewayLogs never showed the post-SNAT source: a gateway
+  with no API writes no rows, and the module's own diagnostic setting passes
+  `logCategoriesAndGroups: []`, which enables no log category. That setting is
+  unchanged and remains an open finding. Pass 2 was not run, so the Entra
+  audience, `apiManagementConfiguration` and the 401, 200 and 429 checks are
+  still unverified, as are Premium, the shared platform gateway, the developer
+  application and the GitHub pipeline.
+- **Defects found and their disposition:**
+  - The script serialized a single ingress prefix as a JSON string, which
+    corrupted the azd environment. Fixed in `9d4349d`.
+  - Five NSG rule descriptions exceeded the 140-character ARM limit. Fixed in
+    `9d4349d`.
+  - azd 1.22.5 cannot carry an array through the quoted `${VAR}` bindings.
+    Resolved by an azd floor, with the bindings unchanged
+    ([ADR-003](003-azd-lifecycle-floor-and-ordering.md)).
+  - The gateway needs the hub-to-spoke peering before it is created. Resolved by
+    a two-pass flow that preflight enforces (ADR-003).
+  - Teardown was blocked by Search shared private links and an azd crash.
+    Resolved by an ordered teardown script and the azd floor (ADR-003).
+
 ## Change notes
 
 This repository has no `CHANGELOG.md`; these notes record the change.

@@ -2,6 +2,10 @@
 name: azure-ai-lz
 metadata:
   template: azure-ai-lz
+# 1.23.4 carries JSON arrays through ${VAR} substitution into array parameters
+# (azure-dev#6694); 1.25.5 lets azd down purge Foundry accounts (azure-dev#8493).
+requiredVersions:
+  azd: ">= 1.25.5"
 infra:
   provider: bicep
   path: .
