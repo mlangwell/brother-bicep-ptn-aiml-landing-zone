@@ -1356,6 +1356,32 @@ function Test-ApiManagementHubPeering {
             return
         }
 
+        # The template sets the flags on a new spoke's spoke-to-hub peering.
+        # Where an operator owns that peering, it must also let the spoke reach
+        # the hub and accept the replies the hub firewall forwards.
+        $templateOwnsSpokePeering = $shape -eq 'NewSpoke' -and (Resolve-DeployFlag -P $P -Key 'hubIntegrationCreateHubPeering' -Default $true)
+        $spokeSegments = if ($spokeVnetId) { $spokeVnetId.Trim('/').Split('/') } else { @() }
+        if (-not $templateOwnsSpokePeering -and $spokeSegments.Count -ge 8) {
+            $spokePeerings = @()
+            try {
+                $spokeRaw = & az network vnet peering list --subscription $spokeSegments[1] --resource-group $spokeSegments[3] --vnet-name $spokeSegments[7] -o json 2>$null
+                if ($LASTEXITCODE -eq 0 -and $spokeRaw) { $spokePeerings = @(($spokeRaw -join "`n") | ConvertFrom-Json) }
+            }
+            catch {
+                $spokePeerings = @()
+            }
+            $toHub = @($spokePeerings | Where-Object { $_ -and [string](Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetwork') 'id') -ieq $hubRid })
+            $spokeBlocked = @($toHub | Where-Object {
+                    (Get-PeeringProperty $_ 'allowVirtualNetworkAccess') -eq $false -or (Get-PeeringProperty $_ 'allowForwardedTraffic') -eq $false
+                })
+            if ($toHub.Count -gt 0 -and $spokeBlocked.Count -eq $toHub.Count) {
+                Add-Finding -Severity $severity -Code 'APIM_SPOKE_PEERING_BLOCKED' `
+                    -Message "Spoke VNet peering '$($spokeBlocked[0].name)' to hub VNet '$hubName' disallows virtual network access or forwarded traffic, so the gateway cannot reach the hub firewall or receive the replies it forwards, and activation fails." `
+                    -Hint "Allow both on the spoke-side peering: az network vnet peering update --ids `"$($spokeBlocked[0].id)`" --allow-vnet-access true --allow-forwarded-traffic true."
+                return
+            }
+        }
+
         $unsynced = @($usable | Where-Object {
                 $sync = [string](Get-PeeringProperty $_ 'peeringSyncLevel')
                 $sync -and $sync -ne 'FullyInSync'

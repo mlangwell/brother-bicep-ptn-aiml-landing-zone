@@ -284,10 +284,14 @@ direction, deploy a new spoke in two passes:
 Preflight enforces the order. For a new spoke it fails with
 `APIM_HUB_PEERING_MISSING` or `APIM_HUB_PEERING_NOT_CONNECTED` until the hub has a
 `Connected` peering to the spoke, and with `APIM_HUB_PEERING_ACCESS_BLOCKED` when
-that peering disallows access to the spoke. It warns instead when it cannot read
-the hub VNet, when the target resource group is not known yet, or for a prepared
-spoke whose route table an operator owns. A `Connected` peering is necessary but
-not sufficient: the hub firewall must also allow the gateway's dependencies, as
+that peering disallows access to the spoke. Where you own the spoke-to-hub
+peering yourself (`HUB_INTEGRATION_CREATE_HUB_PEERING=false`), it also fails with
+`APIM_SPOKE_PEERING_BLOCKED` when that peering disallows access or forwarded
+traffic. It warns instead of failing when it cannot read the hub VNet, when the
+only match is a `Connected` peering it cannot attribute to this spoke because
+the target resource group is not known yet, and for a prepared spoke whose
+route table an operator owns. A `Connected` peering is necessary but not
+sufficient: the hub firewall must also allow the gateway's dependencies, as
 listed below.
 
 The deployment uses the Developer SKU and internal VNet mode. It creates the
@@ -458,9 +462,16 @@ does nothing destructive until its checks pass:
   is redeployed.
 
 The script deletes the shared private links with your Azure CLI identity, and
-`azd down` runs as your azd identity. Both need rights on the resource group. If
-`azd down` fails after the links are deleted, fix the reported error and rerun
-the script; it finds no links and runs `azd down` again.
+`azd down` runs as your azd identity. Both need rights on the resource group.
+
+If `azd down` fails before it deletes the resource group, fix the reported error
+and rerun the script; it finds no links and runs `azd down` again. azd deletes
+the group before it purges, so a purge failure cannot be redone by a rerun. The
+script then names the `az keyvault`, `az appconfig`, `az apim deletedservice` and
+`az cognitiveservices account` commands that list and purge what remains.
+Purging a soft-deleted Key Vault needs
+[permissions at subscription level](https://learn.microsoft.com/azure/key-vault/general/key-vault-recovery),
+which a role assigned only on the resource group does not grant.
 
 To tear down by hand instead, run the same steps in order:
 
@@ -531,6 +542,8 @@ was deleted or recreated: delete the hub-side peering and create it again.
 
 `APIM_HUB_PEERING_ACCESS_BLOCKED` means the peering is `Connected` but the hub
 side disallows access to the spoke; the hub owner must allow it.
+`APIM_SPOKE_PEERING_BLOCKED` means a spoke-to-hub peering that you own disallows
+access or forwarded traffic; allow both on it.
 `APIM_HUB_PEERING_UNVERIFIED` means preflight could not read the hub VNet, or
 could not tell this spoke's peering from another spoke's because
 `AZURE_RESOURCE_GROUP` is not set yet. Pass `AZURE_SUBSCRIPTION_ID` and

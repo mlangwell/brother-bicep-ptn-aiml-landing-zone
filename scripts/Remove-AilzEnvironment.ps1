@@ -21,8 +21,10 @@
     you to type the resource group name. It then deletes the Search shared
     private links, waits until they are gone, and runs
     `azd down --force --purge`. Finally it prints the hub-side peering that the
-    hub owner must remove. It never changes the hub. If azd down fails after the
-    links are deleted, fix the reported error and rerun the script.
+    hub owner must remove. It never changes the hub. If azd down fails before
+    it deletes the resource group, fix the reported error and rerun the script.
+    azd down deletes the group before it purges, so if the purge fails the
+    script names the commands that finish it.
 
     Run it from the azd project root, where `azd down` finds azure.yaml.
 
@@ -89,6 +91,12 @@ function Get-LinkState {
     param([Parameter(Mandatory)] $Link, [Parameter(Mandatory)][string] $Name)
 
     return [string](Get-OptionalProperty -InputObject (Get-OptionalProperty -InputObject $Link -Name 'properties') -Name $Name)
+}
+
+function Get-PurgeGuidance {
+    return ('List what remains soft-deleted with az keyvault list-deleted, az appconfig list-deleted, az apim deletedservice list ' +
+        'and az cognitiveservices account list-deleted, then purge each item with az keyvault purge, az appconfig purge, ' +
+        'az apim deletedservice purge or az cognitiveservices account purge.')
 }
 
 function Get-AzdMinimumVersion {
@@ -236,8 +244,7 @@ $hubVnetResourceId = Get-AzdEnvironmentValue -Name 'HUB_INTEGRATION_HUB_VNET_RES
 $groupExists = (Invoke-AzJson -Arguments @('group', 'exists', '--name', $resourceGroupName, '--subscription', $subscriptionId)) -eq $true
 if (-not $groupExists) {
     Write-Host "Resource group '$resourceGroupName' does not exist in subscription '$subscriptionId'. Nothing to delete."
-    Write-Host 'If a soft-deleted Key Vault, Foundry account or API Management service remains, purge it with az keyvault purge,'
-    Write-Host 'az cognitiveservices account purge or az apim deletedservice purge.'
+    Write-Host "If an earlier azd down deleted it and then failed while purging, soft-deleted resources may remain. $(Get-PurgeGuidance)"
     return
 }
 
@@ -283,7 +290,24 @@ foreach ($entry in $links) {
 
 & azd down --force --purge --environment $EnvironmentName
 if ($LASTEXITCODE -ne 0) {
-    throw "azd down failed with exit code $LASTEXITCODE. No Search shared private links remain, so fix the error above and rerun this script to finish the teardown."
+    # azd down deletes the resource group before it purges, so whether the
+    # group survived decides whether a rerun can finish the teardown.
+    $downExitCode = $LASTEXITCODE
+    $groupRemains = $null
+    try {
+        $groupRemains = (Invoke-AzJson -Arguments @('group', 'exists', '--name', $resourceGroupName, '--subscription', $subscriptionId)) -eq $true
+    }
+    catch {
+        $groupRemains = $null
+    }
+    $failure = "azd down failed with exit code $downExitCode. No Search shared private links remain"
+    if ($groupRemains -eq $true) {
+        throw "$failure, and resource group '$resourceGroupName' still exists, so fix the error above and rerun this script."
+    }
+    if ($groupRemains -eq $false) {
+        throw "$failure. azd down deleted resource group '$resourceGroupName' and then failed, most likely while purging, which a rerun cannot redo. $(Get-PurgeGuidance)"
+    }
+    throw "$failure. If resource group '$resourceGroupName' still exists, fix the error above and rerun this script. Otherwise azd down failed after deleting it, most likely while purging. $(Get-PurgeGuidance)"
 }
 
 if ($hubVnetResourceId) {

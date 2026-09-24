@@ -99,7 +99,7 @@ prompts. No Bicep resource, parameter, output or binding changes.
 | Compatibility | 1 | `main.parameters.json` and every pinned binding unchanged; `Compatibility.Tests.ps1` passes |
 | Deployability | 2 | Array parameters reach ARM as arrays (harness); a gateway is never created before its egress path works |
 | Fail early | 3 | Each failure is reported before any Azure write, with its remedy |
-| Safe teardown | 4 | Nothing is deleted before the version, sign-in, ownership and confirmation checks; links are gone before the group is deleted; a failed `azd down` can be rerun |
+| Safe teardown | 4 | Nothing is deleted before the version, sign-in, ownership and confirmation checks; links are gone before the group is deleted; a failed `azd down` is reported with the step that finishes it |
 | Operability | 5 | One documented command per lifecycle step |
 
 ## Alternatives considered
@@ -183,10 +183,19 @@ prompts. No Bicep resource, parameter, output or binding changes.
      when a Connected hub-side peering has `allowVirtualNetworkAccess` false. A
      prepared spoke warns instead, because an operator owns its route table.
    - `APIM_HUB_PEERING_UNVERIFIED` warns when the hub is unreadable, or when the
-     target resource group is unknown and the only evidence is a Connected
-     peering holding the gateway subnet, which could belong to another spoke.
-     With no such peering at all, the spoke cannot be peered, so that still
-     fails. An unsynchronized peering warns with `APIM_HUB_PEERING_NOT_SYNCED`.
+     target resource group is unknown and the only match is a Connected peering
+     holding the gateway subnet, which could belong to another spoke. Without a
+     Connected match it still fails: this spoke's peering, if it existed, would
+     be among the matches. An unsynchronized peering warns with
+     `APIM_HUB_PEERING_NOT_SYNCED`.
+   - Where an operator owns the spoke-to-hub peering
+     (`hubIntegrationCreateHubPeering=false`, or a prepared spoke), preflight
+     also reads it once the spoke VNet ID is known.
+     `APIM_SPOKE_PEERING_BLOCKED` reports it when `allowVirtualNetworkAccess` or
+     `allowForwardedTraffic` is false, because the gateway then cannot reach the
+     hub firewall or receive the replies it forwards. It is a failure for a new
+     spoke and a warning for a prepared spoke. The template sets both flags on the
+     peering it creates, so that peering is not read.
    - A Connected peering is necessary, not sufficient: the gateway also needs
      the hub firewall to allow its dependencies, which preflight cannot see.
    - `Deploy-AilzIntegrated.ps1 -PreviewOutput Full` runs the preflight before
@@ -198,8 +207,12 @@ prompts. No Bicep resource, parameter, output or binding changes.
    - a resource group tagged `azd-env-name=<environment>`, unless
      `-AllowExternalResourceGroup` is passed;
    - the typed confirmation.
-   It never changes the hub. If `azd down` fails after the links are deleted,
-   rerunning the script finds no links and retries `azd down`.
+   It never changes the hub. azd down deletes the resource group before it
+   purges. If it fails while the group still exists, rerunning the script finds
+   no links and retries `azd down`. If the group is already gone, the purge
+   failed and a rerun cannot redo it. The script checks which case applies and
+   names the `az ... list-deleted` and `az ... purge` commands for Key Vault,
+   App Configuration, API Management and Foundry.
 
 ## Consequences
 
@@ -257,7 +270,11 @@ prompts. No Bicep resource, parameter, output or binding changes.
 - **Needs a live run:** a two-pass `-DeployApiManagement` deployment with
   `APIM_HUB_PEERING_CONNECTED` before the second pass; `Remove-AilzEnvironment.ps1`
   against a real environment with Search shared private links; azd 1.34.2
-  provisioning the quoted array bindings against ARM.
+  provisioning the quoted array bindings against ARM; gateway activation with
+  the hub-side peering's `allowForwardedTraffic` set to false. Preflight does not
+  require that flag, because gateway egress starts in the spoke. Most Microsoft
+  sources support that reading, but the `az` help and the peering
+  troubleshooter describe the flag differently.
 
 ## Documentation impact
 
