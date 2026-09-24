@@ -86,6 +86,11 @@ prompts. No Bicep resource, parameter, output or binding changes.
   ([Learn](https://learn.microsoft.com/azure/search/troubleshoot-shared-private-link-resources#deleting-a-shared-private-link-resource)).
   Learn does not document `LockedSPLResourceFound` itself; the proof error text
   is the evidence for it.
+- **`azd auth login --check-status`.** In both the 1.22.5 and 1.34.2 source it
+  "always return[s] a zero exit code". With an expired sign-in on this
+  workstation, its JSON output reported `"status": "unauthenticated"`, while its
+  text output on 1.22.5 printed "Logged in to Azure as ...". Only the JSON status
+  can be trusted.
 
 ## Prioritized characteristics
 
@@ -94,7 +99,7 @@ prompts. No Bicep resource, parameter, output or binding changes.
 | Compatibility | 1 | `main.parameters.json` and every pinned binding unchanged; `Compatibility.Tests.ps1` passes |
 | Deployability | 2 | Array parameters reach ARM as arrays (harness); a gateway is never created before its egress path works |
 | Fail early | 3 | Each failure is reported before any Azure write, with its remedy |
-| Safe teardown | 4 | Nothing is deleted before the version check, ownership check and confirmation; links are gone before the group is deleted |
+| Safe teardown | 4 | Nothing is deleted before the version, sign-in, ownership and confirmation checks; links are gone before the group is deleted; a failed `azd down` can be rerun |
 | Operability | 5 | One documented command per lifecycle step |
 
 ## Alternatives considered
@@ -140,9 +145,9 @@ prompts. No Bicep resource, parameter, output or binding changes.
 
 ### Teardown
 
-- **A. A teardown script (selected)** that checks the azd version and resource
-  group ownership, confirms, deletes the links, runs `azd down --force --purge`
-  and reports the hub-side peering.
+- **A. A teardown script (selected)** that checks the azd version, the azd
+  sign-in and resource group ownership, confirms, deletes the links, runs
+  `azd down --force --purge` and reports the hub-side peering.
 - **B. An azd `predown` hook.** Native to azd, but hooks run before azd's own
   delete prompt and cannot see `--force`. Declining the prompt would leave a
   running environment without its Search private links.
@@ -158,10 +163,14 @@ prompts. No Bicep resource, parameter, output or binding changes.
    lifecycle.
    - `azure.yaml` declares `requiredVersions.azd: ">= 1.25.5"`, which azd
      enforces itself.
-   - Preflight mirrors it as `AZD_VERSION_UNSUPPORTED` when Azure lookups run,
-     for paths azd does not gate: the full preview, standalone runs and consumer
-     projects with their own `azure.yaml`. Deterministic CI runs
-     (`-SkipAzureLookups`) do not depend on the runner's azd.
+   - Preflight mirrors it as `AZD_VERSION_UNSUPPORTED` for paths azd does not
+     gate: the full preview, standalone runs and consumer projects with their
+     own `azure.yaml`. It checks only when Azure lookups run and the parameters
+     file carries `${...}` tokens that azd substitutes. It reads the azd on PATH,
+     because azd tells a hook nothing about the azd that runs it. The GitHub
+     protected-delivery path deploys the resolver's literal parameters with
+     `az deployment` and never runs azd, so that runner's azd cannot block it.
+     Deterministic CI runs (`-SkipAzureLookups`) are not checked either.
    - The pinned bindings stay as they are.
 2. **API Management activates in a second pass.**
    - `Test-ApiManagementHubPeering` lists the hub VNet's peerings when the
@@ -169,16 +178,28 @@ prompts. No Bicep resource, parameter, output or binding changes.
      `VNET_RESOURCE_ID` or, for a prepared spoke, `existingVnetResourceId`.
      Otherwise it matches a peering to a VNet in the target resource group whose
      address space holds the gateway subnet.
-   - A new spoke fails with `APIM_HUB_PEERING_MISSING` or
-     `APIM_HUB_PEERING_NOT_CONNECTED`. A prepared spoke warns, because an
-     operator owns its route table. An unreadable hub warns with
-     `APIM_HUB_PEERING_UNVERIFIED`. An unsynchronized peering warns with
-     `APIM_HUB_PEERING_NOT_SYNCED`.
+   - A new spoke fails with `APIM_HUB_PEERING_MISSING`,
+     `APIM_HUB_PEERING_NOT_CONNECTED`, or `APIM_HUB_PEERING_ACCESS_BLOCKED`
+     when a Connected hub-side peering has `allowVirtualNetworkAccess` false. A
+     prepared spoke warns instead, because an operator owns its route table.
+   - `APIM_HUB_PEERING_UNVERIFIED` warns when the hub is unreadable, or when the
+     target resource group is unknown and the only evidence is a Connected
+     peering holding the gateway subnet, which could belong to another spoke.
+     With no such peering at all, the spoke cannot be peered, so that still
+     fails. An unsynchronized peering warns with `APIM_HUB_PEERING_NOT_SYNCED`.
+   - A Connected peering is necessary, not sufficient: the gateway also needs
+     the hub firewall to allow its dependencies, which preflight cannot see.
    - `Deploy-AilzIntegrated.ps1 -PreviewOutput Full` runs the preflight before
      its What-If.
 3. **Teardown is ordered.** `scripts/Remove-AilzEnvironment.ps1` implements
-   option A. It refuses a resource group without `azd-env-name=<environment>`
-   unless `-AllowExternalResourceGroup` is passed, and it never changes the hub.
+   option A. Before deleting anything it requires:
+   - azd 1.25.5 or the project's `azure.yaml` floor, whichever is higher;
+   - a successful azd sign-in, read from the JSON status;
+   - a resource group tagged `azd-env-name=<environment>`, unless
+     `-AllowExternalResourceGroup` is passed;
+   - the typed confirmation.
+   It never changes the hub. If `azd down` fails after the links are deleted,
+   rerunning the script finds no links and retries `azd down`.
 
 ## Consequences
 
@@ -212,25 +233,29 @@ prompts. No Bicep resource, parameter, output or binding changes.
 ## Security and identity
 
 - Preflight stays read-only.
-- The teardown runs as the operator's `az` and `azd` identities. It deletes
-  only in the environment's resource group, only after confirmation, and
-  refuses a group azd did not create unless told otherwise.
+- The teardown deletes the shared private links as the operator's `az`
+  identity and runs `azd down` as the operator's azd identity; both need rights
+  on the resource group. It deletes only in the environment's resource group,
+  only after confirmation, and refuses a group azd did not create unless told
+  otherwise.
 - No secrets, keys or public access change.
 
 ## Adoption and rollback
 
 - **Order:** version floor, preflight gate, preview ordering, teardown script,
-  documentation. All are local.
+  contract suite in the local gate and CI, documentation. All are local.
 - **Rollback:** revert the commit. Nothing is deployed by this change.
 
 ## Compliance verification
 
 - Offline: the azd harness above; the `requiredVersions` probe against azd
   1.22.5 and 1.34.2; `tests/contracts/Test-AzdOperationsContract.ps1`, which runs
-  the real preflight, deploy and teardown scripts against recorded stand-ins for
-  `az` and `azd`; the local gate.
+  the real preflight, deploy and teardown scripts against stand-ins for `az` and
+  `azd` that answer only the expected scope. It is mutation-checked, runs in the
+  local gate and in CI, and passed under PowerShell 7.6.6 on Linux as well as on
+  Windows.
 - **Needs a live run:** a two-pass `-DeployApiManagement` deployment with
-  `APIM_HUB_PEERING_CONNECTED` before pass 2; `Remove-AilzEnvironment.ps1`
+  `APIM_HUB_PEERING_CONNECTED` before the second pass; `Remove-AilzEnvironment.ps1`
   against a real environment with Search shared private links; azd 1.34.2
   provisioning the quoted array bindings against ARM.
 

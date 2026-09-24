@@ -283,8 +283,12 @@ direction, deploy a new spoke in two passes:
 
 Preflight enforces the order. For a new spoke it fails with
 `APIM_HUB_PEERING_MISSING` or `APIM_HUB_PEERING_NOT_CONNECTED` until the hub has a
-`Connected` peering to the spoke. It warns instead when it cannot read the hub
-VNet, or for a prepared spoke whose route table an operator owns.
+`Connected` peering to the spoke, and with `APIM_HUB_PEERING_ACCESS_BLOCKED` when
+that peering disallows access to the spoke. It warns instead when it cannot read
+the hub VNet, when the target resource group is not known yet, or for a prepared
+spoke whose route table an operator owns. A `Connected` peering is necessary but
+not sufficient: the hub firewall must also allow the gateway's dependencies, as
+listed below.
 
 The deployment uses the Developer SKU and internal VNet mode. It creates the
 dedicated `api-management-subnet` at `192.168.3.128/27` and a dedicated route
@@ -431,22 +435,32 @@ pwsh ./scripts/Remove-AilzEnvironment.ps1 -EnvironmentName "ailz-dev"
 ```
 
 `azd down` cannot tear this template down alone, because Azure AI Search
-refuses to delete a service that still has shared private links. The script:
+refuses to delete a service that still has shared private links. The script
+does nothing destructive until its checks pass:
 
-1. Checks that azd is 1.25.5 or later, before it deletes anything.
-2. Reads the subscription and resource group from the azd environment.
-3. Refuses a resource group that is not tagged `azd-env-name=<environment>`,
+1. Checks that azd is 1.25.5 or later, and at least the minimum in your
+  `azure.yaml`.
+2. Checks that azd is signed in. `azd auth login --check-status` always exits 0,
+  so the script reads its JSON status. The Azure CLI sign-in is checked by the
+  first `az` call.
+3. Reads the subscription and resource group from the azd environment.
+4. Refuses a resource group that is not tagged `azd-env-name=<environment>`,
   unless you pass `-AllowExternalResourceGroup`. `azd down --force` deletes
   every resource in the group, including resources this template did not create.
-4. Shows the plan and asks you to type the resource group name. `-Force` skips
+5. Shows the plan and asks you to type the resource group name. `-Force` skips
   this prompt.
-5. Deletes each Search shared private link and waits until it is gone.
-6. Runs `azd down --force --purge`. This deletes the resource group and purges
+6. Deletes each Search shared private link and waits until it is gone.
+7. Runs `azd down --force --purge`. This deletes the resource group and purges
   its soft-deleted Key Vault, App Configuration, API Management, Foundry and Log
   Analytics resources, which cannot then be recovered.
-7. Prints the hub-side peering that the hub owner must delete. The script never
+8. Prints the hub-side peering that the hub owner must delete. The script never
   changes the hub, and a `Disconnected` peering cannot be reused when the spoke
   is redeployed.
+
+The script deletes the shared private links with your Azure CLI identity, and
+`azd down` runs as your azd identity. Both need rights on the resource group. If
+`azd down` fails after the links are deleted, fix the reported error and rerun
+the script; it finds no links and runs `azd down` again.
 
 To tear down by hand instead, run the same steps in order:
 
@@ -494,7 +508,8 @@ azd version
 `error unmarshalling Bicep template parameters: invalid character ... after object
 key:value pair` has the same cause: an azd older than 1.23.4 reading a project
 whose `azure.yaml` does not declare the minimum. Preflight reports it as
-`AZD_VERSION_UNSUPPORTED`.
+`AZD_VERSION_UNSUPPORTED` when azd substitutes the parameters file. It reads the
+azd on PATH, so put the azd you run first on PATH.
 
 ### API Management fails with `ActivationFailed`
 
@@ -513,6 +528,13 @@ activation. On a first deployment, deploy the spoke without
 `-DeployApiManagement` and have the hub-to-spoke peering created first.
 `Initiated` means one direction is missing. `Disconnected` means the spoke VNet
 was deleted or recreated: delete the hub-side peering and create it again.
+
+`APIM_HUB_PEERING_ACCESS_BLOCKED` means the peering is `Connected` but the hub
+side disallows access to the spoke; the hub owner must allow it.
+`APIM_HUB_PEERING_UNVERIFIED` means preflight could not read the hub VNet, or
+could not tell this spoke's peering from another spoke's because
+`AZURE_RESOURCE_GROUP` is not set yet. Pass `AZURE_SUBSCRIPTION_ID` and
+`AZURE_RESOURCE_GROUP` through `-AdditionalEnvironmentVariables`.
 
 ### Azure sign-in opens the wrong tenant
 

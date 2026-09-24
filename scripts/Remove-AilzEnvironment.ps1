@@ -15,13 +15,14 @@
         networkInjections, so `azd down` fails before deleting anything
         (azure-dev#8493).
 
-    The script checks the azd version, resolves the target from the azd
-    environment, refuses a resource group that azd did not create for this
-    environment unless told otherwise, shows the plan, and asks you to type the
-    resource group name. It then deletes the Search shared private links, waits
-    until they are gone, and runs `azd down --force --purge`. Finally it prints
-    the hub-side peering that the hub owner must remove. It never changes the
-    hub.
+    The script checks the azd version and that azd is signed in, resolves the
+    target from the azd environment, refuses a resource group that azd did not
+    create for this environment unless told otherwise, shows the plan, and asks
+    you to type the resource group name. It then deletes the Search shared
+    private links, waits until they are gone, and runs
+    `azd down --force --purge`. Finally it prints the hub-side peering that the
+    hub owner must remove. It never changes the hub. If azd down fails after the
+    links are deleted, fix the reported error and rerun the script.
 
     Run it from the azd project root, where `azd down` finds azure.yaml.
 
@@ -70,6 +71,10 @@ $ErrorActionPreference = 'Stop'
 
 $searchApiVersion = '2025-05-01'
 $pollSeconds = 15
+# azd down purges Foundry accounts only from 1.25.5 (azure-dev#8493), whatever
+# azure.yaml declares. azd down enforces a higher azure.yaml floor itself, so
+# the larger of the two is checked before anything is deleted.
+$teardownMinimumAzd = [version]'1.25.5'
 
 function Get-OptionalProperty {
     param($InputObject, [Parameter(Mandatory)][string] $Name)
@@ -87,13 +92,14 @@ function Get-LinkState {
 }
 
 function Get-AzdMinimumVersion {
-    $path = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'azure.yaml'
-    if (-not (Test-Path -LiteralPath $path)) {
-        throw "Cannot find $path, which declares the minimum azd version."
+    param([Parameter(Mandatory)][string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
     }
-    $match = [regex]::Match((Get-Content -LiteralPath $path -Raw), '(?m)^requiredVersions:[ \t]*\r?\n(?:[ \t]+.*\r?\n)*?[ \t]+azd:[ \t]*["'']?>=[ \t]*(\d+\.\d+\.\d+)')
+    $match = [regex]::Match((Get-Content -LiteralPath $Path -Raw), '(?m)^requiredVersions:[ \t]*\r?\n(?:[ \t]+.*\r?\n)*?[ \t]+azd:[ \t]*["'']?>=[ \t]*(\d+\.\d+\.\d+)')
     if (-not $match.Success) {
-        throw "Cannot read requiredVersions.azd from $path."
+        return $null
     }
     return [version]$match.Groups[1].Value
 }
@@ -108,6 +114,25 @@ function Get-AzdVersion {
         throw 'Unable to parse the azd version.'
     }
     return [version]$match.Value
+}
+
+function Assert-AzdSignedIn {
+    # --check-status always exits 0, and its text output can name a cached
+    # account whose token has expired, so read the JSON status instead.
+    $raw = & azd auth login --check-status --output json 2>$null
+    $status = ''
+    if ($raw) {
+        try {
+            $status = [string](Get-OptionalProperty -InputObject ($raw -join "`n" | ConvertFrom-Json) -Name 'status')
+        }
+        catch {
+            $status = ''
+        }
+    }
+    if ($status -cne 'success') {
+        throw ("azd is not signed in (azd auth login --check-status reports '$(if ($status) { $status } else { 'no status' })'), so azd down would fail after the shared private links were deleted. " +
+            "Run 'azd auth login', then rerun this script.")
+    }
 }
 
 function Get-AzdEnvironmentValue {
@@ -186,17 +211,22 @@ foreach ($command in @('az', 'azd')) {
         throw "Required command '$command' was not found. Install it and try again."
     }
 }
-if (-not (Test-Path -LiteralPath (Join-Path -Path (Get-Location) -ChildPath 'azure.yaml'))) {
+$projectFile = Join-Path -Path (Get-Location) -ChildPath 'azure.yaml'
+if (-not (Test-Path -LiteralPath $projectFile)) {
     throw 'Run this script from the azd project root, where azd down finds azure.yaml.'
 }
 
-# azd enforces the same floor when azd down loads azure.yaml, but only after
-# this script has deleted the shared private links, so check it first.
-$minimumAzd = Get-AzdMinimumVersion
+# Check what azd down needs before this script deletes the shared private links.
+$minimumAzd = $teardownMinimumAzd
+$declaredAzd = Get-AzdMinimumVersion -Path $projectFile
+if ($declaredAzd -and $declaredAzd -gt $minimumAzd) {
+    $minimumAzd = $declaredAzd
+}
 $currentAzd = Get-AzdVersion
 if ($currentAzd -lt $minimumAzd) {
-    throw "azd $currentAzd is older than $minimumAzd, the minimum in azure.yaml requiredVersions. Older releases cannot purge Foundry accounts. Upgrade azd (https://aka.ms/azure-dev/install) and rerun."
+    throw "azd $currentAzd is older than $minimumAzd. azd down needs 1.25.5 or later to purge Foundry accounts, and azure.yaml can require a later release. Upgrade azd (https://aka.ms/azure-dev/install) and rerun."
 }
+Assert-AzdSignedIn
 
 $subscriptionId = Get-AzdEnvironmentValue -Name 'AZURE_SUBSCRIPTION_ID' -Required
 $resourceGroupName = Get-AzdEnvironmentValue -Name 'AZURE_RESOURCE_GROUP' -Required
@@ -253,7 +283,7 @@ foreach ($entry in $links) {
 
 & azd down --force --purge --environment $EnvironmentName
 if ($LASTEXITCODE -ne 0) {
-    throw "azd down failed with exit code $LASTEXITCODE."
+    throw "azd down failed with exit code $LASTEXITCODE. No Search shared private links remain, so fix the error above and rerun this script to finish the teardown."
 }
 
 if ($hubVnetResourceId) {

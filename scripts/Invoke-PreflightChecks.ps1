@@ -17,7 +17,8 @@
       * Observability parameters that would produce telemetry split-brain
       * BYO resources (VNet, Private DNS zones, Log Analytics, App Insights,
         route table) that the operator promised but that don't actually exist
-      * An azd older than the `requiredVersions.azd` floor in azure.yaml
+      * An azd older than the `requiredVersions.azd` floor in azure.yaml, when
+        azd substitutes the parameters file
       * An API Management gateway requested before the hub-to-spoke peering
         it activates through is Connected
 
@@ -405,6 +406,8 @@ function Get-AzdVersion {
 }
 
 function Test-Tooling {
+    param([string]$ParametersPath)
+
     foreach ($t in 'pwsh', 'az') {
         if (-not (Get-Command $t -ErrorAction SilentlyContinue)) {
             Add-Finding -Severity FAIL -Code 'TOOL_MISSING' -Message "'$t' is not on PATH." `
@@ -416,18 +419,23 @@ function Test-Tooling {
             -Hint "Install Azure Developer CLI (https://aka.ms/azd-install)."
     }
     elseif (-not $SkipAzureLookups) {
-        $minimumAzd = Get-AzdMinimumVersion
+        # The floor matters only when azd substitutes this parameters file. The
+        # GitHub protected-delivery path deploys a resolved, literal file with
+        # az deployment and never runs azd, so its runner's azd is irrelevant.
+        $usesAzdSubstitution = $ParametersPath -and (Test-Path -LiteralPath $ParametersPath) -and
+            ((Get-Content -LiteralPath $ParametersPath -Raw) -match '\$\{[A-Za-z_][A-Za-z0-9_]*')
+        $minimumAzd = if ($usesAzdSubstitution) { Get-AzdMinimumVersion } else { $null }
         if ($minimumAzd) {
             $currentAzd = Get-AzdVersion
             if (-not $currentAzd) {
                 Add-Finding -Severity WARN -Code 'AZD_VERSION_UNKNOWN' `
-                    -Message "Could not read the azd version. This template requires azd $minimumAzd or later." `
+                    -Message "Could not read the version of the azd on PATH. This template requires azd $minimumAzd or later." `
                     -Hint "Run 'azd version' and upgrade if it reports an older release (https://aka.ms/azure-dev/install)."
             }
             elseif ($currentAzd -lt $minimumAzd) {
                 Add-Finding -Severity FAIL -Code 'AZD_VERSION_UNSUPPORTED' `
-                    -Message "azd $currentAzd is older than $minimumAzd, the minimum in azure.yaml requiredVersions. Older releases substitute a JSON array such as API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES into main.parameters.json as a string, so provisioning fails, and 'azd down --purge' cannot read Foundry accounts." `
-                    -Hint 'Upgrade azd, for example with winget upgrade Microsoft.Azd (https://aka.ms/azure-dev/install), then rerun.'
+                    -Message "The azd on PATH is $currentAzd, older than $minimumAzd, the minimum in azure.yaml requiredVersions. Older releases substitute a JSON array such as API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES into main.parameters.json as a string, so provisioning fails, and 'azd down --purge' cannot read Foundry accounts." `
+                    -Hint 'Upgrade azd, for example with winget upgrade Microsoft.Azd (https://aka.ms/azure-dev/install), then rerun. If you run a newer azd from another location, put it first on PATH.'
             }
         }
     }
@@ -1299,6 +1307,7 @@ function Test-ApiManagementHubPeering {
 
     if ($spokeVnetId) {
         $spokeLabel = "spoke VNet '$spokeVnetId'"
+        $spokeIdentified = $true
         $candidates = @($peerings | Where-Object { [string](Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetwork') 'id') -ieq $spokeVnetId })
     }
     else {
@@ -1309,6 +1318,7 @@ function Test-ApiManagementHubPeering {
         $subscriptionId = if ($envValues.ContainsKey('AZURE_SUBSCRIPTION_ID')) { [string]$envValues['AZURE_SUBSCRIPTION_ID'] } else { '' }
         $resourceGroup = if ($envValues.ContainsKey('AZURE_RESOURCE_GROUP')) { [string]$envValues['AZURE_RESOURCE_GROUP'] } else { '' }
         $groupScope = if ($subscriptionId -and $resourceGroup) { "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/" } else { '' }
+        $spokeIdentified = [bool]$groupScope
         $spokeLabel = if ($groupScope) { "a VNet in resource group '$resourceGroup' containing $apimPrefix" } else { "a VNet containing $apimPrefix" }
         $candidates = @($peerings | Where-Object {
                 $remoteId = [string](Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetwork') 'id')
@@ -1326,7 +1336,27 @@ function Test-ApiManagementHubPeering {
     $hubName = if ($hubSegments.Count -ge 8) { $hubSegments[7] } else { $hubRid }
     $connected = @($candidates | Where-Object { [string](Get-PeeringProperty $_ 'peeringState') -eq 'Connected' })
     if ($connected.Count -gt 0) {
-        $unsynced = @($connected | Where-Object {
+        if (-not $spokeIdentified) {
+            # Without a spoke VNet ID or target resource group, a Connected
+            # peering to an address space holding the gateway subnet may belong
+            # to another spoke, so it is not evidence about this one.
+            Add-Finding -Severity WARN -Code 'APIM_HUB_PEERING_UNVERIFIED' `
+                -Message "Hub VNet '$hubName' peering '$($connected[0].name)' to $spokeLabel is Connected, but the target resource group is not known yet, so it may belong to another spoke." `
+                -Hint "Set AZURE_SUBSCRIPTION_ID and AZURE_RESOURCE_GROUP in the azd environment, for example through -AdditionalEnvironmentVariables, so preflight can match this spoke. $twoPassHint"
+            return
+        }
+
+        # Hub-to-spoke traffic, including the firewall's replies to the gateway,
+        # needs 'Allow access to remote virtual network' on the hub-side peering.
+        $usable = @($connected | Where-Object { (Get-PeeringProperty $_ 'allowVirtualNetworkAccess') -ne $false })
+        if ($usable.Count -eq 0) {
+            Add-Finding -Severity $severity -Code 'APIM_HUB_PEERING_ACCESS_BLOCKED' `
+                -Message "Hub VNet '$hubName' peering '$($connected[0].name)' to $spokeLabel is Connected, but allowVirtualNetworkAccess is false, so traffic from the hub to the spoke is blocked and the gateway fails activation." `
+                -Hint "Have the hub owner allow access on the hub-side peering: az network vnet peering update --ids `"$($connected[0].id)`" --allow-vnet-access true."
+            return
+        }
+
+        $unsynced = @($usable | Where-Object {
                 $sync = [string](Get-PeeringProperty $_ 'peeringSyncLevel')
                 $sync -and $sync -ne 'FullyInSync'
             })
@@ -1337,7 +1367,7 @@ function Test-ApiManagementHubPeering {
         }
         else {
             Add-Finding -Severity INFO -Code 'APIM_HUB_PEERING_CONNECTED' `
-                -Message "Hub VNet '$hubName' peering '$($connected[0].name)' to $spokeLabel is Connected, so the gateway can activate over the hub egress path."
+                -Message "Hub VNet '$hubName' peering '$($usable[0].name)' to $spokeLabel is Connected. The gateway also needs the hub firewall to allow its dependencies; see the API Management section of the README."
         }
         return
     }
@@ -2138,7 +2168,7 @@ Write-Host "[preflight] Parameters file: $ParametersFile"
 if ($AzdEnv) { Write-Host "[preflight] azd environment: $AzdEnv" }
 if ($SkipAzureLookups) { Write-Host "[preflight] Azure lookups: SKIPPED" -ForegroundColor Yellow }
 
-Test-Tooling
+Test-Tooling -ParametersPath $ParametersFile
 
 $effective = Get-EffectiveParameters -Path $ParametersFile
 if ($effective.Count -eq 0) {

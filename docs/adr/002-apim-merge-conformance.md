@@ -290,8 +290,10 @@ Adopt option A with these rules.
 
 ## Addendum: live proof, 2026-09-23
 
-The proof ran pass 1 only: the gateway alone, from the flat parameters, with
-Developer x1 in a throwaway hub and spoke that were deleted afterwards.
+The proof ran its first phase only: the gateway alone, from the flat
+parameters, with Developer x1 in a throwaway hub and spoke that were deleted
+afterwards. Its phases are not the two deployment passes of
+[ADR-003](003-azd-lifecycle-floor-and-ordering.md).
 
 - **Ingress source (decision 4 and 5).** This was settled by changing only the
   source of `AllowHttpsFromHubFirewall`. A jumpbox reached the gateway through
@@ -303,10 +305,10 @@ Developer x1 in a throwaway hub and spoke that were deleted afterwards.
 - **Not verified.** GatewayLogs never showed the post-SNAT source: a gateway
   with no API writes no rows, and the module's own diagnostic setting passes
   `logCategoriesAndGroups: []`, which enables no log category. That setting is
-  unchanged and remains an open finding. Pass 2 was not run, so the Entra
-  audience, `apiManagementConfiguration` and the 401, 200 and 429 checks are
-  still unverified, as are Premium, the shared platform gateway, the developer
-  application and the GitHub pipeline.
+  unchanged and remains an open finding. The second phase, the workload API from
+  `apiManagementConfiguration`, was not run, so the Entra audience and the 401,
+  200 and 429 checks are still unverified, as are Premium, the shared platform
+  gateway, the developer application and the GitHub pipeline.
 - **Defects found and their disposition:**
   - The script serialized a single ingress prefix as a JSON string, which
     corrupted the azd environment. Fixed in `9d4349d`.
