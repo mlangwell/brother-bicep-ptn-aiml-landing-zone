@@ -101,7 +101,7 @@ var injectionRules = [
     // plane and data plane." Always present so dev/test rehearse prod.
     name: 'AllowAzureLoadBalancerInbound'
     properties: {
-      description: 'Required on Premium, harmless on Developer: Azure infrastructure load balancer health probe (6390). If this probe fails on Premium, ALL inbound control-plane and data-plane access is blocked.'
+      description: 'Azure infrastructure load balancer health probe (6390). Critical on Premium: probe failure blocks all inbound access. Harmless on Developer.'
       protocol: 'Tcp'
       access: 'Allow'
       direction: 'Inbound'
@@ -178,7 +178,7 @@ var injectionRules = [
     // plain HTTP by design. This is NOT general internet egress.
     name: 'AllowCertificateValidationOutbound'
     properties: {
-      description: 'Required: validation and management of Microsoft-managed and customer-managed certificates (CRL/OCSP over HTTP, port 80). Not a general internet egress rule.'
+      description: 'Required: certificate validation via CRL/OCSP over HTTP (port 80). Not a general internet egress rule.'
       protocol: 'Tcp'
       access: 'Allow'
       direction: 'Outbound'
@@ -195,7 +195,7 @@ var injectionRules = [
     // policy is validate-azure-ad-token, so for this workload it is REQUIRED.
     name: 'AllowMicrosoftEntraIdOutbound'
     properties: {
-      description: 'Required by this workload: the inbound API policy uses validate-azure-ad-token, which needs Microsoft Entra ID and Microsoft Graph (443). Learn lists this as optional only because gateways that do not authenticate callers against Entra do not need it.'
+      description: 'Required by this workload: the inbound policy validate-azure-ad-token needs Microsoft Entra ID and Microsoft Graph (443).'
       protocol: 'Tcp'
       access: 'Allow'
       direction: 'Outbound'
@@ -214,7 +214,7 @@ var injectionRules = [
     // on-premises forwarder reached over ExpressRoute.
     name: 'AllowDnsOutbound'
     properties: {
-      description: 'Required: DNS resolution (53, UDP and TCP). Internal mode has no Azure-provided public name resolution for the gateway, and the gateway must resolve the backend Foundry private endpoint, so a working resolver path is mandatory.'
+      description: 'Required: DNS resolution (53, UDP and TCP). Internal mode needs a working resolver to reach the backend Foundry private endpoint.'
       protocol: '*'
       access: 'Allow'
       direction: 'Outbound'
@@ -259,7 +259,7 @@ var restrictedIngressRules = [
   {
     name: 'AllowRateLimitSyncInbound'
     properties: {
-      description: 'Sync rate-limit counters between gateway units (UDP 4290), within the injection subnet only. Needed by multi-unit Premium; harmless on Developer.'
+      description: 'Sync rate-limit counters between gateway units (UDP 4290), inside the injection subnet only. Needed by multi-unit Premium.'
       protocol: 'Udp'
       access: 'Allow'
       direction: 'Inbound'

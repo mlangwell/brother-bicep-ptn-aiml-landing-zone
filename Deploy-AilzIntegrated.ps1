@@ -84,6 +84,14 @@ function Assert-ApiManagementIngressSource {
         throw 'API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES must be a JSON array of hub firewall source CIDRs.'
     }
 
+    # A bare JSON string parses and counts as one element, so the count check
+    # alone cannot tell ["10.0.0.0/26"] from "10.0.0.0/26". azd stores the scalar
+    # form with broken escaping, which leaves the environment unreadable, and the
+    # Bicep array parameter would reject it, so reject the shape here.
+    if (-not $SerializedValue.TrimStart().StartsWith('[')) {
+        throw 'API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES must be a JSON array of hub firewall source CIDRs.'
+    }
+
     if ($ingressPrefixes.Count -eq 0) {
         throw 'At least one hub firewall source CIDR is required when DeployApiManagement is enabled.'
     }
@@ -503,7 +511,10 @@ try {
                 'If the hub uses Azure Firewall, pass -ApiManagementIngressSourceAddressPrefixes with that subnet range.')
             @("$EgressNextHopIp/32")
         }
-        $settings['API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES'] = ConvertTo-Json -InputObject $resolvedIngressPrefixes -Compress
+        # Assigning the output of an if statement unwraps a single-element array
+        # to a scalar, which would serialize as a JSON string rather than a JSON
+        # array, so re-wrap before serializing.
+        $settings['API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES'] = ConvertTo-Json -InputObject @($resolvedIngressPrefixes) -Compress
         Assert-ApiManagementIngressSource -SerializedValue ([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)
     }
 
