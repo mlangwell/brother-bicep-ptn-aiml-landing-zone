@@ -287,12 +287,12 @@ Preflight enforces the order. For a new spoke it fails with
 that peering disallows access to the spoke. Where you own the spoke-to-hub
 peering yourself (`HUB_INTEGRATION_CREATE_HUB_PEERING=false`), it also fails with
 `APIM_SPOKE_PEERING_BLOCKED` when that peering disallows access or forwarded
-traffic. It warns instead of failing when it cannot read the hub VNet, when the
-only match is a `Connected` peering it cannot attribute to this spoke because
-the target resource group is not known yet, and for a prepared spoke whose
-route table an operator owns. A `Connected` peering is necessary but not
-sufficient: the hub firewall must also allow the gateway's dependencies, as
-listed below.
+traffic. It warns instead of failing when it cannot read the hub VNet or a
+spoke-to-hub peering you own, when the only match is a `Connected` peering it
+cannot attribute to this spoke because the target resource group is not known
+yet, and for a prepared spoke whose route table an operator owns. A `Connected`
+peering is necessary but not sufficient: the hub firewall must also allow the
+gateway's dependencies, as listed below.
 
 The deployment uses the Developer SKU and internal VNet mode. It creates the
 dedicated `api-management-subnet` at `192.168.3.128/27` and a dedicated route
@@ -543,7 +543,9 @@ was deleted or recreated: delete the hub-side peering and create it again.
 `APIM_HUB_PEERING_ACCESS_BLOCKED` means the peering is `Connected` but the hub
 side disallows access to the spoke; the hub owner must allow it.
 `APIM_SPOKE_PEERING_BLOCKED` means a spoke-to-hub peering that you own disallows
-access or forwarded traffic; allow both on it.
+access or forwarded traffic; allow both on it. `APIM_SPOKE_PEERING_UNVERIFIED`
+means preflight could not read that peering, or found none back to the hub;
+confirm both flags on it yourself.
 `APIM_HUB_PEERING_UNVERIFIED` means preflight could not read the hub VNet, or
 could not tell this spoke's peering from another spoke's because
 `AZURE_RESOURCE_GROUP` is not set yet. Pass `AZURE_SUBSCRIPTION_ID` and

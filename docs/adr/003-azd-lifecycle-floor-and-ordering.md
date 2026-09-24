@@ -190,12 +190,14 @@ prompts. No Bicep resource, parameter, output or binding changes.
      `APIM_HUB_PEERING_NOT_SYNCED`.
    - Where an operator owns the spoke-to-hub peering
      (`hubIntegrationCreateHubPeering=false`, or a prepared spoke), preflight
-     also reads it once the spoke VNet ID is known.
+     also reads it. It takes the spoke VNet from the recorded ID or, failing
+     that, from the remote VNet of the matched hub-side peering.
      `APIM_SPOKE_PEERING_BLOCKED` reports it when `allowVirtualNetworkAccess` or
      `allowForwardedTraffic` is false, because the gateway then cannot reach the
      hub firewall or receive the replies it forwards. It is a failure for a new
-     spoke and a warning for a prepared spoke. The template sets both flags on the
-     peering it creates, so that peering is not read.
+     spoke and a warning for a prepared spoke. `APIM_SPOKE_PEERING_UNVERIFIED`
+     warns when that peering cannot be read or does not exist. The template sets
+     both flags on the peering it creates, so that peering is not read.
    - A Connected peering is necessary, not sufficient: the gateway also needs
      the hub firewall to allow its dependencies, which preflight cannot see.
    - `Deploy-AilzIntegrated.ps1 -PreviewOutput Full` runs the preflight before

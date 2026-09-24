@@ -48,6 +48,9 @@ function Reset-Stub {
     $global:StubPeerings = @()
     $global:StubSpokePeerings = @()
     $global:StubPeeringListFails = $false
+    $global:StubSpokePeeringListFails = $false
+    $global:StubGroupExistsFails = $false
+    $global:StubAzdDownBreaksGroupLookup = $false
     $global:StubPwshExitCode = 0
     $global:StubGroupExists = $true
     $global:StubGroupTags = @{ 'azd-env-name' = 'contract' }
@@ -96,12 +99,13 @@ function az {
                 (Test-Argument $joined '--resource-group' 'rg-hub') -and (Test-Argument $joined '--vnet-name' 'vnet-hub')
             $spokeVnetScope = $spokeScope -and (Test-Argument $joined '--resource-group' 'rg-spoke') -and (Test-Argument $joined '--vnet-name' 'vnet-spoke')
             if ($global:StubPeeringListFails -or -not ($hubScope -or $spokeVnetScope)) { $global:LASTEXITCODE = 1; return }
+            if ($spokeVnetScope -and $global:StubSpokePeeringListFails) { $global:LASTEXITCODE = 1; return }
             $listed = if ($hubScope) { $global:StubPeerings } else { $global:StubSpokePeerings }
             return (ConvertTo-Json -InputObject @($listed) -Depth 10 -AsArray)
         }
         '^network vnet show' { return "{`"id`":`"$hubVnetId`",`"name`":`"vnet-hub`",`"addressSpace`":{`"addressPrefixes`":[`"10.100.0.0/22`"]},`"subnets`":[]}" }
         '^group exists' {
-            if (-not ($spokeScope -and (Test-Argument $joined '--name' 'rg-spoke'))) { $global:LASTEXITCODE = 1; return }
+            if ($global:StubGroupExistsFails -or -not ($spokeScope -and (Test-Argument $joined '--name' 'rg-spoke'))) { $global:LASTEXITCODE = 1; return }
             return ($(if ($global:StubGroupExists) { 'true' } else { 'false' }))
         }
         '^group show' {
@@ -158,6 +162,7 @@ function azd {
         # azd down deletes the resource group before it purges.
         '^down ' {
             if ($global:StubAzdDownDeletesGroup) { $global:StubGroupExists = $false }
+            if ($global:StubAzdDownBreaksGroupLookup) { $global:StubGroupExistsFails = $true }
             $global:LASTEXITCODE = $global:StubAzdDownExitCode
             return
         }
@@ -418,6 +423,28 @@ try {
     $result = Invoke-Preflight
     Assert-True (Test-Finding $result 'WARN' 'APIM_SPOKE_PEERING_BLOCKED') 'A prepared spoke whose peering blocks access must warn.'
 
+    # An operator-owned spoke peering that cannot be checked must not pass silently.
+    Reset-Stub; Set-ApiManagementEnvironment
+    $global:StubAzdEnv.VNET_RESOURCE_ID = $spokeVnetId
+    $global:StubAzdEnv.HUB_INTEGRATION_CREATE_HUB_PEERING = 'false'
+    $global:StubPeerings = @(New-Peering -RemoteId $spokeVnetId -State 'Connected')
+    $global:StubSpokePeeringListFails = $true
+    $result = Invoke-Preflight
+    Assert-True (Test-Finding $result 'WARN' 'APIM_SPOKE_PEERING_UNVERIFIED') 'An unreadable operator-owned spoke peering must warn.'
+
+    Reset-Stub; Set-ApiManagementEnvironment
+    $global:StubAzdEnv.HUB_INTEGRATION_CREATE_HUB_PEERING = 'false'
+    $global:StubPeerings = @(New-Peering -RemoteId $spokeVnetId -State 'Connected')
+    $global:StubSpokePeerings = @(New-Peering -RemoteId $hubVnetId -State 'Connected' -AllowForwarded $false -LocalVnetId $spokeVnetId)
+    $result = Invoke-Preflight
+    Assert-True (Test-Finding $result 'FAIL' 'APIM_SPOKE_PEERING_BLOCKED') 'Without a recorded VNet ID, the matched hub-side peering must name the spoke to check.'
+    Assert-True (@($global:StubCalls -match "^az network vnet peering list --subscription $spokeSubscription --resource-group rg-spoke --vnet-name vnet-spoke").Count -eq 1) 'The derived spoke VNet must be read in its own scope.'
+
+    Reset-Stub; Set-ApiManagementEnvironment -PreparedSpoke
+    $global:StubPeerings = @(New-Peering -RemoteId $spokeVnetId -State 'Connected')
+    $result = Invoke-Preflight
+    Assert-True (Test-Finding $result 'WARN' 'APIM_SPOKE_PEERING_UNVERIFIED') 'A spoke VNet with no peering back to the hub must warn.'
+
     Reset-Stub; Set-ApiManagementEnvironment
     $global:StubAzdEnv.DEPLOY_API_MANAGEMENT = 'false'
     $result = Invoke-Preflight
@@ -544,6 +571,13 @@ try {
     Assert-True ($message -match "azd down deleted resource group 'rg-spoke' and then failed") 'A purge failure after the group is deleted must be named.'
     Assert-True ($message -match 'az appconfig purge' -and $message -match 'az keyvault purge' -and $message -match 'az apim deletedservice purge' -and $message -match 'az cognitiveservices account purge') 'The purge guidance must cover every type azd down purges.'
     Assert-True (-not ($message -match 'rerun this script\.')) 'A rerun cannot finish a purge once the group is gone, so it must not be offered.'
+
+    Reset-Stub; Set-TeardownEnvironment
+    $global:StubAzdDownExitCode = 1
+    $global:StubAzdDownBreaksGroupLookup = $true
+    $message = Invoke-Teardown @{ Force = $true }
+    Assert-True ($message -match "If resource group 'rg-spoke' still exists, fix the error above and rerun this script\. Otherwise azd down failed after deleting it") 'When the group cannot be checked, both outcomes must be explained.'
+    Assert-True ($message -match 'az appconfig purge' -and $message -match 'az keyvault purge') 'When the group cannot be checked, the purge guidance must be given too.'
 
     Reset-Stub; Set-TeardownEnvironment
     $global:StubGroupExists = $false

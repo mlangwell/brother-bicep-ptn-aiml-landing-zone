@@ -1358,27 +1358,42 @@ function Test-ApiManagementHubPeering {
 
         # The template sets the flags on a new spoke's spoke-to-hub peering.
         # Where an operator owns that peering, it must also let the spoke reach
-        # the hub and accept the replies the hub firewall forwards.
+        # the hub and accept the replies the hub firewall forwards. Without a
+        # recorded spoke VNet ID, the matched hub-side peering names the spoke.
         $templateOwnsSpokePeering = $shape -eq 'NewSpoke' -and (Resolve-DeployFlag -P $P -Key 'hubIntegrationCreateHubPeering' -Default $true)
-        $spokeSegments = if ($spokeVnetId) { $spokeVnetId.Trim('/').Split('/') } else { @() }
-        if (-not $templateOwnsSpokePeering -and $spokeSegments.Count -ge 8) {
-            $spokePeerings = @()
-            try {
-                $spokeRaw = & az network vnet peering list --subscription $spokeSegments[1] --resource-group $spokeSegments[3] --vnet-name $spokeSegments[7] -o json 2>$null
-                if ($LASTEXITCODE -eq 0 -and $spokeRaw) { $spokePeerings = @(($spokeRaw -join "`n") | ConvertFrom-Json) }
+        if (-not $templateOwnsSpokePeering) {
+            $spokeVnetForCheck = if ($spokeVnetId) { $spokeVnetId } else { [string](Get-PeeringProperty (Get-PeeringProperty $usable[0] 'remoteVirtualNetwork') 'id') }
+            $spokeSegments = $spokeVnetForCheck.Trim('/').Split('/')
+            $toHub = $null
+            if ($spokeSegments.Count -ge 8) {
+                try {
+                    $spokeRaw = & az network vnet peering list --subscription $spokeSegments[1] --resource-group $spokeSegments[3] --vnet-name $spokeSegments[7] -o json 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        $spokePeerings = @(if ($spokeRaw) { ($spokeRaw -join "`n") | ConvertFrom-Json })
+                        $toHub = @($spokePeerings | Where-Object { $_ -and [string](Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetwork') 'id') -ieq $hubRid })
+                    }
+                }
+                catch {
+                    $toHub = $null
+                }
             }
-            catch {
-                $spokePeerings = @()
+
+            if ($null -eq $toHub -or $toHub.Count -eq 0) {
+                $spokeName = if ($spokeVnetForCheck) { "spoke VNet '$spokeVnetForCheck'" } else { 'the spoke VNet' }
+                Add-Finding -Severity WARN -Code 'APIM_SPOKE_PEERING_UNVERIFIED' `
+                    -Message "Could not read the peering from $spokeName to hub VNet '$hubName'. You own that peering, and the gateway needs it to allow virtual network access and forwarded traffic." `
+                    -Hint 'Grant the deploying identity Reader on the spoke VNet so preflight can check it, or confirm both flags on the spoke-side peering with az network vnet peering show.'
             }
-            $toHub = @($spokePeerings | Where-Object { $_ -and [string](Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetwork') 'id') -ieq $hubRid })
-            $spokeBlocked = @($toHub | Where-Object {
-                    (Get-PeeringProperty $_ 'allowVirtualNetworkAccess') -eq $false -or (Get-PeeringProperty $_ 'allowForwardedTraffic') -eq $false
-                })
-            if ($toHub.Count -gt 0 -and $spokeBlocked.Count -eq $toHub.Count) {
-                Add-Finding -Severity $severity -Code 'APIM_SPOKE_PEERING_BLOCKED' `
-                    -Message "Spoke VNet peering '$($spokeBlocked[0].name)' to hub VNet '$hubName' disallows virtual network access or forwarded traffic, so the gateway cannot reach the hub firewall or receive the replies it forwards, and activation fails." `
-                    -Hint "Allow both on the spoke-side peering: az network vnet peering update --ids `"$($spokeBlocked[0].id)`" --allow-vnet-access true --allow-forwarded-traffic true."
-                return
+            else {
+                $spokeBlocked = @($toHub | Where-Object {
+                        (Get-PeeringProperty $_ 'allowVirtualNetworkAccess') -eq $false -or (Get-PeeringProperty $_ 'allowForwardedTraffic') -eq $false
+                    })
+                if ($spokeBlocked.Count -eq $toHub.Count) {
+                    Add-Finding -Severity $severity -Code 'APIM_SPOKE_PEERING_BLOCKED' `
+                        -Message "Spoke VNet peering '$($spokeBlocked[0].name)' to hub VNet '$hubName' disallows virtual network access or forwarded traffic, so the gateway cannot reach the hub firewall or receive the replies it forwards, and activation fails." `
+                        -Hint "Allow both on the spoke-side peering: az network vnet peering update --ids `"$($spokeBlocked[0].id)`" --allow-vnet-access true --allow-forwarded-traffic true."
+                    return
+                }
             }
         }
 
