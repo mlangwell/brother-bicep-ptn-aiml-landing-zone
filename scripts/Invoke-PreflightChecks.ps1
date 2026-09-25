@@ -17,6 +17,10 @@
       * Observability parameters that would produce telemetry split-brain
       * BYO resources (VNet, Private DNS zones, Log Analytics, App Insights,
         route table) that the operator promised but that don't actually exist
+      * An azd older than the `requiredVersions.azd` floor in azure.yaml, when
+        azd substitutes the parameters file
+      * An API Management gateway requested before the hub-to-spoke peering
+        it activates through is Connected
 
     The script is **read-only**: it never modifies Azure state. It is safe to
     run from a `preprovision` hook, from CI, or interactively at any time.
@@ -317,6 +321,33 @@ function Resolve-DeployFlag {
     return [bool](ConvertTo-Bool $raw)
 }
 
+function Get-ApiManagementTopologyShape {
+    # The two network shapes in which this template creates a gateway, mirroring
+    # _apiManagementTopologySupported in main.bicep (ADR-001, ADR-002). Returns
+    # 'NewSpoke' when this deployment owns the injection subnet, its NSG and its
+    # route table; 'PreparedSpoke' when an operator owns them (useExistingVNet
+    # with deploySubnets=false); otherwise ''.
+    param([hashtable]$P)
+
+    $apimCommon = (ConvertTo-Bool $P['networkIsolation']) -and
+        (Get-StringValue $P['deploymentMode']) -eq 'ailz-integrated' -and
+        -not (ConvertTo-Bool $P['deployAzureFirewall']) -and
+        -not [string]::IsNullOrWhiteSpace((Get-StringValue $P['hubIntegrationHubVnetResourceId']))
+    if (-not $apimCommon) { return '' }
+
+    $useExistingVNet = ConvertTo-Bool $P['useExistingVNet']
+    if (-not $useExistingVNet -and
+        (Resolve-DeployFlag -P $P -Key 'deployNsgs' -Default $true) -and
+        -not [string]::IsNullOrWhiteSpace((Get-StringValue $P['hubIntegrationEgressNextHopIp'])) -and
+        [string]::IsNullOrWhiteSpace((Get-StringValue $P['hubIntegrationExistingRouteTableResourceId']))) {
+        return 'NewSpoke'
+    }
+    if ($useExistingVNet -and -not (Resolve-DeployFlag -P $P -Key 'deploySubnets' -Default $true)) {
+        return 'PreparedSpoke'
+    }
+    return ''
+}
+
 function Test-BooleanParameterValues {
     param([hashtable]$P)
 
@@ -349,7 +380,34 @@ function Test-BooleanParameterValues {
 # Deterministic topology checks (no Azure calls)
 # --------------------------------------------------------------------------
 
+function Get-AzdMinimumVersion {
+    # azd enforces requiredVersions.azd itself whenever it loads azure.yaml.
+    # This mirrors that floor for runs azd does not gate: a standalone
+    # preflight, the script's full What-If preview, or a consumer project whose
+    # own azure.yaml wires this script as its preprovision hook.
+    $path = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'azure.yaml'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $match = [regex]::Match((Get-Content -LiteralPath $path -Raw), '(?m)^requiredVersions:[ \t]*\r?\n(?:[ \t]+.*\r?\n)*?[ \t]+azd:[ \t]*["'']?>=[ \t]*(\d+\.\d+\.\d+)')
+    if (-not $match.Success) { return $null }
+    return [version]$match.Groups[1].Value
+}
+
+function Get-AzdVersion {
+    try {
+        $raw = & azd version --output json 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $raw) { return $null }
+        $match = [regex]::Match([string](($raw -join "`n" | ConvertFrom-Json).azd.version), '^\d+\.\d+\.\d+')
+        if (-not $match.Success) { return $null }
+        return [version]$match.Value
+    }
+    catch {
+        return $null
+    }
+}
+
 function Test-Tooling {
+    param([string]$ParametersPath)
+
     foreach ($t in 'pwsh', 'az') {
         if (-not (Get-Command $t -ErrorAction SilentlyContinue)) {
             Add-Finding -Severity FAIL -Code 'TOOL_MISSING' -Message "'$t' is not on PATH." `
@@ -359,6 +417,27 @@ function Test-Tooling {
     if (-not (Get-Command azd -ErrorAction SilentlyContinue)) {
         Add-Finding -Severity WARN -Code 'AZD_MISSING' -Message "'azd' is not on PATH — env-var values cannot be sourced from the azd environment." `
             -Hint "Install Azure Developer CLI (https://aka.ms/azd-install)."
+    }
+    elseif (-not $SkipAzureLookups) {
+        # The floor matters only when azd substitutes this parameters file. The
+        # GitHub protected-delivery path deploys a resolved, literal file with
+        # az deployment and never runs azd, so its runner's azd is irrelevant.
+        $usesAzdSubstitution = $ParametersPath -and (Test-Path -LiteralPath $ParametersPath) -and
+            ((Get-Content -LiteralPath $ParametersPath -Raw) -match '\$\{[A-Za-z_][A-Za-z0-9_]*')
+        $minimumAzd = if ($usesAzdSubstitution) { Get-AzdMinimumVersion } else { $null }
+        if ($minimumAzd) {
+            $currentAzd = Get-AzdVersion
+            if (-not $currentAzd) {
+                Add-Finding -Severity WARN -Code 'AZD_VERSION_UNKNOWN' `
+                    -Message "Could not read the version of the azd on PATH. This template requires azd $minimumAzd or later." `
+                    -Hint "Run 'azd version' and upgrade if it reports an older release (https://aka.ms/azure-dev/install)."
+            }
+            elseif ($currentAzd -lt $minimumAzd) {
+                Add-Finding -Severity FAIL -Code 'AZD_VERSION_UNSUPPORTED' `
+                    -Message "The azd on PATH is $currentAzd, older than $minimumAzd, the minimum in azure.yaml requiredVersions. Older releases substitute a JSON array such as API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES into main.parameters.json as a string, so provisioning fails, and 'azd down --purge' cannot read Foundry accounts." `
+                    -Hint 'Upgrade azd, for example with winget upgrade Microsoft.Azd (https://aka.ms/azure-dev/install), then rerun. If you run a newer azd from another location, put it first on PATH.'
+            }
+        }
     }
     if ($PSVersionTable.PSVersion.Major -lt 7) {
         Add-Finding -Severity WARN -Code 'PWSH_OLD' -Message "Running on PowerShell $($PSVersionTable.PSVersion). pwsh 7+ is recommended."
@@ -465,8 +544,8 @@ function Test-Topology {
 
     if ($deployApiManagement) {
         $publisherEmail = (Get-StringValue $P['apiManagementPublisherEmail']).Trim()
-        $hubVnetResourceId = (Get-StringValue $P['hubIntegrationHubVnetResourceId']).Trim()
         $ingressPrefixes = Get-ArrayValue $P['apiManagementIngressSourceAddressPrefixes']
+        $directCallerPrefixes = Get-ArrayValue $P['apiManagementDirectCallerAddressPrefixes']
 
         if ($publisherEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
             Add-Finding -Severity FAIL -Code 'APIM_PUBLISHER_EMAIL_INVALID' `
@@ -474,34 +553,64 @@ function Test-Topology {
                 -Hint 'Set API_MANAGEMENT_PUBLISHER_EMAIL to the operational owner of the API Management instance.'
         }
 
-        if (-not $netIso -or $mode -ne 'ailz-integrated' -or $useExistingVNet -or $deployFw -or -not $deployNsgs -or
-            [string]::IsNullOrWhiteSpace($hubVnetResourceId) -or [string]::IsNullOrWhiteSpace($egressIp) -or
-            -not [string]::IsNullOrWhiteSpace($existingRt)) {
+        # Two supported network shapes (ADR-002): a new spoke whose injection
+        # subnet, NSG and route table this deployment owns, or a prepared spoke
+        # whose injection subnet an operator owns.
+        $apimShape = Get-ApiManagementTopologyShape -P $P
+        $apimNewSpoke = $apimShape -eq 'NewSpoke'
+        $apimPreparedSpoke = $apimShape -eq 'PreparedSpoke'
+
+        if (-not $apimNewSpoke -and -not $apimPreparedSpoke) {
             Add-Finding -Severity FAIL -Code 'APIM_TOPOLOGY_UNSUPPORTED' `
-                -Message 'API Management requires networkIsolation=true, deploymentMode=ailz-integrated, a new spoke VNet with managed NSGs and route table, a hub VNet resource ID, and a hub firewall next-hop IP.' `
-                -Hint 'Use Deploy-AilzIntegrated.ps1 with a new spoke; existing VNets and platform-owned route tables are not supported for API Management.'
+                -Message 'API Management requires networkIsolation=true, deploymentMode=ailz-integrated, a hub VNet resource ID and no local firewall. It also needs either a new spoke with managed NSGs, a hub firewall next-hop IP and no platform-owned route table, or a prepared spoke (useExistingVNet=true, deploySubnets=false) whose injection subnet an operator owns.' `
+                -Hint 'Use Deploy-AilzIntegrated.ps1 for a new spoke. API Management does not support updating subnets in an existing VNet (useExistingVNet=true with deploySubnets=true).'
+        }
+
+        if ($apimPreparedSpoke) {
+            Add-Finding -Severity WARN -Code 'APIM_PREPARED_SUBNET_OBLIGATION' `
+                -Message 'API Management will be injected into an operator-prepared subnet. This deployment does not manage that subnet, its NSG or its route table.' `
+                -Hint 'Before provisioning, confirm the subnet is undelegated and carries the rule set in modules/networking/api-management-injection-nsg.bicep, including the hub-firewall-only ingress rules. It must also route the ApiManagement service tag to Internet whenever 0.0.0.0/0 goes to a firewall.'
+        }
+        else {
+            try {
+                if ($ingressPrefixes.Count -eq 0) {
+                    throw 'At least one CIDR is required.'
+                }
+
+                foreach ($entry in $ingressPrefixes) {
+                    $cidr = (Get-StringValue $entry).Trim()
+                    if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$') {
+                        throw "'$cidr' is not an IPv4 CIDR."
+                    }
+                    Get-CidrRange -Cidr $cidr | Out-Null
+                    if ($cidr -eq '0.0.0.0/0') {
+                        throw '0.0.0.0/0 cannot enforce hub-firewall-only ingress.'
+                    }
+                }
+            }
+            catch {
+                Add-Finding -Severity FAIL -Code 'APIM_INGRESS_PREFIXES_INVALID' `
+                    -Message "apiManagementIngressSourceAddressPrefixes must be a non-empty array of restricted IPv4 CIDRs: $_" `
+                    -Hint 'Set API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES to the hub AzureFirewallSubnet prefix. Azure Firewall source-NATs gateway traffic to a back-end instance IP in that subnet, not to its frontend IP. Deploy-AilzIntegrated.ps1 looks it up by default.'
+            }
         }
 
         try {
-            if ($ingressPrefixes.Count -eq 0) {
-                throw 'At least one CIDR is required.'
-            }
-
-            foreach ($entry in $ingressPrefixes) {
+            foreach ($entry in $directCallerPrefixes) {
                 $cidr = (Get-StringValue $entry).Trim()
                 if ($cidr -notmatch '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$') {
                     throw "'$cidr' is not an IPv4 CIDR."
                 }
                 Get-CidrRange -Cidr $cidr | Out-Null
                 if ($cidr -eq '0.0.0.0/0') {
-                    throw '0.0.0.0/0 cannot enforce hub-firewall-only ingress.'
+                    throw '0.0.0.0/0 would bypass the hub firewall for every caller.'
                 }
             }
         }
         catch {
-            Add-Finding -Severity FAIL -Code 'APIM_INGRESS_PREFIXES_INVALID' `
-                -Message "apiManagementIngressSourceAddressPrefixes must be a non-empty array of restricted IPv4 CIDRs: $_" `
-                -Hint 'For Azure Firewall DNAT, set API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES to the firewall private IPs as /32 CIDRs.'
+            Add-Finding -Severity FAIL -Code 'APIM_DIRECT_CALLER_PREFIXES_INVALID' `
+                -Message "apiManagementDirectCallerAddressPrefixes must contain only restricted IPv4 CIDRs of subnets inside this spoke: $_" `
+                -Hint 'List only in-spoke caller subnets. Callers outside the spoke must reach the gateway through the hub firewall.'
         }
     }
 
@@ -1106,6 +1215,221 @@ function Test-AzureResources {
             }
         }
     }
+}
+
+function Get-PeeringProperty {
+    # az emits peering properties flattened; also accept the raw ARM shape.
+    param($Peering, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Peering) { return $null }
+    $value = $Peering.$Name
+    if ($null -eq $value -and $null -ne $Peering.properties) { $value = $Peering.properties.$Name }
+    return $value
+}
+
+function Get-ApiManagementSubnetPrefix {
+    # Mirrors main.bicep: apiManagementConfiguration.integrationSubnetPrefix
+    # takes precedence over apiManagementSubnetPrefix, whose Bicep default is
+    # read from main.bicep when the parameters file leaves it unset.
+    param([hashtable]$P)
+    $configuration = $P['apiManagementConfiguration']
+    if ($null -ne $configuration -and -not [string]::IsNullOrWhiteSpace([string]$configuration.integrationSubnetPrefix)) {
+        return ([string]$configuration.integrationSubnetPrefix).Trim()
+    }
+    $explicit = (Get-StringValue $P['apiManagementSubnetPrefix']).Trim()
+    if ($explicit) { return $explicit }
+    $bicepPath = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'main.bicep'
+    if (Test-Path -LiteralPath $bicepPath) {
+        $match = [regex]::Match((Get-Content -LiteralPath $bicepPath -Raw), "(?m)^param apiManagementSubnetPrefix string = '([^']+)'")
+        if ($match.Success) { return $match.Groups[1].Value }
+    }
+    return ''
+}
+
+function Test-ApiManagementHubPeering {
+    # API Management activates over the spoke's egress path. In the new-spoke
+    # shape the template routes the injection subnet's 0.0.0.0/0 to the hub next
+    # hop, which is reachable only once the hub-to-spoke peering exists. Created
+    # before that peering, the gateway blackholes its dependency traffic and
+    # fails with ActivationFailed (ADR-002). The template creates only the
+    # spoke-to-hub direction, so a first deployment cannot include the gateway.
+    param([hashtable]$P)
+
+    if (-not (Resolve-DeployFlag -P $P -Key 'deployApiManagement' -Default $false)) { return }
+    if (-not [string]::IsNullOrWhiteSpace((Get-StringValue $P['existingApiManagementResourceId']))) { return }
+    $shape = Get-ApiManagementTopologyShape -P $P
+    if (-not $shape) { return }
+
+    $hubRid = (Get-StringValue $P['hubIntegrationHubVnetResourceId']).Trim()
+    $twoPassHint = 'Provision the spoke first with DEPLOY_API_MANAGEMENT=false (Deploy-AilzIntegrated.ps1 without -DeployApiManagement). Then have the hub owner create the hub-to-spoke peering, or run tests/scripts/Add-HubSpokePeering.ps1 where you own the hub. Confirm both directions show Connected, then rerun with API Management enabled.'
+
+    if ($SkipAzureLookups) {
+        Add-Finding -Severity INFO -Code 'APIM_HUB_PEERING_UNVERIFIED' `
+            -Message 'API Management needs a Connected hub-to-spoke peering before the gateway is created. Not verified because Azure lookups were skipped.' `
+            -Hint $twoPassHint
+        return
+    }
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) { return }
+
+    # The template owns the new spoke's default route to the hub, so a missing
+    # peering there always fails activation. An operator owns a prepared
+    # spoke's route table, whose default route may not use the hub.
+    $severity = if ($shape -eq 'NewSpoke') { 'FAIL' } else { 'WARN' }
+    $hubSegments = $hubRid.Trim('/').Split('/')
+    $peerings = @()
+    $listed = $false
+    if ($hubSegments.Count -ge 8) {
+        try {
+            $raw = & az network vnet peering list --subscription $hubSegments[1] --resource-group $hubSegments[3] --vnet-name $hubSegments[7] -o json 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $listed = $true
+                if ($raw) { $peerings = @(($raw -join "`n") | ConvertFrom-Json) }
+            }
+        }
+        catch {
+            $listed = $false
+        }
+    }
+    if (-not $listed) {
+        Add-Finding -Severity WARN -Code 'APIM_HUB_PEERING_UNVERIFIED' `
+            -Message "Could not list the peerings of hub VNet '$hubRid'. API Management needs a Connected hub-to-spoke peering before the gateway is created." `
+            -Hint "Grant the deploying identity Reader on the hub VNet, or confirm the peering state with the hub owner. $twoPassHint"
+        return
+    }
+
+    $envValues = Get-AzdEnvValues
+    $spokeVnetId = if ($shape -eq 'PreparedSpoke') {
+        (Get-StringValue $P['existingVnetResourceId']).Trim()
+    }
+    elseif ($envValues.ContainsKey('VNET_RESOURCE_ID')) {
+        ([string]$envValues['VNET_RESOURCE_ID']).Trim()
+    }
+    else { '' }
+
+    if ($spokeVnetId) {
+        $spokeLabel = "spoke VNet '$spokeVnetId'"
+        $spokeIdentified = $true
+        $candidates = @($peerings | Where-Object { [string](Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetwork') 'id') -ieq $spokeVnetId })
+    }
+    else {
+        # No spoke VNet ID is recorded yet, as on a first deployment. Match a
+        # peering whose remote address space holds the gateway subnet and, when
+        # the target is known, whose remote VNet is in the target resource group.
+        $apimPrefix = Get-ApiManagementSubnetPrefix -P $P
+        $subscriptionId = if ($envValues.ContainsKey('AZURE_SUBSCRIPTION_ID')) { [string]$envValues['AZURE_SUBSCRIPTION_ID'] } else { '' }
+        $resourceGroup = if ($envValues.ContainsKey('AZURE_RESOURCE_GROUP')) { [string]$envValues['AZURE_RESOURCE_GROUP'] } else { '' }
+        $groupScope = if ($subscriptionId -and $resourceGroup) { "/subscriptions/$subscriptionId/resourceGroups/$resourceGroup/" } else { '' }
+        $spokeIdentified = [bool]$groupScope
+        $spokeLabel = if ($groupScope) { "a VNet in resource group '$resourceGroup' containing $apimPrefix" } else { "a VNet containing $apimPrefix" }
+        $candidates = @($peerings | Where-Object {
+                $remoteId = [string](Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetwork') 'id')
+                $remotePrefixes = @(
+                    (Get-PeeringProperty (Get-PeeringProperty $_ 'remoteAddressSpace') 'addressPrefixes')
+                    (Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetworkAddressSpace') 'addressPrefixes')
+                ) | Where-Object { $_ }
+                $holdsSubnet = @($remotePrefixes | Where-Object {
+                        try { $apimPrefix -and (Test-CidrContains -Outer ([string]$_) -Inner $apimPrefix) } catch { $false }
+                    }).Count -gt 0
+                $holdsSubnet -and (-not $groupScope -or $remoteId.StartsWith($groupScope, [StringComparison]::OrdinalIgnoreCase))
+            })
+    }
+
+    $hubName = if ($hubSegments.Count -ge 8) { $hubSegments[7] } else { $hubRid }
+    $connected = @($candidates | Where-Object { [string](Get-PeeringProperty $_ 'peeringState') -eq 'Connected' })
+    if ($connected.Count -gt 0) {
+        if (-not $spokeIdentified) {
+            # Without a spoke VNet ID or target resource group, a Connected
+            # peering to an address space holding the gateway subnet may belong
+            # to another spoke, so it is not evidence about this one.
+            Add-Finding -Severity WARN -Code 'APIM_HUB_PEERING_UNVERIFIED' `
+                -Message "Hub VNet '$hubName' peering '$($connected[0].name)' to $spokeLabel is Connected, but the target resource group is not known yet, so it may belong to another spoke." `
+                -Hint "Set AZURE_SUBSCRIPTION_ID and AZURE_RESOURCE_GROUP in the azd environment, for example through -AdditionalEnvironmentVariables, so preflight can match this spoke. $twoPassHint"
+            return
+        }
+
+        # Hub-to-spoke traffic, including the firewall's replies to the gateway,
+        # needs 'Allow access to remote virtual network' on the hub-side peering.
+        $usable = @($connected | Where-Object { (Get-PeeringProperty $_ 'allowVirtualNetworkAccess') -ne $false })
+        if ($usable.Count -eq 0) {
+            Add-Finding -Severity $severity -Code 'APIM_HUB_PEERING_ACCESS_BLOCKED' `
+                -Message "Hub VNet '$hubName' peering '$($connected[0].name)' to $spokeLabel is Connected, but allowVirtualNetworkAccess is false, so traffic from the hub to the spoke is blocked and the gateway fails activation." `
+                -Hint "Have the hub owner allow access on the hub-side peering: az network vnet peering update --ids `"$($connected[0].id)`" --allow-vnet-access true."
+            return
+        }
+
+        # The template sets the flags on a new spoke's spoke-to-hub peering.
+        # Where an operator owns that peering, it must also let the spoke reach
+        # the hub and accept the replies the hub firewall forwards. Without a
+        # recorded spoke VNet ID, the matched hub-side peering names the spoke.
+        $templateOwnsSpokePeering = $shape -eq 'NewSpoke' -and (Resolve-DeployFlag -P $P -Key 'hubIntegrationCreateHubPeering' -Default $true)
+        if (-not $templateOwnsSpokePeering) {
+            $spokeVnetForCheck = if ($spokeVnetId) { $spokeVnetId } else { [string](Get-PeeringProperty (Get-PeeringProperty $usable[0] 'remoteVirtualNetwork') 'id') }
+            $spokeSegments = $spokeVnetForCheck.Trim('/').Split('/')
+            $toHub = $null
+            if ($spokeSegments.Count -ge 8) {
+                try {
+                    $spokeRaw = & az network vnet peering list --subscription $spokeSegments[1] --resource-group $spokeSegments[3] --vnet-name $spokeSegments[7] -o json 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        $spokePeerings = @(if ($spokeRaw) { ($spokeRaw -join "`n") | ConvertFrom-Json })
+                        $toHub = @($spokePeerings | Where-Object { $_ -and [string](Get-PeeringProperty (Get-PeeringProperty $_ 'remoteVirtualNetwork') 'id') -ieq $hubRid })
+                    }
+                }
+                catch {
+                    $toHub = $null
+                }
+            }
+
+            if ($null -eq $toHub -or $toHub.Count -eq 0) {
+                $spokeName = if ($spokeVnetForCheck) { "spoke VNet '$spokeVnetForCheck'" } else { 'the spoke VNet' }
+                Add-Finding -Severity WARN -Code 'APIM_SPOKE_PEERING_UNVERIFIED' `
+                    -Message "Could not read the peering from $spokeName to hub VNet '$hubName'. You own that peering, and the gateway needs it to allow virtual network access and forwarded traffic." `
+                    -Hint 'Grant the deploying identity Reader on the spoke VNet so preflight can check it, or confirm both flags on the spoke-side peering with az network vnet peering show.'
+            }
+            else {
+                $spokeBlocked = @($toHub | Where-Object {
+                        (Get-PeeringProperty $_ 'allowVirtualNetworkAccess') -eq $false -or (Get-PeeringProperty $_ 'allowForwardedTraffic') -eq $false
+                    })
+                if ($spokeBlocked.Count -eq $toHub.Count) {
+                    Add-Finding -Severity $severity -Code 'APIM_SPOKE_PEERING_BLOCKED' `
+                        -Message "Spoke VNet peering '$($spokeBlocked[0].name)' to hub VNet '$hubName' disallows virtual network access or forwarded traffic, so the gateway cannot reach the hub firewall or receive the replies it forwards, and activation fails." `
+                        -Hint "Allow both on the spoke-side peering: az network vnet peering update --ids `"$($spokeBlocked[0].id)`" --allow-vnet-access true --allow-forwarded-traffic true."
+                    return
+                }
+            }
+        }
+
+        $unsynced = @($usable | Where-Object {
+                $sync = [string](Get-PeeringProperty $_ 'peeringSyncLevel')
+                $sync -and $sync -ne 'FullyInSync'
+            })
+        if ($unsynced.Count -gt 0) {
+            Add-Finding -Severity WARN -Code 'APIM_HUB_PEERING_NOT_SYNCED' `
+                -Message "Hub VNet '$hubName' peering '$($unsynced[0].name)' to $spokeLabel is Connected but '$(Get-PeeringProperty $unsynced[0] 'peeringSyncLevel')'. Address space added since the peering was created is not routed through the hub yet." `
+                -Hint "Resynchronize both directions, for example: az network vnet peering sync --resource-group <rg> --vnet-name <vnet> --name <peering>."
+        }
+        else {
+            Add-Finding -Severity INFO -Code 'APIM_HUB_PEERING_CONNECTED' `
+                -Message "Hub VNet '$hubName' peering '$($usable[0].name)' to $spokeLabel is Connected. The gateway also needs the hub firewall to allow its dependencies; see the API Management section of the README."
+        }
+        return
+    }
+
+    if ($candidates.Count -gt 0) {
+        $states = ($candidates | ForEach-Object { '{0}={1}' -f $_.name, (Get-PeeringProperty $_ 'peeringState') }) -join ', '
+        Add-Finding -Severity $severity -Code 'APIM_HUB_PEERING_NOT_CONNECTED' `
+            -Message "Hub VNet '$hubName' has a peering to $spokeLabel, but it is not Connected ($states). Until it is, the gateway's dependency traffic through the hub is dropped and activation fails." `
+            -Hint "Initiated means the other direction is missing, so create it. Disconnected means the spoke VNet was deleted or recreated, so delete the hub-side peering and create it again once the spoke VNet exists. $twoPassHint"
+        return
+    }
+
+    $impact = if ($shape -eq 'NewSpoke') {
+        "The template routes the gateway subnet's 0.0.0.0/0 to $(Get-StringValue $P['hubIntegrationEgressNextHopIp']) in the hub, so without the hub-to-spoke peering every dependency call is dropped and the gateway fails with ActivationFailed."
+    }
+    else {
+        'If the prepared injection subnet routes 0.0.0.0/0 to the hub, the gateway fails with ActivationFailed until that peering is Connected.'
+    }
+    Add-Finding -Severity $severity -Code 'APIM_HUB_PEERING_MISSING' `
+        -Message "Hub VNet '$hubName' has no peering to $spokeLabel. $impact" `
+        -Hint $twoPassHint
 }
 
 # --------------------------------------------------------------------------
@@ -1885,7 +2209,7 @@ Write-Host "[preflight] Parameters file: $ParametersFile"
 if ($AzdEnv) { Write-Host "[preflight] azd environment: $AzdEnv" }
 if ($SkipAzureLookups) { Write-Host "[preflight] Azure lookups: SKIPPED" -ForegroundColor Yellow }
 
-Test-Tooling
+Test-Tooling -ParametersPath $ParametersFile
 
 $effective = Get-EffectiveParameters -Path $ParametersFile
 if ($effective.Count -eq 0) {
@@ -1900,6 +2224,7 @@ Test-AllowedIpRanges -P $effective
 Test-LocalCidrSanity -P $effective
 Test-FoundryIqConfiguration -P $effective
 Test-AzureResources -P $effective
+Test-ApiManagementHubPeering -P $effective
 Test-ResourceProviders -P $effective
 Test-CosmosAnalyticalStorageRegionSupport -P $effective
 Test-RegionalReadiness -P $effective

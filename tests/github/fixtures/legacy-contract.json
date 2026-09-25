@@ -1,0 +1,1479 @@
+{
+  "sourceCommit": "99c048e84acf4661ea0ec0a0ef1bb23ea29c0f3b",
+  "approvedChanges": {
+    "Deploy-AilzIntegrated.ps1": "ADR-002 (approved 2026-09-23): with -DeployApiManagement and no explicit ingress sources, the default API Management ingress source is the hub AzureFirewallSubnet prefix, falling back to EgressNextHopIp/32 with a warning. 9d4349d re-wraps a single resolved prefix as a JSON array. ADR-003 (proposed 2026-09-24): -PreviewOutput Full runs scripts/Invoke-PreflightChecks.ps1 before its What-If, because that path bypasses the azd preprovision hook. ADR-003 live run (2026-09-24): without -DeployApiManagement the ingress default is no longer recorded at all. It previously wrote EgressNextHopIp/32 into the azd environment for a disabled feature, and that is the one value Azure Firewall never matches, so enabling the gateway by any route that did not re-resolve it built an unreachable gateway. Requires review by the script owner in PR #1.",
+    "azure.yaml": "ADR-003 (proposed 2026-09-24): requiredVersions.azd '>= 1.25.5'. azd 1.23.4 (azure-dev#6694) is the first release that parses the pinned quoted array bindings as arrays; 1.25.5 (azure-dev#8493) fixes azd down --purge for Foundry accounts. Hooks and infra settings are unchanged. Requires review by the template owner in PR #1."
+  },
+  "parameters": {
+    "acaEnvironmentSubnetName": {
+      "type": "string",
+      "defaultValue": "aca-environment-subnet"
+    },
+    "acaEnvironmentSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.1.0/24"
+    },
+    "acrDnsSuffix": {
+      "type": "string",
+      "defaultValue": "[if(equals(environment().name, 'AzureUSGovernment'), 'azurecr.us', if(equals(environment().name, 'AzureChinaCloud'), 'azurecr.cn', 'azurecr.io'))]"
+    },
+    "acrTaskAgentPoolCount": {
+      "type": "int",
+      "defaultValue": 1
+    },
+    "acrTaskAgentPoolName": {
+      "type": "string",
+      "defaultValue": "build-pool"
+    },
+    "acrTaskAgentPoolTier": {
+      "type": "string",
+      "defaultValue": "S1"
+    },
+    "additionalAcrTaskBuildFqdns": {
+      "type": "array",
+      "defaultValue": []
+    },
+    "additionalAppConfigurationSettings": {
+      "type": "array",
+      "defaultValue": []
+    },
+    "agentSubnetName": {
+      "type": "string",
+      "defaultValue": "agent-subnet"
+    },
+    "agentSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.0.0/24"
+    },
+    "aiFoundryAccountName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').ai.aiFoundry, parameters('resourceToken'))]"
+    },
+    "aiFoundryCosmosDBAccountResourceId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "aiFoundryCosmosDbName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}{2}', variables('_1.abbrs').databases.cosmosDBDatabase, variables('_1.abbrs').ai.aiFoundry, parameters('resourceToken'))]"
+    },
+    "aiFoundryDisableLocalAuth": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "aiFoundryProjectDescription": {
+      "type": "string"
+    },
+    "aiFoundryProjectDisplayName": {
+      "type": "string"
+    },
+    "aiFoundryProjectName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').ai.aiFoundryProject, parameters('resourceToken'))]"
+    },
+    "aiFoundrySearchServiceName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}{2}', variables('_1.abbrs').ai.aiSearch, variables('_1.abbrs').ai.aiFoundry, parameters('resourceToken'))]"
+    },
+    "aiFoundryStorageAccountName": {
+      "type": "string",
+      "defaultValue": "[replace(format('{0}{1}{2}', variables('_1.abbrs').storage.storageAccount, variables('_1.abbrs').ai.aiFoundry, parameters('resourceToken')), '-', '')]"
+    },
+    "aiFoundryStorageAccountResourceId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "aiFoundryStorageSku": {
+      "type": "string",
+      "defaultValue": "Standard_LRS"
+    },
+    "aiSearchResourceId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "allowedIpRanges": {
+      "type": "array",
+      "defaultValue": []
+    },
+    "allowMixedObservabilityWorkspaces": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "apiManagementIngressSourceAddressPrefixes": {
+      "type": "array",
+      "defaultValue": []
+    },
+    "apiManagementName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').integration.apiManagement, parameters('resourceToken'))]"
+    },
+    "apiManagementPublisherEmail": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "apiManagementPublisherName": {
+      "type": "string",
+      "defaultValue": "AI Landing Zone"
+    },
+    "apiManagementSubnetName": {
+      "type": "string",
+      "defaultValue": "api-management-subnet"
+    },
+    "apiManagementSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.3.128/27"
+    },
+    "appConfigLabel": {
+      "type": "string",
+      "defaultValue": "ai-lz"
+    },
+    "appConfigName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').configuration.appConfiguration, parameters('resourceToken'))]"
+    },
+    "appInsightsName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').managementGovernance.applicationInsights, parameters('resourceToken'))]"
+    },
+    "appRuntimeConfigurationMode": {
+      "type": "string",
+      "defaultValue": "appConfig"
+    },
+    "azureAppGatewaySubnetName": {
+      "type": "string",
+      "defaultValue": "AppGatewaySubnet"
+    },
+    "azureAppGatewaySubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.3.0/27"
+    },
+    "azureBastionSubnetName": {
+      "type": "string",
+      "defaultValue": "AzureBastionSubnet"
+    },
+    "azureBastionSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.2.64/26"
+    },
+    "azureFirewallSubnetName": {
+      "type": "string",
+      "defaultValue": "AzureFirewallSubnet"
+    },
+    "azureFirewallSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.2.128/26"
+    },
+    "bastionAllowedSourceIPs": {
+      "type": "array",
+      "defaultValue": []
+    },
+    "bastionEnableTunneling": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "bastionSkuName": {
+      "type": "string",
+      "defaultValue": "Standard"
+    },
+    "bingSearchName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').ai.bing, parameters('resourceToken'))]"
+    },
+    "cafEnvironmentName": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "cafInstance": {
+      "type": "string",
+      "defaultValue": "001"
+    },
+    "cafRegionName": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "cafWorkloadName": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "containerAppsList": {
+      "type": "array"
+    },
+    "containerEnvName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').containers.containerAppsEnvironment, parameters('resourceToken'))]"
+    },
+    "containerRegistryName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').containers.containerRegistry, parameters('resourceToken'))]"
+    },
+    "cosmosLocation": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "databaseContainersList": {
+      "type": "array"
+    },
+    "dbAccountName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').databases.cosmosDBDatabase, parameters('resourceToken'))]"
+    },
+    "dbDatabaseName": {
+      "type": "string",
+      "defaultValue": "[format('{0}db{1}', variables('_1.abbrs').databases.cosmosDBDatabase, parameters('resourceToken'))]"
+    },
+    "dbDatabaseThroughput": {
+      "type": "int"
+    },
+    "deployAAfAgentSvc": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployAcrTaskAgentPool": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployAfProject": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployAiFoundry": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployAiFoundrySubnet": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployApiManagement": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "deployAppConfig": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployAppInsights": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployAzureFirewall": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployBastion": {
+      "type": "bool"
+    },
+    "deployContainerApps": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployContainerEnv": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployContainerRegistry": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployCosmosDb": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployGroundingWithBing": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployHostedAgent": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "deployJumpbox": {
+      "type": "bool"
+    },
+    "deployKeyVault": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployLogAnalytics": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deploymentMode": {
+      "type": "string",
+      "defaultValue": "standalone"
+    },
+    "deploymentTags": {
+      "type": "object",
+      "defaultValue": {}
+    },
+    "deployNatGateway": {
+      "type": "bool"
+    },
+    "deployNsgs": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deploySearchService": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deploySoftware": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deploySpeechService": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "deployStorageAccount": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deploySubnets": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "deployVM": {
+      "type": "bool"
+    },
+    "deployVmKeyVault": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "devopsBuildAgentsSubnetName": {
+      "type": "string",
+      "defaultValue": "devops-build-agents-subnet"
+    },
+    "devopsBuildAgentsSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.3.96/27"
+    },
+    "dnsZoneLinkSuffix": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "enableAcsMediaEgress": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "enableAgenticRetrieval": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "enableCosmosAnalyticalStorage": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "enablePrivateLogAnalytics": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "environmentName": {
+      "type": "string"
+    },
+    "existingApplicationInsightsConnectionString": {
+      "type": "securestring"
+    },
+    "existingApplicationInsightsResourceId": {
+      "type": "string"
+    },
+    "existingBastionResourceId": {
+      "type": "string"
+    },
+    "existingJumpboxResourceId": {
+      "type": "string"
+    },
+    "existingLogAnalyticsWorkspaceResourceId": {
+      "type": "string"
+    },
+    "existingNatGatewayResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneAcrResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneAiServicesResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneAppConfigResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneAppInsightsResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneAzureAutomationResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneAzureMonitorResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneBlobResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneCogSvcsResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneContainerAppsResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneCosmosResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneKeyVaultResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneOdsOpsInsightsResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneOmsOpsInsightsResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneOpenAiResourceId": {
+      "type": "string"
+    },
+    "existingPrivateDnsZoneSearchResourceId": {
+      "type": "string"
+    },
+    "existingVnetResourceId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "extendFirewallForAcrTaskBuilds": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "extendFirewallForJumpboxBootstrap": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "foundryIqAiServicesEndpoint": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "foundryIqApiVersion": {
+      "type": "string",
+      "defaultValue": "2026-05-01-preview"
+    },
+    "foundryIqBaseFilter": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "foundryIqContentExtractionMode": {
+      "type": "string",
+      "defaultValue": "standard"
+    },
+    "foundryIqFilterAddOnEnabled": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "foundryIqIngestionPermissionOptions": {
+      "type": "array",
+      "defaultValue": [
+        "rbacScope"
+      ]
+    },
+    "foundryIqIngestionPermissionOptionsJson": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "foundryIqIsAdlsGen2": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "foundryIqKnowledgeRetrievalBillingPlan": {
+      "type": "string",
+      "defaultValue": "free"
+    },
+    "foundryIqKnowledgeSourceKind": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "foundryIqKnowledgeSourceName": {
+      "type": "string",
+      "defaultValue": "[format('{0}-blob-ks', parameters('environmentName'))]"
+    },
+    "foundryIqMaxOutputDocuments": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "foundryIqPattern": {
+      "type": "string",
+      "defaultValue": "azureBlob"
+    },
+    "foundryIqSearchFields": {
+      "type": "array",
+      "defaultValue": [
+        "content"
+      ]
+    },
+    "foundryIqSearchIndexName": {
+      "type": "string",
+      "defaultValue": "gpt-rag-index"
+    },
+    "foundryIqSecurityFieldName": {
+      "type": "string",
+      "defaultValue": "metadata_security_id"
+    },
+    "foundryIqSemanticConfigurationName": {
+      "type": "string",
+      "defaultValue": "default"
+    },
+    "foundryIqSourceDataFields": {
+      "type": "array",
+      "defaultValue": [
+        "id",
+        "title",
+        "filepath",
+        "url",
+        "content"
+      ]
+    },
+    "foundryIqStorageContainerName": {
+      "type": "string",
+      "defaultValue": "documents"
+    },
+    "foundryIqStorageFolderPath": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "gatewaySubnetName": {
+      "type": "string",
+      "defaultValue": "gateway-subnet"
+    },
+    "gatewaySubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.2.192/26"
+    },
+    "hostedAgent": {
+      "type": null,
+      "defaultValue": {
+        "name": "",
+        "image": "",
+        "version": "",
+        "startupCommand": "",
+        "runtime": {
+          "cpu": "1",
+          "memory": "1Gi"
+        },
+        "protocols": [
+          {
+            "protocol": "responses",
+            "version": "2.0.0"
+          }
+        ]
+      }
+    },
+    "hostedAgentContainerRegistryEndpoint": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "hostedAgentContainerRegistryResourceId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "hostedAgentContainerRegistryRoleAssignmentMode": {
+      "type": "string",
+      "defaultValue": "rbac"
+    },
+    "hubIntegrationCreateHubPeering": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "hubIntegrationEgressNextHopIp": {
+      "type": "string"
+    },
+    "hubIntegrationExistingRouteTableResourceId": {
+      "type": "string"
+    },
+    "hubIntegrationHubVnetResourceId": {
+      "type": "string"
+    },
+    "hubIntegrationPeeringAllowGatewayTransit": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "hubIntegrationPeeringUseRemoteGateways": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "jumpboxSubnetName": {
+      "type": "string",
+      "defaultValue": "jumpbox-subnet"
+    },
+    "jumpboxSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.3.64/27"
+    },
+    "keyVaultName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').security.keyVault, parameters('resourceToken'))]"
+    },
+    "keyVaultResourceId": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "knowledgeBaseConnectionName": {
+      "type": "string",
+      "defaultValue": "[format('{0}-knowledge-base-connection', parameters('environmentName'))]"
+    },
+    "knowledgeBaseName": {
+      "type": "string",
+      "defaultValue": "[format('{0}-knowledge-base', parameters('environmentName'))]"
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "logAnalyticsWorkspaceName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').managementGovernance.logAnalyticsWorkspace, parameters('resourceToken'))]"
+    },
+    "modelDeploymentList": {
+      "type": "array"
+    },
+    "networkIsolation": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "peSubnetName": {
+      "type": "string",
+      "defaultValue": "pe-subnet"
+    },
+    "peSubnetPrefix": {
+      "type": "string",
+      "defaultValue": "192.168.2.0/26"
+    },
+    "policyManagedPrivateDns": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "prepareHostedAgent": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "principalId": {
+      "type": "string"
+    },
+    "principalType": {
+      "type": "string",
+      "defaultValue": "User"
+    },
+    "privateEndpointLocation": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "privateEndpointResourceGroupName": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "publicIngress": {
+      "type": null,
+      "defaultValue": {
+        "enabled": false
+      }
+    },
+    "resourceNamingMode": {
+      "type": "string",
+      "defaultValue": "caf"
+    },
+    "resourceToken": {
+      "type": "string",
+      "defaultValue": "[toLower(uniqueString(subscription().id, parameters('environmentName'), parameters('location')))]"
+    },
+    "retrievalBackend": {
+      "type": "string",
+      "defaultValue": "foundry_iq"
+    },
+    "searchServiceLocation": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "searchServiceName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').ai.aiSearch, parameters('resourceToken'))]"
+    },
+    "sideBySideDeploy": {
+      "type": "bool",
+      "defaultValue": true
+    },
+    "speechServiceLocation": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "speechServiceName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').ai.speechService, parameters('resourceToken'))]"
+    },
+    "speechServiceSku": {
+      "type": "string",
+      "defaultValue": "S0"
+    },
+    "storageAccountContainersList": {
+      "type": "array"
+    },
+    "storageAccountName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').storage.storageAccount, parameters('resourceToken'))]"
+    },
+    "useCAppAPIKey": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "useExistingVNet": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "useUAI": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "useZoneRedundancy": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "vmAdminPassword": {
+      "type": "securestring"
+    },
+    "vmImageOffer": {
+      "type": "string",
+      "defaultValue": "WindowsServer"
+    },
+    "vmImagePublisher": {
+      "type": "string",
+      "defaultValue": "MicrosoftWindowsServer"
+    },
+    "vmImageSku": {
+      "type": "string",
+      "defaultValue": "2022-datacenter-azure-edition"
+    },
+    "vmImageVersion": {
+      "type": "string",
+      "defaultValue": "latest"
+    },
+    "vmName": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D2s_v5"
+    },
+    "vmUserName": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "vnetAddressPrefixes": {
+      "type": "array",
+      "defaultValue": [
+        "192.168.0.0/21"
+      ]
+    },
+    "vnetName": {
+      "type": "string",
+      "defaultValue": "[format('{0}{1}', variables('_1.abbrs').networking.virtualNetwork, parameters('resourceToken'))]"
+    },
+    "workloadProfiles": {
+      "type": "array",
+      "defaultValue": []
+    }
+  },
+  "parameterFile": {
+    "environmentName": {
+      "value": "${AZURE_ENV_NAME}"
+    },
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "aiFoundryLocation": {
+      "value": "${AZURE_AI_FOUNDRY_LOCATION}"
+    },
+    "psqlLocation": {
+      "value": "${AZURE_PSQL_LOCATION}"
+    },
+    "cosmosLocation": {
+      "value": "${AZURE_COSMOS_LOCATION}"
+    },
+    "searchServiceLocation": {
+      "value": "${AZURE_SEARCH_LOCATION}"
+    },
+    "speechServiceLocation": {
+      "value": "${AZURE_SPEECH_LOCATION}"
+    },
+    "deploymentTags": {
+      "value": {}
+    },
+    "principalId": {
+      "value": "${AZURE_PRINCIPAL_ID}"
+    },
+    "principalType": {
+      "value": "${AZURE_PRINCIPAL_TYPE=User}"
+    },
+    "networkIsolation": {
+      "value": "${NETWORK_ISOLATION}"
+    },
+    "allowedIpRanges": {
+      "value": []
+    },
+    "privateEndpointLocation": {
+      "value": "${AZURE_PE_LOCATION}"
+    },
+    "privateEndpointResourceGroupName": {
+      "value": "${AZURE_PE_RESOURCE_GROUP_NAME}"
+    },
+    "useUAI": {
+      "value": "${USE_UAI}"
+    },
+    "useCAppAPIKey": {
+      "value": "${USE_CAPP_API_KEY}"
+    },
+    "useZoneRedundancy": {
+      "value": "false"
+    },
+    "enableAgenticRetrieval": {
+      "value": "${ENABLE_AGENTIC_RETRIEVAL}"
+    },
+    "retrievalBackend": {
+      "value": "${RETRIEVAL_BACKEND=foundry_iq}"
+    },
+    "foundryIqPattern": {
+      "value": "${FOUNDRY_IQ_PATTERN=azureBlob}"
+    },
+    "foundryIqApiVersion": {
+      "value": "${FOUNDRY_IQ_API_VERSION=2026-05-01-preview}"
+    },
+    "foundryIqKnowledgeRetrievalBillingPlan": {
+      "value": "${FOUNDRY_IQ_KNOWLEDGE_RETRIEVAL_BILLING_PLAN=free}"
+    },
+    "knowledgeBaseName": {
+      "value": "${KNOWLEDGE_BASE_NAME=knowledge-base}"
+    },
+    "knowledgeBaseConnectionName": {
+      "value": "${KNOWLEDGE_BASE_CONNECTION_NAME=knowledge-base-connection}"
+    },
+    "foundryIqKnowledgeSourceName": {
+      "value": "${FOUNDRY_IQ_KNOWLEDGE_SOURCE_NAME=knowledge-base-blob-ks}"
+    },
+    "foundryIqKnowledgeSourceKind": {
+      "value": "${FOUNDRY_IQ_KNOWLEDGE_SOURCE_KIND=azureBlob}"
+    },
+    "foundryIqStorageContainerName": {
+      "value": "${FOUNDRY_IQ_STORAGE_CONTAINER_NAME=documents}"
+    },
+    "foundryIqStorageFolderPath": {
+      "value": "${FOUNDRY_IQ_STORAGE_FOLDER_PATH=}"
+    },
+    "foundryIqIsAdlsGen2": {
+      "value": "${FOUNDRY_IQ_IS_ADLS_GEN2=false}"
+    },
+    "foundryIqIngestionPermissionOptionsJson": {
+      "value": "${FOUNDRY_IQ_INGESTION_PERMISSION_OPTIONS=[\"rbacScope\"]}"
+    },
+    "foundryIqSearchIndexName": {
+      "value": "${FOUNDRY_IQ_SEARCH_INDEX_NAME=gpt-rag-index}"
+    },
+    "foundryIqSemanticConfigurationName": {
+      "value": "${FOUNDRY_IQ_SEMANTIC_CONFIGURATION_NAME=default}"
+    },
+    "foundryIqSourceDataFields": {
+      "value": [
+        "id",
+        "title",
+        "filepath",
+        "url",
+        "content"
+      ]
+    },
+    "foundryIqSearchFields": {
+      "value": [
+        "content"
+      ]
+    },
+    "foundryIqBaseFilter": {
+      "value": "${FOUNDRY_IQ_BASE_FILTER=}"
+    },
+    "foundryIqFilterAddOnEnabled": {
+      "value": "${FOUNDRY_IQ_FILTER_ADD_ON_ENABLED=false}"
+    },
+    "foundryIqSecurityFieldName": {
+      "value": "${FOUNDRY_IQ_SECURITY_FIELD_NAME=metadata_security_id}"
+    },
+    "foundryIqMaxOutputDocuments": {
+      "value": "${FOUNDRY_IQ_MAX_OUTPUT_DOCUMENTS=}"
+    },
+    "foundryIqContentExtractionMode": {
+      "value": "${FOUNDRY_IQ_CONTENT_EXTRACTION_MODE=standard}"
+    },
+    "foundryIqAiServicesEndpoint": {
+      "value": "${FOUNDRY_IQ_AI_SERVICES_ENDPOINT=}"
+    },
+    "additionalAppConfigurationSettings": {
+      "value": []
+    },
+    "aiSearchResourceId": {
+      "value": null
+    },
+    "aiFoundryStorageAccountResourceId": {
+      "value": null
+    },
+    "aiFoundryCosmosDBAccountResourceId": {
+      "value": null
+    },
+    "deployAiFoundry": {
+      "value": "true"
+    },
+    "deployAAfAgentSvc": {
+      "value": "${DEPLOY_AAF_AGENT_SVC=true}"
+    },
+    "aiFoundryDisableLocalAuth": {
+      "value": "${AI_FOUNDRY_DISABLE_LOCAL_AUTH=true}"
+    },
+    "deployAiFoundrySubnet": {
+      "value": "true"
+    },
+    "deployAppConfig": {
+      "value": "true"
+    },
+    "deployApiManagement": {
+      "value": "${DEPLOY_API_MANAGEMENT=false}"
+    },
+    "apiManagementPublisherEmail": {
+      "value": "${API_MANAGEMENT_PUBLISHER_EMAIL=}"
+    },
+    "apiManagementPublisherName": {
+      "value": "${API_MANAGEMENT_PUBLISHER_NAME=AI Landing Zone}"
+    },
+    "apiManagementIngressSourceAddressPrefixes": {
+      "value": "${API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES=[]}"
+    },
+    "appRuntimeConfigurationMode": {
+      "value": "${APP_RUNTIME_CONFIGURATION_MODE=appConfig}"
+    },
+    "deployAppInsights": {
+      "value": "true"
+    },
+    "deployCosmosDb": {
+      "value": "${DEPLOY_COSMOS_DB=true}"
+    },
+    "enableCosmosAnalyticalStorage": {
+      "value": "${ENABLE_COSMOS_ANALYTICAL_STORAGE=false}"
+    },
+    "deployContainerApps": {
+      "value": "${DEPLOY_CONTAINER_APPS=true}"
+    },
+    "deployContainerRegistry": {
+      "value": "${DEPLOY_CONTAINER_REGISTRY=true}"
+    },
+    "deployContainerEnv": {
+      "value": "${DEPLOY_CONTAINER_ENV=true}"
+    },
+    "deployNsgs": {
+      "value": "${DEPLOY_NSGS=true}"
+    },
+    "deployAzureFirewall": {
+      "value": "${DEPLOY_AZURE_FIREWALL}"
+    },
+    "deployAcrTaskAgentPool": {
+      "value": "${DEPLOY_ACR_TASK_AGENT_POOL=false}"
+    },
+    "additionalAcrTaskBuildFqdns": {
+      "value": []
+    },
+    "bastionAllowedSourceIPs": {
+      "value": []
+    },
+    "bastionSkuName": {
+      "value": "${BASTION_SKU_NAME=Standard}"
+    },
+    "bastionEnableTunneling": {
+      "value": "${BASTION_ENABLE_TUNNELING=false}"
+    },
+    "enableAcsMediaEgress": {
+      "value": "${ENABLE_ACS_MEDIA_EGRESS=false}"
+    },
+    "publicIngress": {
+      "value": {
+        "enabled": false
+      }
+    },
+    "deployMcp": {
+      "value": "${DEPLOY_MCP=true}"
+    },
+    "deployGroundingWithBing": {
+      "value": "${DEPLOY_GROUNDING_WITH_BING=false}"
+    },
+    "prepareHostedAgent": {
+      "value": "${PREPARE_HOSTED_AGENT=false}"
+    },
+    "deployHostedAgent": {
+      "value": "${DEPLOY_HOSTED_AGENT=false}"
+    },
+    "hostedAgent": {
+      "value": {
+        "name": "${HOSTED_AGENT_NAME=}",
+        "image": "${HOSTED_AGENT_IMAGE=}",
+        "version": "${HOSTED_AGENT_IMAGE_VERSION=}",
+        "startupCommand": "${HOSTED_AGENT_STARTUP_COMMAND=}",
+        "runtime": {
+          "cpu": "${HOSTED_AGENT_CONTAINER_CPU=1}",
+          "memory": "${HOSTED_AGENT_CONTAINER_MEMORY=1Gi}"
+        },
+        "protocols": [
+          {
+            "protocol": "responses",
+            "version": "${HOSTED_AGENT_RESPONSES_PROTOCOL_VERSION=2.0.0}"
+          }
+        ]
+      }
+    },
+    "hostedAgentContainerRegistryResourceId": {
+      "value": "${HOSTED_AGENT_CONTAINER_REGISTRY_RESOURCE_ID=}"
+    },
+    "hostedAgentContainerRegistryEndpoint": {
+      "value": "${HOSTED_AGENT_CONTAINER_REGISTRY_ENDPOINT=}"
+    },
+    "hostedAgentContainerRegistryRoleAssignmentMode": {
+      "value": "${HOSTED_AGENT_CONTAINER_REGISTRY_ROLE_ASSIGNMENT_MODE=rbac}"
+    },
+    "deployKeyVault": {
+      "value": "${DEPLOY_KEY_VAULT=true}"
+    },
+    "deployVmKeyVault": {
+      "value": "${DEPLOY_VM_KEY_VAULT=false}"
+    },
+    "deployLogAnalytics": {
+      "value": "${DEPLOY_LOG_ANALYTICS=true}"
+    },
+    "enablePrivateLogAnalytics": {
+      "value": "${ENABLE_PRIVATE_LOG_ANALYTICS=true}"
+    },
+    "deploySearchService": {
+      "value": "${DEPLOY_SEARCH_SERVICE=true}"
+    },
+    "deploySpeechService": {
+      "value": "${DEPLOY_SPEECH_SERVICE=false}"
+    },
+    "speechServiceSku": {
+      "value": "${SPEECH_SERVICE_SKU=S0}"
+    },
+    "deployStorageAccount": {
+      "value": "${DEPLOY_STORAGE_ACCOUNT=true}"
+    },
+    "greenFieldDeployment": {
+      "value": "${GREEN_FIELD_DEPLOYMENT=true}"
+    },
+    "deployJumpbox": {
+      "value": "${DEPLOY_JUMPBOX=null}"
+    },
+    "deployBastion": {
+      "value": "${DEPLOY_BASTION=null}"
+    },
+    "deployNatGateway": {
+      "value": "${DEPLOY_NAT_GATEWAY=null}"
+    },
+    "existingJumpboxResourceId": {
+      "value": "${EXISTING_JUMPBOX_RESOURCE_ID=}"
+    },
+    "existingBastionResourceId": {
+      "value": "${EXISTING_BASTION_RESOURCE_ID=}"
+    },
+    "existingNatGatewayResourceId": {
+      "value": "${EXISTING_NAT_GATEWAY_RESOURCE_ID=}"
+    },
+    "existingLogAnalyticsWorkspaceResourceId": {
+      "value": "${EXISTING_LOG_ANALYTICS_WORKSPACE_RESOURCE_ID=}"
+    },
+    "existingApplicationInsightsResourceId": {
+      "value": "${EXISTING_APPLICATION_INSIGHTS_RESOURCE_ID=}"
+    },
+    "existingApplicationInsightsConnectionString": {
+      "value": "${EXISTING_APPLICATION_INSIGHTS_CONNECTION_STRING=}"
+    },
+    "allowMixedObservabilityWorkspaces": {
+      "value": "${ALLOW_MIXED_OBSERVABILITY_WORKSPACES=false}"
+    },
+    "hubIntegrationEgressNextHopIp": {
+      "value": "${HUB_INTEGRATION_EGRESS_NEXT_HOP_IP=}"
+    },
+    "hubIntegrationExistingRouteTableResourceId": {
+      "value": "${HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID=}"
+    },
+    "hubIntegrationHubVnetResourceId": {
+      "value": "${HUB_INTEGRATION_HUB_VNET_RESOURCE_ID=}"
+    },
+    "hubIntegrationCreateHubPeering": {
+      "value": "${HUB_INTEGRATION_CREATE_HUB_PEERING=true}"
+    },
+    "hubIntegrationPeeringAllowGatewayTransit": {
+      "value": "${HUB_INTEGRATION_PEERING_ALLOW_GATEWAY_TRANSIT=false}"
+    },
+    "hubIntegrationPeeringUseRemoteGateways": {
+      "value": "${HUB_INTEGRATION_PEERING_USE_REMOTE_GATEWAYS=false}"
+    },
+    "existingPrivateDnsZoneCogSvcsResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_COGSVCS_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneOpenAiResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_OPENAI_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneAiServicesResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_AISERVICES_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneSearchResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_SEARCH_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneCosmosResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_COSMOS_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneBlobResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_BLOB_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneKeyVaultResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_KEYVAULT_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneAppConfigResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_APPCONFIG_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneContainerAppsResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_CONTAINERAPPS_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneAcrResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_ACR_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneAzureMonitorResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_AZUREMONITOR_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneOmsOpsInsightsResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_OMSOPSINSIGHTS_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneOdsOpsInsightsResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_ODSOPSINSIGHTS_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneAzureAutomationResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_AZUREAUTOMATION_RESOURCE_ID=}"
+    },
+    "existingPrivateDnsZoneAppInsightsResourceId": {
+      "value": "${EXISTING_PRIVATE_DNS_ZONE_APPINSIGHTS_RESOURCE_ID=}"
+    },
+    "dnsZoneLinkSuffix": {
+      "value": "${DNS_ZONE_LINK_SUFFIX=}"
+    },
+    "deploymentMode": {
+      "value": "${DEPLOYMENT_MODE=standalone}"
+    },
+    "deployVM": {
+      "value": "${DEPLOY_VM=null}"
+    },
+    "deploySoftware": {
+      "value": "${DEPLOY_SOFTWARE=true}"
+    },
+    "deployPostgres": {
+      "value": "${DEPLOY_POSTGRES=false}"
+    },
+    "resourceNamingMode": {
+      "value": "${RESOURCE_NAMING_MODE=caf}"
+    },
+    "cafWorkloadName": {
+      "value": "${CAF_WORKLOAD_NAME=}"
+    },
+    "cafEnvironmentName": {
+      "value": "${CAF_ENVIRONMENT_NAME=}"
+    },
+    "cafRegionName": {
+      "value": "${CAF_REGION_NAME=}"
+    },
+    "cafInstance": {
+      "value": "${CAF_INSTANCE=001}"
+    },
+    "aiFoundryAccountName": {
+      "value": null
+    },
+    "aiFoundryProjectName": {
+      "value": null
+    },
+    "aiFoundryProjectDisplayName": {
+      "value": null
+    },
+    "aiFoundryProjectDescription": {
+      "value": null
+    },
+    "aiFoundryStorageAccountName": {
+      "value": null
+    },
+    "aiFoundryStorageSku": {
+      "value": "Standard_LRS"
+    },
+    "aiFoundrySearchServiceName": {
+      "value": null
+    },
+    "aiFoundryCosmosDbName": {
+      "value": null
+    },
+    "bingSearchName": {
+      "value": null
+    },
+    "appConfigName": {
+      "value": null
+    },
+    "apiManagementName": {
+      "value": null
+    },
+    "appInsightsName": {
+      "value": null
+    },
+    "containerEnvName": {
+      "value": null
+    },
+    "containerRegistryName": {
+      "value": null
+    },
+    "conversationContainerName": {
+      "value": null
+    },
+    "dataIngestContainerAppName": {
+      "value": null
+    },
+    "datasourcesContainerName": {
+      "value": null
+    },
+    "dbAccountName": {
+      "value": null
+    },
+    "dbDatabaseName": {
+      "value": null
+    },
+    "frontEndContainerAppName": {
+      "value": null
+    },
+    "keyVaultName": {
+      "value": null
+    },
+    "logAnalyticsWorkspaceName": {
+      "value": null
+    },
+    "searchServiceName": {
+      "value": null
+    },
+    "speechServiceName": {
+      "value": null
+    },
+    "solutionStorageAccountName": {
+      "value": null
+    },
+    "vmAdminPassword": {
+      "value": "$(secretOrRandomPassword)"
+    },
+    "vmSize": {
+      "value": "${AZURE_VM_SIZE=Standard_D2s_v3}"
+    },
+    "useCMK": {
+      "value": "false"
+    },
+    "useExistingVNet": {
+      "value": "${USE_EXISTING_VNET}"
+    },
+    "deploySubnets": {
+      "value": "${DEPLOY_SUBNETS}"
+    },
+    "sideBySideDeploy": {
+      "value": "${SIDE_BY_SIDE}"
+    },
+    "existingVnetResourceId": {
+      "value": "${EXISTING_VNET_RESOURCE_ID}"
+    },
+    "policyManagedPrivateDns": {
+      "value": "${POLICY_MANAGED_PRIVATE_DNS=false}"
+    },
+    "modelDeploymentList": {
+      "value": [
+        {
+          "name": "chat",
+          "model": {
+            "format": "OpenAI",
+            "name": "gpt-5-nano",
+            "version": "2025-08-07"
+          },
+          "sku": {
+            "name": "GlobalStandard",
+            "capacity": 40
+          },
+          "canonical_name": "CHAT_DEPLOYMENT_NAME",
+          "apiVersion": "2025-12-01-preview"
+        },
+        {
+          "name": "text-embedding",
+          "model": {
+            "format": "OpenAI",
+            "name": "text-embedding-3-large",
+            "version": "1"
+          },
+          "sku": {
+            "name": "Standard",
+            "capacity": 10
+          },
+          "canonical_name": "EMBEDDING_DEPLOYMENT_NAME",
+          "apiVersion": "2025-12-01-preview"
+        }
+      ]
+    },
+    "workloadProfiles": {
+      "value": [
+        {
+          "name": "Consumption",
+          "workloadProfileType": "Consumption"
+        },
+        {
+          "workloadProfileType": "D4",
+          "name": "main",
+          "minimumCount": 0,
+          "maximumCount": 1
+        }
+      ]
+    },
+    "storageAccountContainersList": {
+      "value": [
+        {
+          "name": "documents",
+          "canonical_name": "DOCUMENTS_STORAGE_CONTAINER"
+        }
+      ]
+    },
+    "databaseContainersList": {
+      "value": [
+        {
+          "name": "conversations",
+          "canonical_name": "CONVERSATIONS_DATABASE_CONTAINER",
+          "partitionKey": "/principal_id",
+          "indexingPolicy": {
+            "compositeIndexes": [
+              [
+                {
+                  "path": "/isDeleted",
+                  "order": "Ascending"
+                },
+                {
+                  "path": "/_ts",
+                  "order": "Descending"
+                }
+              ],
+              [
+                {
+                  "path": "/isDeleted",
+                  "order": "Ascending"
+                },
+                {
+                  "path": "/name",
+                  "order": "Ascending"
+                },
+                {
+                  "path": "/_ts",
+                  "order": "Descending"
+                }
+              ]
+            ]
+          }
+        }
+      ]
+    },
+    "containerAppsList": {
+      "value": [
+        {
+          "name": null,
+          "external": true,
+          "target_port": 8080,
+          "service_name": "orchestrator",
+          "profile_name": "main",
+          "min_replicas": 1,
+          "max_replicas": 1,
+          "cpu": "1.0",
+          "memory": "2.0Gi",
+          "canonical_name": "ORCHESTRATOR_APP",
+          "roles": [
+            "AppConfigurationDataReader",
+            "CognitiveServicesUser",
+            "CognitiveServicesOpenAIUser",
+            "AcrPull",
+            "CosmosDBBuiltInDataContributor",
+            "SearchIndexDataReader",
+            "StorageBlobDataReader",
+            "KeyVaultSecretsUser"
+          ]
+        }
+      ]
+    }
+  },
+  "outputs": {
+    "ACR_TASK_AGENT_POOL": "string",
+    "APP_CONFIG_ENDPOINT": "string",
+    "APP_GATEWAY_SUBNET_RESOURCE_ID": "string",
+    "APP_INSIGHTS_RESOURCE_ID": "string",
+    "APP_RUNTIME_CONFIGURATION_MODE": "string",
+    "AZURE_AI_PROJECT_ENDPOINT": "string",
+    "AZURE_AI_PROJECT_RESOURCE_ID": "string",
+    "AZURE_CONTAINER_REGISTRY_ENDPOINT": "string",
+    "AZURE_CONTAINER_REGISTRY_RESOURCE_ID": "string",
+    "AZURE_RESOURCE_GROUP": "string",
+    "AZURE_SPEECH_ENDPOINT": "string",
+    "AZURE_SPEECH_REGION": "string",
+    "AZURE_SPEECH_RESOURCE_ID": "string",
+    "AZURE_SPEECH_RESOURCE_NAME": "string",
+    "CONTAINER_APP_INTERNAL_FQDN": "string",
+    "DEPLOY_APP_CONFIG": "bool",
+    "DEPLOY_APP_INSIGHTS": "bool",
+    "DEPLOY_CONTAINER_APPS": "bool",
+    "DEPLOY_CONTAINER_ENV": "bool",
+    "DEPLOY_CONTAINER_REGISTRY": "bool",
+    "DEPLOY_COSMOS_DB": "bool",
+    "DEPLOY_HOSTED_AGENT": "bool",
+    "DEPLOY_KEY_VAULT": "bool",
+    "DEPLOY_LOG_ANALYTICS": "bool",
+    "DEPLOY_SEARCH_SERVICE": "bool",
+    "DEPLOY_SOFTWARE": "bool",
+    "DEPLOY_SPEECH_SERVICE": "bool",
+    "DEPLOY_STORAGE_ACCOUNT": "bool",
+    "DEPLOY_VM_KEY_VAULT": "bool",
+    "DEPLOYMENT_NAME": "string",
+    "ENVIRONMENT_NAME": "string",
+    "FOUNDRY_IQ_KNOWLEDGE_SOURCE_KIND": "string",
+    "FOUNDRY_IQ_KNOWLEDGE_SOURCE_NAME": "string",
+    "FOUNDRY_IQ_PATTERN": "string",
+    "HOSTED_AGENT_DEPLOYMENT": "object",
+    "HOSTED_AGENT_PREPARED": "bool",
+    "KEY_VAULT_NAME": "string",
+    "KEY_VAULT_RESOURCE_ID": "string",
+    "KNOWLEDGE_BASE_CONNECTION_ID": "string",
+    "KNOWLEDGE_BASE_ENDPOINT": "string",
+    "KNOWLEDGE_BASE_NAME": "string",
+    "LOCATION": "string",
+    "LOG_ANALYTICS_RESOURCE_ID": "string",
+    "NETWORK_ISOLATION": "bool",
+    "OBSERVABILITY_MIXED_WORKSPACES_ALLOWED": "bool",
+    "PUBLIC_INGRESS_ENABLED": "bool",
+    "PUBLIC_INGRESS_GATEWAY_RESOURCE_ID": "string",
+    "PUBLIC_INGRESS_IDENTITY_PRINCIPAL_ID": "string",
+    "PUBLIC_INGRESS_LIVE": "bool",
+    "PUBLIC_INGRESS_NSG_RESOURCE_ID": "string",
+    "PUBLIC_INGRESS_PUBLIC_IP": "string",
+    "PUBLIC_INGRESS_PUBLIC_IP_RESOURCE_ID": "string",
+    "PUBLIC_INGRESS_WAF_POLICY_RESOURCE_ID": "string",
+    "RELEASE": "string",
+    "RESOURCE_TOKEN": "string",
+    "RETRIEVAL_BACKEND": "string",
+    "SUBSCRIPTION_ID": "string",
+    "TENANT_ID": "string",
+    "USE_CAPP_API_KEY": "bool",
+    "USE_UAI": "bool",
+    "VNET_RESOURCE_ID": "string"
+  },
+  "preservedFiles": {
+    "azure.yaml": "aedf47237e207f7203612526d6e70209f33c4160c45a167d1566c38e7fbc8ec6",
+    "manifest.json": "9182f38f9b088c51b5ac716be41846bd0b3fd96858d861682b88483fbf02e0dd",
+    "install.ps1": "45cfdcc58aa58593ef3b961726734a272b3e73679fb9461f4ba8d5a310e98864",
+    "Deploy-AilzIntegrated.ps1": "7bc6655dd20fdd30d99c7dec77d57dced9d80aa1b45c9f7a8ccad687de371111",
+    "pipelines/azuredevops/cd-pipeline.yml": "4a0ff750111c1ff9149c86dc80bbfb2a628387c7f4254df9b651abca5d4fa219",
+    "pipelines/azuredevops/ci-pipeline.yml": "bdad7e9517721d0ea7b1d2042d747a0eedfed875955797e2598f987147de344a",
+    "pipelines/azuredevops/templates/deploy-bicep.yml": "31b00d0e98bf379806d4d006ea757ddea4dd5c4189e8b626e2acf39ccd958b83",
+    "pipelines/azuredevops/templates/preview-bicep.yml": "43ce4ccdd7b613897bb1c8efcdc07843b533486d74015045040e79e79472db3a",
+    "pipelines/azuredevops/templates/validate-bicep.yml": "f08bc2838d40ead185abc40ec399a5d1633df1aa69d0b7ce6a3af8ef0ea8ba34",
+    "pipelines/azuredevops/templates/variables.yml": "b5340ea328251b509b42c8b18171eeced2a6b0b4b8349ddae7516018313f6e95"
+  }
+}

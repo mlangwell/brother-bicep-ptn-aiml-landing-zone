@@ -1,0 +1,46 @@
+name: Deploy selected environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment whose bootstrap and protected configuration are already established
+        required: true
+        type: choice
+        options: [dev, test, prod]
+      release_run_id:
+        description: Successful trusted bicep-validate push run recorded in the profile
+        required: true
+        type: string
+      configuration_sha:
+        description: Immutable approved commit containing environments/<environment>.json
+        required: true
+        type: string
+      prior_promotion_run_id:
+        description: Successful prior-environment live-evidence run; required for test/prod
+        required: false
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ailz-${{ github.repository_id }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/deploy-environment-reusable.yml
+    with:
+      environment: ${{ inputs.environment }}
+      release_run_id: ${{ inputs.release_run_id }}
+      configuration_sha: ${{ inputs.configuration_sha }}
+      prior_promotion_run_id: ${{ inputs.prior_promotion_run_id }}
+    secrets:
+      AILZ_GITHUB_READ_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN }}

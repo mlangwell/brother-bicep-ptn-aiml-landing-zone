@@ -1,0 +1,6 @@
+azure-identity==1.25.3
+PyJWT[crypto]==2.13.0
+cryptography==50.0.1
+httpx==0.28.1
+starlette==1.6.0
+uvicorn==0.52.4

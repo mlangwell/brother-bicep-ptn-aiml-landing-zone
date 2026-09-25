@@ -1,0 +1,178 @@
+{
+  "_readMeFirst": [
+    "Copy this file to 'config.json' in the repository root, then edit the values.",
+    "  Windows PowerShell:  Copy-Item config.json.example config.json",
+    "",
+    "config.json is git-ignored. It is YOUR environment, not a file to commit.",
+    "",
+    "RULES",
+    "  1. Any value containing angle brackets, like <subscription-id>, is a PLACEHOLDER.",
+    "     Replace it, or delete the whole key if you do not need that feature.",
+    "  2. Leave a value as \"\" (empty string) to mean 'let the deployment create this for me'.",
+    "  3. Keys beginning with an underscore are documentation. Every tool that reads",
+    "     this file ignores them. You may delete them once you understand the file.",
+    "  4. This is strict JSON. No trailing commas, no // comments.",
+    "",
+    "HOW IT IS USED",
+    "  This file is a worksheet. It is NOT read automatically by Deploy-AilzIntegrated.ps1.",
+    "  Hand it to GitHub Copilot with the prompt in docs/copilot-deploy-prompt.md and",
+    "  Copilot will translate it into the correct command and run the deployment,",
+    "  or translate it by hand using the '_mapsTo' note on each section below."
+  ],
+
+  "deployment": {
+    "_comment": "REQUIRED. These four values are the required parameters of Deploy-AilzIntegrated.ps1.",
+    "_mapsTo": "Deploy-AilzIntegrated.ps1 parameters: -EnvironmentName -Location -HubVnetResourceId -EgressNextHopIp -PreviewOnly",
+
+    "environmentName": "ailz-dev",
+    "_environmentName": "Name of the local azd environment to create or reuse. Short, identifies workload + lifecycle. Reusing a name also reuses values saved by earlier runs.",
+
+    "location": "eastus2",
+    "_location": "Primary Azure region, no spaces. List valid values with: az account list-locations --query \"[].name\" -o table",
+
+    "hubVnetResourceId": "/subscriptions/<subscription-id>/resourceGroups/<hub-resource-group>/providers/Microsoft.Network/virtualNetworks/<hub-vnet-name>",
+    "_hubVnetResourceId": "Full resource ID of the EXISTING hub VNet to peer with. Get it with: az network vnet show -g <hub-rg> -n <hub-vnet> --query id -o tsv",
+
+    "egressNextHopIp": "10.100.0.4",
+    "_egressNextHopIp": "PRIVATE IPv4 of the hub Azure Firewall or NVA that receives the spoke default route. Never the public IP. Get it with: az network firewall show -g <hub-rg> -n <fw-name> --query \"ipConfigurations[0].privateIPAddress\" -o tsv",
+
+    "previewOnly": true,
+    "_previewOnly": "true  = stop after 'azd provision --preview' and change nothing in Azure. START HERE. false = run the preview, then prompt you to type DEPLOY before provisioning."
+  },
+
+  "azureTarget": {
+    "_comment": "STRONGLY RECOMMENDED. Without these, azd silently uses whatever subscription/resource group the environment last had, which is a common cause of 'it deployed to the wrong place'.",
+    "_mapsTo": "Deploy-AilzIntegrated.ps1 -AdditionalEnvironmentVariables",
+
+    "AZURE_SUBSCRIPTION_ID": "<subscription-id>",
+    "AZURE_RESOURCE_GROUP": "<spoke-resource-group-name>",
+    "_AZURE_RESOURCE_GROUP": "Resource group that will hold the SPOKE resources. May already exist or be created by the deployment."
+  },
+
+  "existingObservability": {
+    "_comment": "OPTIONAL. Reuse hub-managed monitoring instead of deploying new. Leave all three empty to deploy a new workspace and component.",
+    "_mapsTo": "Deploy-AilzIntegrated.ps1 -ExistingLogAnalyticsWorkspaceResourceId / -ExistingApplicationInsightsResourceId / -ExistingApplicationInsightsConnectionString",
+
+    "logAnalyticsWorkspaceResourceId": "",
+    "_logAnalyticsWorkspaceResourceId": "Example: /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.OperationalInsights/workspaces/<name>",
+
+    "applicationInsightsResourceId": "",
+    "_applicationInsightsResourceId": "Example: /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<name>. MUST be supplied together with the connection string below, or the script throws.",
+
+    "applicationInsightsConnectionString": "",
+    "_applicationInsightsConnectionString": "SECRET-ISH. Prefer leaving this empty here and setting the environment variable AILZ_APPINSIGHTS_CONNECTION_STRING in your shell instead. Retrieve with: az monitor app-insights component show -g <rg> --app <name> --query connectionString -o tsv"
+  },
+
+  "landingZoneDns": {
+    "_comment": "OPTIONAL but usually REQUIRED in a real Azure Landing Zone. Pick ONE of the two strategies below.",
+    "_mapsTo": "Deploy-AilzIntegrated.ps1 -AdditionalEnvironmentVariables",
+
+    "POLICY_MANAGED_PRIVATE_DNS": "false",
+    "_POLICY_MANAGED_PRIVATE_DNS": "STRATEGY A. Set to \"true\" if Azure Policy in your platform automatically links private endpoints to hub Private DNS zones (typical CAF / Enterprise-Scale platform LZ). This stops the deployment creating its own zones, which would otherwise CONFLICT with policy and fail. If you set this to true, leave the whole existingPrivateDnsZones section empty.",
+
+    "DNS_ZONE_LINK_SUFFIX": "",
+    "_DNS_ZONE_LINK_SUFFIX": "Set a unique short value (e.g. \"spoke01\") when MORE THAN ONE spoke links to the same shared Private DNS zone. Without it the VNet link name collides and the second deployment fails. 1-80 chars, alphanumeric / hyphen / underscore only."
+  },
+
+  "existingPrivateDnsZones": {
+    "_comment": "STRATEGY B. OPTIONAL. Only when the hub owns the Private DNS zones and Azure Policy does NOT link them automatically. Supply the resource ID of each zone you want to REUSE; leave a zone empty to let the deployment create it locally. Delete this entire section if you set POLICY_MANAGED_PRIVATE_DNS to true.",
+    "_mapsTo": "Deploy-AilzIntegrated.ps1 -AdditionalEnvironmentVariables",
+    "_idFormat": "/subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Network/privateDnsZones/<zone-name>",
+    "_note": "You must also ensure each reused zone is linked to the spoke VNet (or reachable via hub-side link + peering). This deployment does not link reused zones for you.",
+
+    "EXISTING_PRIVATE_DNS_ZONE_COGSVCS_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_COGSVCS_RESOURCE_ID": "privatelink.cognitiveservices.azure.com",
+
+    "EXISTING_PRIVATE_DNS_ZONE_OPENAI_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_OPENAI_RESOURCE_ID": "privatelink.openai.azure.com",
+
+    "EXISTING_PRIVATE_DNS_ZONE_AISERVICES_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_AISERVICES_RESOURCE_ID": "privatelink.services.ai.azure.com",
+
+    "EXISTING_PRIVATE_DNS_ZONE_SEARCH_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_SEARCH_RESOURCE_ID": "privatelink.search.windows.net",
+
+    "EXISTING_PRIVATE_DNS_ZONE_COSMOS_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_COSMOS_RESOURCE_ID": "privatelink.documents.azure.com",
+
+    "EXISTING_PRIVATE_DNS_ZONE_BLOB_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_BLOB_RESOURCE_ID": "privatelink.blob.core.windows.net",
+
+    "EXISTING_PRIVATE_DNS_ZONE_KEYVAULT_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_KEYVAULT_RESOURCE_ID": "privatelink.vaultcore.azure.net",
+
+    "EXISTING_PRIVATE_DNS_ZONE_APPCONFIG_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_APPCONFIG_RESOURCE_ID": "privatelink.azconfig.io",
+
+    "EXISTING_PRIVATE_DNS_ZONE_ACR_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_ACR_RESOURCE_ID": "privatelink.azurecr.io",
+
+    "EXISTING_PRIVATE_DNS_ZONE_CONTAINERAPPS_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_CONTAINERAPPS_RESOURCE_ID": "privatelink.<region>.azurecontainerapps.io - REGION-SPECIFIC. The region in the zone name must match deployment.location, e.g. privatelink.eastus2.azurecontainerapps.io. Only needed when Container Apps are deployed.",
+
+    "EXISTING_PRIVATE_DNS_ZONE_AZUREMONITOR_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_AZUREMONITOR_RESOURCE_ID": "privatelink.monitor.azure.com",
+
+    "EXISTING_PRIVATE_DNS_ZONE_OMSOPSINSIGHTS_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_OMSOPSINSIGHTS_RESOURCE_ID": "privatelink.oms.opinsights.azure.com",
+
+    "EXISTING_PRIVATE_DNS_ZONE_ODSOPSINSIGHTS_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_ODSOPSINSIGHTS_RESOURCE_ID": "privatelink.ods.opinsights.azure.com",
+
+    "EXISTING_PRIVATE_DNS_ZONE_AZUREAUTOMATION_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_AZUREAUTOMATION_RESOURCE_ID": "privatelink.agentsvc.azure.automation.net",
+
+    "EXISTING_PRIVATE_DNS_ZONE_APPINSIGHTS_RESOURCE_ID": "",
+    "_EXISTING_PRIVATE_DNS_ZONE_APPINSIGHTS_RESOURCE_ID": "privatelink.applicationinsights.io. Only consumed when ENABLE_PRIVATE_LOG_ANALYTICS is true and the Monitor Private Link Scope is created locally."
+  },
+
+  "spokeNetwork": {
+    "_comment": "READ THIS IF PREFLIGHT REPORTS OVERLAPPING CIDR. The spoke address range is NOT settable through an azd environment variable. It must be edited into main.parameters.json.",
+    "_mapsTo": "MANUAL EDIT to main.parameters.json -> parameters -> vnetAddressPrefixes. NOT an environment variable.",
+    "_default": "192.168.0.0/21 is the default in this checkout. If that overlaps your hub or any connected network, set a non-overlapping range below.",
+    "_howToApply": "Add this object inside the 'parameters' object of main.parameters.json:  \"vnetAddressPrefixes\": { \"value\": [ \"10.200.0.0/21\" ] }",
+    "_sizing": "Keep at least a /21. The template subdivides this range into the Foundry agent, private endpoint, jumpbox, Bastion and Container Apps subnets.",
+
+    "vnetAddressPrefixes": [
+      "192.168.0.0/21"
+    ]
+  },
+
+  "optionalFeatures": {
+    "_comment": "OPTIONAL. Everything here has a working default, so you can delete this whole section for a first deployment. Values are strings because they become azd environment variables.",
+    "_mapsTo": "Deploy-AilzIntegrated.ps1 -AdditionalEnvironmentVariables",
+    "_fullReference": "https://azure.github.io/AI-Landing-Zones/bicep/parameterization/",
+
+    "DEPLOY_JUMPBOX": "false",
+    "_DEPLOY_JUMPBOX": "Deploy a jumpbox VM inside the spoke. In an integrated landing zone you usually reach the spoke from an EXISTING hub jumpbox instead, so this stays false.",
+
+    "DEPLOY_BASTION": "false",
+    "_DEPLOY_BASTION": "Deploy Azure Bastion in the spoke. Usually false when the hub already provides Bastion.",
+
+    "DEPLOY_SEARCH_SERVICE": "true",
+    "DEPLOY_COSMOS_DB": "true",
+    "DEPLOY_KEY_VAULT": "true",
+    "DEPLOY_STORAGE_ACCOUNT": "true",
+    "DEPLOY_CONTAINER_APPS": "true",
+    "DEPLOY_CONTAINER_REGISTRY": "true",
+    "DEPLOY_API_MANAGEMENT": "false",
+    "DEPLOY_POSTGRES": "false",
+    "DEPLOY_GROUNDING_WITH_BING": "false",
+    "_DEPLOY_GROUNDING_WITH_BING": "Grounding with Bing is not available in every region or every subscription. Leave false unless you have confirmed availability.",
+
+    "RESOURCE_NAMING_MODE": "caf",
+    "_RESOURCE_NAMING_MODE": "\"caf\" generates Cloud Adoption Framework names from the four CAF_* values below. The alternative is \"legacy\".",
+
+    "CAF_WORKLOAD_NAME": "",
+    "_CAF_WORKLOAD_NAME": "Short workload token used in generated resource names, e.g. \"aichat\".",
+    "CAF_ENVIRONMENT_NAME": "",
+    "_CAF_ENVIRONMENT_NAME": "Lifecycle token, e.g. \"dev\", \"test\", \"prod\".",
+    "CAF_REGION_NAME": "",
+    "_CAF_REGION_NAME": "Short region token, e.g. \"eus2\".",
+    "CAF_INSTANCE": "001"
+  },
+
+  "additionalEnvironmentVariables": {
+    "_comment": "ESCAPE HATCH. Any other azd environment variable from main.parameters.json that has no home above. Names must match main.parameters.json EXACTLY. Never put passwords, tokens or application secrets here; use Azure Key Vault."
+  }
+}

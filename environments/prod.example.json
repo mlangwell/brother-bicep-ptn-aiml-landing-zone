@@ -1,0 +1,123 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": 1,
+  "environment": "prod",
+  "synthetic": false,
+  "azure": { "tenantId": null, "subscriptionId": null, "resourceGroup": null, "location": null },
+  "github": {
+    "repository": null, "repositoryId": null, "ownerId": null,
+    "protectedRef": null, "offering": null, "visibility": null,
+    "environmentReviewers": [],
+    "oidc": {
+      "issuer": "https://token.actions.githubusercontent.com",
+      "audience": "api://AzureADTokenExchange",
+      "subjectFormat": null, "previewSubject": null, "deploySubject": null
+    },
+    "runner": {
+      "mode": null, "group": null, "labels": [],
+      "subnetResourceId": null, "networkConfigurationId": null
+    }
+  },
+  "identities": {
+    "preview": { "clientId": null, "principalId": null, "resourceId": null },
+    "deploy": { "clientId": null, "principalId": null, "resourceId": null },
+    "workload": { "clientId": null, "principalId": null, "resourceId": null },
+    "developerObjectIds": [], "developerGroupObjectIds": []
+  },
+  "parameters": {
+    "deploymentMode": "ailz-integrated",
+    "deploymentTags": { "environment": "prod", "owner": null },
+    "networkIsolation": true, "allowedIpRanges": [], "policyManagedPrivateDns": false,
+    "useExistingVNet": false, "sideBySideDeploy": true, "deploySubnets": true,
+    "deployNsgs": true, "deployAzureFirewall": false,
+    "deployAiFoundry": true, "deployAfProject": true, "deployAiFoundrySubnet": false,
+    "deployAAfAgentSvc": false, "aiFoundryDisableLocalAuth": true,
+    "deployGroundingWithBing": false, "prepareHostedAgent": false,
+    "deployHostedAgent": false, "enableAgenticRetrieval": false,
+    "deployAppConfig": true, "appRuntimeConfigurationMode": "appConfig",
+    "deployKeyVault": false, "deployVmKeyVault": false,
+    "deployLogAnalytics": true, "deployAppInsights": true, "enablePrivateLogAnalytics": true,
+    "deploySearchService": false, "deploySpeechService": false,
+    "deployStorageAccount": false, "deployCosmosDb": false, "enableCosmosAnalyticalStorage": false,
+    "deployContainerApps": true, "deployContainerEnv": true,
+    "deployContainerRegistry": false, "deployAcrTaskAgentPool": false,
+    "deployVM": false, "deployJumpbox": false, "deployBastion": false,
+    "deployNatGateway": false, "deploySoftware": false,
+    "useUAI": false, "useCAppAPIKey": false, "useZoneRedundancy": null,
+    "publicIngress": { "enabled": false },
+    "aiFoundryProjectName": null, "vnetName": null, "vnetAddressPrefixes": [],
+    "agentSubnetName": null, "agentSubnetPrefix": null,
+    "acaEnvironmentSubnetName": null, "acaEnvironmentSubnetPrefix": null,
+    "peSubnetName": null, "peSubnetPrefix": null,
+    "azureBastionSubnetName": "AzureBastionSubnet", "azureBastionSubnetPrefix": null,
+    "azureFirewallSubnetName": "AzureFirewallSubnet", "azureFirewallSubnetPrefix": null,
+    "gatewaySubnetName": null, "gatewaySubnetPrefix": null,
+    "azureAppGatewaySubnetName": null, "azureAppGatewaySubnetPrefix": null,
+    "jumpboxSubnetName": null, "jumpboxSubnetPrefix": null,
+    "devopsBuildAgentsSubnetName": null, "devopsBuildAgentsSubnetPrefix": null,
+    "hubIntegrationHubVnetResourceId": null,
+    "hubIntegrationEgressNextHopIp": null,
+    "hubIntegrationCreateHubPeering": null,
+    "hubIntegrationPeeringAllowGatewayTransit": null,
+    "hubIntegrationPeeringUseRemoteGateways": null,
+    "existingPrivateDnsZoneCogSvcsResourceId": null,
+    "existingPrivateDnsZoneOpenAiResourceId": null,
+    "existingPrivateDnsZoneAiServicesResourceId": null,
+    "existingPrivateDnsZoneAppConfigResourceId": null,
+    "existingPrivateDnsZoneContainerAppsResourceId": null,
+    "existingPrivateDnsZoneAcrResourceId": null,
+    "existingPrivateDnsZoneAzureMonitorResourceId": null,
+    "existingPrivateDnsZoneOmsOpsInsightsResourceId": null,
+    "existingPrivateDnsZoneOdsOpsInsightsResourceId": null,
+    "existingPrivateDnsZoneAzureAutomationResourceId": null,
+    "existingPrivateDnsZoneAppInsightsResourceId": null,
+    "modelDeploymentList": [{
+      "name": null,
+      "model": { "format": "OpenAI", "name": null, "version": null },
+      "sku": { "name": null, "capacity": null },
+      "canonical_name": null, "apiVersion": null
+    }],
+    "workloadProfiles": [{ "name": null, "workloadProfileType": null }],
+    "databaseContainersList": [], "storageAccountContainersList": []
+  },
+  "gateway": {
+    "enabled": true, "name": null, "workloadKey": null, "sku": "Premium", "capacity": 2,
+    "publisherEmail": null, "publisherName": null, "audience": null,
+    "integrationSubnetName": null, "integrationSubnetPrefix": null,
+    "privateDnsZoneResourceId": null, "stopNewRequests": false, "foundryIntegration": false,
+    "callerMappings": [{
+      "objectId": null, "project": null, "models": [],
+      "tokensPerMinute": null, "tokenQuota": null, "tokenQuotaPeriod": null
+    }]
+  },
+  "application": {
+    "name": null, "registryResourceId": null, "imageRepository": null,
+    "audience": null, "modelDeployment": null, "maxOutputTokens": null,
+    "workspaceRepository": null, "workspaceRef": null
+  },
+  "release": {
+    "repository": null, "runId": null, "runAttempt": null, "sourceSha": null,
+    "workflow": null, "ref": null, "infrastructureVersion": null,
+    "imageDigest": null, "artifactName": null
+  },
+  "governance": {
+    "assignmentPrefix": null, "policyEffect": null, "assessmentApproved": false,
+    "allowedLocations": [], "allowedModelAssetIds": [], "allowedDeploymentSkus": [],
+    "requiredTags": ["environment", "owner"],
+    "budget": {
+      "amount": null, "currency": null, "startDate": null, "endDate": null,
+      "actualThreshold": null, "forecastThreshold": null,
+      "contactEmails": [], "contactGroups": []
+    },
+    "inferenceAllowance": {
+      "amount": null, "currency": null, "pricingDate": null,
+      "pricingSources": [], "allocatedTokens": null
+    }
+  },
+  "network": { "hubAddressPrefixes": [], "runnerSubnetPrefix": null, "reservedAddressPrefixes": [] },
+  "production": {
+    "approved": false, "identityIsolation": null, "dataIsolation": null, "residency": null,
+    "capacity": null, "backupRecovery": null, "retention": null,
+    "availability": null, "approverOwnership": null
+  }
+}

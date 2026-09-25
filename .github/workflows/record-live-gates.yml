@@ -1,0 +1,108 @@
+name: Record reviewed live gate observations
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment of the already completed protected deployment
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+      configuration_sha:
+        description: Exact protected-branch commit containing the environment profile and platform approvals
+        required: true
+        type: string
+      evidence_commit_sha:
+        description: Exact protected-branch commit containing sanitized reviewed observations
+        required: true
+        type: string
+      release_run_id:
+        description: Successful trusted CI run that supplied the deployed immutable release
+        required: true
+        type: string
+      deployment_run_id:
+        description: Successful deploy-environment.yml run with the actual deployment artifact
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ailz-live-gates-${{ inputs.environment }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  GH_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN || github.token }}
+  AILZ_ENVIRONMENT: ${{ inputs.environment }}
+  AILZ_CONFIGURATION_SHA: ${{ inputs.configuration_sha }}
+  AILZ_EVIDENCE_COMMIT_SHA: ${{ inputs.evidence_commit_sha }}
+  AILZ_RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+  AILZ_DEPLOYMENT_RUN_ID: ${{ inputs.deployment_run_id }}
+
+jobs:
+  preflight:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_protected }}
+    runs-on: ubuntu-latest
+    outputs:
+      preflight_hash: ${{ steps.preflight.outputs.preflight_hash }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify source deployment, receipts and existing GitHub protections
+        id: preflight
+        run: |
+          $arguments = @{
+            Phase = 'Preflight'
+            Environment = $env:AILZ_ENVIRONMENT
+            Repository = $env:GITHUB_REPOSITORY
+            ConfigurationSha = $env:AILZ_CONFIGURATION_SHA
+            EvidenceCommitSha = $env:AILZ_EVIDENCE_COMMIT_SHA
+            ReleaseRunId = $env:AILZ_RELEASE_RUN_ID
+            DeploymentRunId = $env:AILZ_DEPLOYMENT_RUN_ID
+            WorkDirectory = Join-Path $env:RUNNER_TEMP 'ailz-live-gates-preflight'
+          }
+          & .\scripts\github\Record-LiveGateEvidence.ps1 @arguments
+
+  record:
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AILZ_PREFLIGHT_HASH: ${{ needs.preflight.outputs.preflight_hash }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Reverify the frozen inputs after protected human review
+        run: |
+          $arguments = @{
+            Phase = 'Record'
+            Environment = $env:AILZ_ENVIRONMENT
+            Repository = $env:GITHUB_REPOSITORY
+            ConfigurationSha = $env:AILZ_CONFIGURATION_SHA
+            EvidenceCommitSha = $env:AILZ_EVIDENCE_COMMIT_SHA
+            ReleaseRunId = $env:AILZ_RELEASE_RUN_ID
+            DeploymentRunId = $env:AILZ_DEPLOYMENT_RUN_ID
+            WorkDirectory = Join-Path $env:RUNNER_TEMP 'ailz-live-gates-record'
+            OutputDirectory = Join-Path $env:GITHUB_WORKSPACE 'artifacts' 'live-gates'
+            ExpectedPreflightHash = $env:AILZ_PREFLIGHT_HASH
+          }
+          & .\scripts\github\Record-LiveGateEvidence.ps1 @arguments
+      - name: Publish reviewed observations, not automated runtime certification
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ailz-promotion-${{ inputs.environment }}-${{ github.run_attempt }}
+          path: artifacts/live-gates/promotion.json
+          if-no-files-found: error

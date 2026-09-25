@@ -1,0 +1,21 @@
+{
+  "if": {
+    "anyOf": [
+      {
+        "allOf": [
+          { "field": "type", "equals": "Microsoft.CognitiveServices/accounts" },
+          { "field": "Microsoft.CognitiveServices/accounts/publicNetworkAccess", "notEquals": "Disabled" }
+        ]
+      },
+      {
+        "allOf": [
+          { "field": "type", "equals": "Microsoft.Search/searchServices" },
+          { "field": "Microsoft.Search/searchServices/publicNetworkAccess", "notEquals": "Disabled" }
+        ]
+      }
+    ]
+  },
+  "then": {
+    "effect": "[parameters('effect')]"
+  }
+}

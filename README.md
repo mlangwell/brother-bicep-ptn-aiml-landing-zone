@@ -22,6 +22,29 @@ Azure Landing Zone hub. Use
 [Deploy-AilzIntegrated.ps1](Deploy-AilzIntegrated.ps1) to configure the `azd`
 environment, preview the infrastructure changes, and provision the deployment.
 
+An additive, opt-in [GitHub development environment path](docs/github-development.md)
+adds typed dev/test/prod profiles, protected artifact promotion, a private APIM
+gateway and a small authenticated inference starter. Infrastructure success is
+not developer readiness: private completion, human SSO and the live acceptance
+gates are separate. The existing wrapper, `azd` hooks and Azure DevOps assets
+remain supported and unchanged.
+
+The APIM gateway can be created by the landing zone, or consumed from
+**per-subscription platform infrastructure**. For the shared option, deploy
+[`platform/api-management/`](platform/api-management/) **once per subscription**,
+then deploy the landing zone **many times** against it via
+`existingApiManagementResourceId`. The landing zone creates Developer by
+default; the structured gateway configuration from the GitHub environment
+profile selects Premium and adds the governed workload API.
+
+Either way, the gateway uses classic VNet injection in Internal mode, so it is
+reachable only from inside the virtual network. Its governed route is
+`/inference/<workloadKey>/v1/responses`. Internal mode registers nothing on
+public DNS, so an operator-created private DNS zone is required before the
+gateway is reachable. See
+[ADR-002](docs/adr/002-apim-merge-conformance.md) and
+[the topology ADR](docs/adr/2026-09-22-apim-classic-vnet-injection.md).
+
 The script configures this topology automatically:
 
 - `DEPLOYMENT_MODE=ailz-integrated`
@@ -31,13 +54,50 @@ The script configures this topology automatically:
 - Spoke egress through the supplied hub firewall or NVA private IP
 - Optional internal Developer-tier API Management in a dedicated spoke subnet
 
+## Quickstart: let Copilot find your values and deploy
+
+Assembling the deployment command by hand is the step most people get wrong. It
+means collecting a dozen resource IDs across two or three subscriptions without
+a typo. Two prompts in
+[Deploy with GitHub Copilot](docs/copilot-deploy-prompt.md) do it for you:
+
+1. **Discover.** Copilot uses the Azure CLI to find your hub VNet, firewall
+   private IP, Private DNS zones and observability resources, then writes a
+   filled-in `config.json`. It only reads from Azure and changes nothing.
+2. **Deploy.** Copilot validates that file, checks your spoke range does not
+   overlap the hub, builds the correct command, runs a preview, and stops for
+   your approval before provisioning.
+
+[config.json.example](config.json.example) is the template behind both. It is a
+commented worksheet covering the four required values, subscription and resource
+group targeting, hub observability reuse, Private DNS strategy for a
+policy-managed landing zone, the spoke address range, and the optional feature
+flags. You can fill it in by hand instead:
+
+```powershell
+Copy-Item config.json.example config.json
+code config.json
+```
+
+`config.json` is git-ignored because it holds subscription and hub identifiers.
+Commit changes to `config.json.example` only.
+
+Prefer to drive the script directly? The rest of this document is the full
+parameter reference, and it remains the authoritative description of the script.
+
 ## Prerequisites
 
 Before running the script, confirm that you have:
 
 1. [PowerShell 7 or later](https://learn.microsoft.com/powershell/scripting/install/installing-powershell).
 2. [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli).
-3. [Azure Developer CLI (`azd`)](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd).
+3. [Azure Developer CLI (`azd`)](https://learn.microsoft.com/azure/developer/azure-developer-cli/install-azd)
+  1.25.5 or later. Check it with `azd version`, and upgrade with
+  `winget upgrade Microsoft.Azd` or the install page. `azure.yaml` enforces
+  this minimum. azd 1.23.4 was the first release to pass the JSON arrays in
+  `main.parameters.json` to their array parameters, such as the API Management
+  CIDR lists. Before it, provisioning fails or sends ARM a string. azd 1.25.5
+  fixed `azd down --purge` for Foundry accounts.
 4. Azure `Contributor` and `User Access Administrator` roles at the deployment
   scope.
 5. Accepted the Responsible AI terms for Azure AI services.
@@ -73,7 +133,7 @@ The script has four required parameters. The remaining parameters are optional.
 | `DeployApiManagement` | No | Deploy a Developer-tier API Management service with internal VNet injection into the AILZ spoke. Disabled by default. | `-DeployApiManagement` |
 | `ApiManagementPublisherEmail` | Conditional | Publisher contact email. Required when `DeployApiManagement` is enabled. | `api-owners@contoso.com` |
 | `ApiManagementPublisherName` | No | Publisher display name. Defaults to `AI Landing Zone`. | `Contoso API Team` |
-| `ApiManagementIngressSourceAddressPrefixes` | No | Hub firewall private IP CIDRs allowed to reach the internal APIM gateway after DNAT. Defaults to `EgressNextHopIp/32`; pass every firewall instance IP when the hub uses multiple addresses. | `@("10.100.0.4/32")` |
+| `ApiManagementIngressSourceAddressPrefixes` | No | Hub firewall source CIDRs allowed to reach the internal APIM gateway on TCP 443. Defaults to the hub VNet's `AzureFirewallSubnet` prefix, read after sign-in, because Azure Firewall source-NATs gateway traffic to a back-end instance IP in that subnet, not to its frontend IP. Falls back to `EgressNextHopIp/32` with a warning when the hub has no readable `AzureFirewallSubnet`, such as an NVA hub. | `@("10.100.0.0/26")` |
 | `AdditionalEnvironmentVariables` | No | PowerShell hashtable containing additional `azd` environment values supported by `main.parameters.json`, such as subscription, resource group, private DNS zone IDs, or feature flags. Values persist in the selected local `azd` environment. | `@{ AZURE_SUBSCRIPTION_ID = "<id>" }` |
 | `PreviewOutput` | No | Preview detail level. `Full` displays ARM What-If changes plus every nested compiled resource declaration. `Slim` (default) displays the original condensed `azd provision --preview` summary. | `Full` |
 | `PreviewOnly` | No | Switch that stops after `azd provision --preview`. Without it, the script displays the preview and then asks you to type `DEPLOY` before provisioning. | `-PreviewOnly` |
@@ -136,8 +196,13 @@ Replace the example values, then run:
 ```
 
 The script signs in when needed, creates or selects the named `azd`
-environment, sets the integrated-topology values, and displays two preview
-sections:
+environment, sets the integrated-topology values, runs the repository preflight,
+and displays the preview. azd runs the preflight as its `preprovision` hook for
+`-PreviewOutput Slim`, and the script runs it itself before `-PreviewOutput
+Full`. A preflight `FAIL` stops the run before anything is deployed.
+With the default `-PreviewOutput Slim` this is the condensed
+`azd provision --preview` summary. With `-PreviewOutput Full` it displays two
+preview sections:
 
 - `ARM What-If resource changes` is Azure's evaluated change set for resources
   ARM expands during What-If.
@@ -149,8 +214,8 @@ sections:
   remain subject to their template or parent-module conditions.
 
 `-PreviewOnly` guarantees that this invocation does not provision resources.
-Pass `-PreviewOutput Slim` when the condensed `azd` resource summary is
-preferred. Omitting `-PreviewOutput` uses `Full`.
+Pass `-PreviewOutput Full` to add the What-If change set and the compiled
+inventory. Omitting `-PreviewOutput` uses `Slim`.
 
 Review both sections for deleted or replaced resources, unexpected role
 assignments, public network access, incorrect regions, and changes outside the
@@ -177,7 +242,8 @@ provisioning. Any other response cancels the deployment.
 After provisioning:
 
 1. Create the reverse hub-to-spoke VNet peering. The template creates only the
-  spoke-to-hub direction.
+  spoke-to-hub direction. API Management depends on this peering, so complete it
+  before you enable the gateway; see [Deploy API Management](#deploy-api-management).
 2. Link the hub-managed private DNS zones to the spoke VNet when Azure Policy
   does not manage those links.
 3. Verify that the hub firewall permits the spoke source range and that its DNS
@@ -192,7 +258,17 @@ for the post-deployment network checks.
 
 ### Deploy API Management
 
-Enable API Management and provide its publisher contact email:
+API Management activates over the spoke's egress path. Its default route goes to
+the hub firewall, so the gateway can reach its dependencies only after the
+hub-to-spoke peering is `Connected`. Created before that, it fails with
+`ActivationFailed`. Because the template creates only the spoke-to-hub
+direction, deploy a new spoke in two passes:
+
+1. Deploy the spoke without `-DeployApiManagement`, as in [Deploy](#deploy).
+2. Have the hub owner create the hub-to-spoke peering. If you own the hub, run
+  `pwsh ./tests/scripts/Add-HubSpokePeering.ps1 -HubVnetResourceId $hubVnetResourceId`.
+  Confirm that both directions show `Connected`.
+3. Rerun the script with `-DeployApiManagement` and the publisher contact email:
 
 ```powershell
 ./Deploy-AilzIntegrated.ps1 `
@@ -205,32 +281,69 @@ Enable API Management and provide its publisher contact email:
   -PreviewOnly
 ```
 
+Preflight enforces the order. For a new spoke it fails with
+`APIM_HUB_PEERING_MISSING` or `APIM_HUB_PEERING_NOT_CONNECTED` until the hub has a
+`Connected` peering to the spoke, and with `APIM_HUB_PEERING_ACCESS_BLOCKED` when
+that peering disallows access to the spoke. Where you own the spoke-to-hub
+peering yourself (`HUB_INTEGRATION_CREATE_HUB_PEERING=false`), it also fails with
+`APIM_SPOKE_PEERING_BLOCKED` when that peering disallows access or forwarded
+traffic. It warns instead of failing when it cannot read the hub VNet or a
+spoke-to-hub peering you own, when the only match is a `Connected` peering it
+cannot attribute to this spoke because the target resource group is not known
+yet, and for a prepared spoke whose route table an operator owns. A `Connected`
+peering is necessary but not sufficient: the hub firewall must also allow the
+gateway's dependencies, as listed below.
+
 The deployment uses the Developer SKU and internal VNet mode. It creates the
-dedicated `api-management-subnet` at `192.168.3.128/27`, an NSG for required
-Azure control-plane and load-balancer traffic plus HTTPS from the approved hub
-firewall CIDRs, and a dedicated route table. The default route sends workload
-and APIM dependency egress to the hub firewall. The required `ApiManagement`
-service-tag route sends control-plane responses directly to the Internet to
-keep TCP 3443 symmetric; this is the sole intentional forced-tunneling
-exception. Set `-ApiManagementPublisherName` to override the default publisher
-name.
+dedicated `api-management-subnet` at `192.168.3.128/27` and a dedicated route
+table. The subnet has service endpoints for Storage, SQL, Key Vault and Event
+Hubs.
+
+Its NSG allows:
+- Azure control-plane traffic and load-balancer probes;
+- HTTPS from the approved hub firewall CIDRs;
+- HTTPS from any in-spoke caller subnets you list;
+- rate-limit counter sync within the subnet.
+
+It denies all other inbound traffic. To let subnets inside the spoke call the
+gateway directly, pass their CIDRs as
+`API_MANAGEMENT_DIRECT_CALLER_ADDRESS_PREFIXES` through
+`-AdditionalEnvironmentVariables`. Callers outside the spoke always go through
+the hub firewall.
+
+The default route sends workload and APIM dependency egress to the hub
+firewall. The required `ApiManagement` service-tag route sends control-plane
+responses directly to the Internet to keep TCP 3443 symmetric; this is the sole
+intentional forced-tunneling exception. Set `-ApiManagementPublisherName` to
+override the default publisher name. Premium and the governed workload API are
+selected through the structured gateway configuration; see
+[ADR-002](docs/adr/002-apim-merge-conformance.md).
 
 The platform team must complete these hub-owned changes before the gateway is
 usable:
 
-1. Configure hub firewall DNAT for TCP 443 to the APIM private VIP. Azure
-  Firewall source-NATs DNAT traffic, so the APIM NSG permits the firewall
-  private IP `/32` by default. Pass
-  `-ApiManagementIngressSourceAddressPrefixes` when multiple firewall private
-  IPs can source the traffic.
+1. Deliver gateway traffic through the hub firewall with source NAT, so it
+  arrives from the `AzureFirewallSubnet` range that the APIM NSG admits. Use
+  either of these patterns:
+   - An application rule for the gateway FQDN. Application rules always
+     source-NAT. Clients resolve the gateway host name to its private VIP and
+     route the spoke range through the firewall.
+   - A private-IP DNAT rule on the firewall, which the Azure Firewall FAQ still
+     labels preview. Clients resolve the gateway host name to the firewall
+     listener.
+
+   Network-rule traffic to private addresses is not source-NATed. It keeps the
+   client address, so the APIM NSG denies it.
 2. Permit the documented APIM VNet dependency service tags, ports, and FQDNs
   in the hub firewall policy. See the [APIM VNet configuration
   reference](https://learn.microsoft.com/azure/api-management/virtual-network-reference).
-3. Publish A records that resolve the APIM gateway, management, portal,
-  developer portal, and SCM host names to its private VIP in DNS visible from
-  the hub and spoke.
-4. Validate that direct spoke access to TCP 443 is denied and that requests
-  succeed only through the hub firewall listener.
+3. Publish DNS for the gateway, management, portal, developer portal, and SCM
+  host names that matches the pattern above. Point them at the private VIP for
+  the application-rule pattern, or at the firewall listener for DNAT. Scope
+  zones to the exact host names; never create a private zone for
+  `azure-api.net`.
+4. Validate that direct access to TCP 443 from other spoke subnets is denied,
+  and that requests succeed through the hub firewall path.
 
 Disabling `DeployApiManagement` does not delete existing resources because ARM
 deployments are incremental. After exporting any APIM data-plane configuration,
@@ -316,6 +429,73 @@ These values persist in the local `azd` environment. Do not pass passwords,
 tokens, or other application secrets through `-AdditionalEnvironmentVariables`;
 store application secrets in Azure Key Vault.
 
+## Tear down
+
+Preview the teardown, then run it from the repository root:
+
+```powershell
+pwsh ./scripts/Remove-AilzEnvironment.ps1 -EnvironmentName "ailz-dev" -WhatIf
+pwsh ./scripts/Remove-AilzEnvironment.ps1 -EnvironmentName "ailz-dev"
+```
+
+`azd down` cannot tear this template down alone, because Azure AI Search
+refuses to delete a service that still has shared private links, and Azure
+refuses to delete a Log Analytics workspace that a scoped resource still links
+into an Azure Monitor Private Link Scope. The script does nothing destructive
+until its checks pass:
+
+1. Checks that azd is 1.25.5 or later, and at least the minimum in your
+  `azure.yaml`.
+2. Checks that azd is signed in. `azd auth login --check-status` always exits 0,
+  so the script reads its JSON status. The Azure CLI sign-in is checked by the
+  first `az` call.
+3. Reads the subscription and resource group from the azd environment.
+4. Refuses a resource group that is not tagged `azd-env-name=<environment>`,
+  unless you pass `-AllowExternalResourceGroup`. `azd down --force` deletes
+  every resource in the group, including resources this template did not create.
+5. Shows the plan and asks you to type the resource group name. `-Force` skips
+  this prompt.
+6. Deletes each Search shared private link and waits until it is gone.
+7. Deletes each Azure Monitor private link scoped resource and waits until it is
+  gone. `azd down` force-deletes the Log Analytics workspace before it deletes
+  the resource group, and Azure rejects that with
+  `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` while a scoped resource
+  still links the workspace, which fails the teardown before anything is
+  deleted.
+8. Runs `azd down --force --purge`. This deletes the resource group and purges
+  its soft-deleted Key Vault, App Configuration, API Management, Foundry and Log
+  Analytics resources, which cannot then be recovered.
+9. Prints the hub-side peering that the hub owner must delete. The script never
+  changes the hub, and a `Disconnected` peering cannot be reused when the spoke
+  is redeployed.
+
+The script deletes the shared private links and scoped resources with your Azure
+CLI identity, and `azd down` runs as your azd identity. Both need rights on the
+resource group.
+
+If `azd down` fails before it deletes the resource group, fix the reported error
+and rerun the script; it finds no links or scoped resources and runs `azd down`
+again. azd purges the Log Analytics workspace before it deletes the group and
+purges the other resources after, so it can fail on either side of the group
+deletion. A purge failure after the group is gone cannot be redone by a rerun.
+The script then names the `az keyvault`, `az appconfig`, `az apim deletedservice`
+and `az cognitiveservices account` commands that list and purge what remains.
+Purging a soft-deleted Key Vault needs
+[permissions at subscription level](https://learn.microsoft.com/azure/key-vault/general/key-vault-recovery),
+which a role assigned only on the resource group does not grant.
+
+To tear down by hand instead, run the same steps in order:
+
+```powershell
+az search shared-private-link-resource list --service-name "<search-service>" --resource-group "<spoke-resource-group>" --output table
+az search shared-private-link-resource delete --name "<link-name>" --service-name "<search-service>" --resource-group "<spoke-resource-group>" --yes
+az monitor private-link-scope scoped-resource list --scope-name "<private-link-scope>" --resource-group "<spoke-resource-group>" --output table
+az monitor private-link-scope scoped-resource delete --name "<scoped-resource>" --scope-name "<private-link-scope>" --resource-group "<spoke-resource-group>" --yes
+azd down --force --purge
+```
+
+Then have the hub owner delete the hub-side peering to the deleted spoke.
+
 ## Troubleshooting
 
 ### `Required command '<name>' was not found`
@@ -338,6 +518,51 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 Do not weaken the machine-wide execution policy unless your organization has
 approved that change.
+
+### `this project requires a version of azd within the range '>= 1.25.5'`
+
+The installed azd is older than this template's minimum; see the
+[prerequisites](#prerequisites). Upgrade it and rerun:
+
+```powershell
+winget upgrade Microsoft.Azd
+azd version
+```
+
+`error unmarshalling Bicep template parameters: invalid character ... after object
+key:value pair` has the same cause: an azd older than 1.23.4 reading a project
+whose `azure.yaml` does not declare the minimum. Preflight reports it as
+`AZD_VERSION_UNSUPPORTED` when azd substitutes the parameters file. It reads the
+azd on PATH, so put the azd you run first on PATH.
+
+### API Management fails with `ActivationFailed`
+
+`Connectivity to Monitoring failed` or `Connectivity to MetricsExtension failed`
+means the gateway could not reach its dependencies through the hub. The usual
+cause is a missing hub-to-spoke peering, not the NSG, which already allows Azure
+Monitor. A failed service must be deleted before it can be redeployed
+(`ServiceInFailedProvisioningState`). Delete it, create the peering, confirm both
+directions show `Connected`, and rerun with `-DeployApiManagement`. See
+[Deploy API Management](#deploy-api-management).
+
+### Preflight reports `APIM_HUB_PEERING_MISSING` or `APIM_HUB_PEERING_NOT_CONNECTED`
+
+The hub has no `Connected` peering to the spoke, so the gateway would fail
+activation. On a first deployment, deploy the spoke without
+`-DeployApiManagement` and have the hub-to-spoke peering created first.
+`Initiated` means one direction is missing. `Disconnected` means the spoke VNet
+was deleted or recreated: delete the hub-side peering and create it again.
+
+`APIM_HUB_PEERING_ACCESS_BLOCKED` means the peering is `Connected` but the hub
+side disallows access to the spoke; the hub owner must allow it.
+`APIM_SPOKE_PEERING_BLOCKED` means a spoke-to-hub peering that you own disallows
+access or forwarded traffic; allow both on it. `APIM_SPOKE_PEERING_UNVERIFIED`
+means preflight could not read that peering, or found none back to the hub;
+confirm both flags on it yourself.
+`APIM_HUB_PEERING_UNVERIFIED` means preflight could not read the hub VNet, or
+could not tell this spoke's peering from another spoke's because
+`AZURE_RESOURCE_GROUP` is not set yet. Pass `AZURE_SUBSCRIPTION_ID` and
+`AZURE_RESOURCE_GROUP` through `-AdditionalEnvironmentVariables`.
 
 ### Azure sign-in opens the wrong tenant
 
@@ -475,6 +700,8 @@ underlying deployment error.
 
 ## Related documentation
 
+- [Deployment worksheet](config.json.example) and
+  [Deploy with GitHub Copilot](docs/copilot-deploy-prompt.md)
 - [How to deploy Azure AI Landing Zones](https://azure.github.io/AI-Landing-Zones/bicep/how-to-deploy/#ai-landing-zone-integrated-deployment)
 - [AILZ parameter reference](https://azure.github.io/AI-Landing-Zones/bicep/parameterization/)
 - [Hub-and-spoke topology](https://azure.github.io/AI-Landing-Zones/bicep/hub-and-spoke/)

@@ -54,11 +54,14 @@ module subnetsM 'subnet.bicep' = [
             }
           }
         ]
-        serviceEndpoints: empty(subnets[i].serviceEndpoints) ? [] : [
-          { 
-            service : subnets[i].serviceEndpoints[0]
-          }
-        ]
+        // Map EVERY requested service endpoint, not just the first. The API
+        // Management injection subnet needs four (Storage, Sql, KeyVault,
+        // EventHub) because Learn strongly recommends service endpoints for
+        // those dependencies whenever the subnet is force tunnelled, and this
+        // landing zone routes 0.0.0.0/0 to the hub firewall by default.
+        serviceEndpoints: map(subnets[i].serviceEndpoints, endpoint => {
+          service: endpoint
+        })
         networkSecurityGroupId: !empty(subnets[i].?networkSecurityGroupResourceId ?? '')
           ? string(subnets[i].networkSecurityGroupResourceId)
           : (deployNsgs && !contains(invalidNsgSubnets, subnets[i].name) ? nsgsM[i]!.outputs.id : '')

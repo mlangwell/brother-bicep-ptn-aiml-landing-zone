@@ -1,0 +1,587 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GitHub private developer environment profile v1",
+  "description": "Nonsecret operator inputs. Test-Json validates shape; Environment.psm1 additionally validates composition, identity isolation, exact approvals, topology and readiness. Unresolved examples are deliberately not valid deployment profiles. Synthetic profiles are offline-only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "environment", "synthetic", "azure", "github", "identities", "parameters", "gateway", "application", "release", "governance", "network"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "environment": { "type": "string", "enum": ["dev", "test", "prod"] },
+    "synthetic": { "type": "boolean" },
+    "azure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenantId", "subscriptionId", "resourceGroup", "location"],
+      "properties": {
+        "tenantId": { "$ref": "#/definitions/guid" },
+        "subscriptionId": { "$ref": "#/definitions/guid" },
+        "resourceGroup": { "$ref": "#/definitions/resourceName" },
+        "location": { "$ref": "#/definitions/location" }
+      }
+    },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "repositoryId", "ownerId", "protectedRef", "offering", "visibility", "environmentReviewers", "oidc", "runner"],
+      "properties": {
+        "repository": { "$ref": "#/definitions/repository" },
+        "repositoryId": { "$ref": "#/definitions/positiveInteger" },
+        "ownerId": { "$ref": "#/definitions/positiveInteger" },
+        "protectedRef": { "$ref": "#/definitions/gitRef" },
+        "offering": { "type": "string", "enum": ["enterprise-cloud", "team", "pro", "free"] },
+        "visibility": { "type": "string", "enum": ["public", "private", "internal"] },
+        "environmentReviewers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "id"],
+            "properties": {
+              "type": { "type": "string", "enum": ["User", "Team"] },
+              "id": { "$ref": "#/definitions/positiveInteger" }
+            }
+          }
+        },
+        "oidc": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["issuer", "audience", "subjectFormat", "previewSubject", "deploySubject"],
+          "properties": {
+            "issuer": { "const": "https://token.actions.githubusercontent.com" },
+            "audience": { "const": "api://AzureADTokenExchange" },
+            "subjectFormat": {
+              "type": "string",
+              "enum": ["immutable", "legacy"],
+              "description": "Must match the inspected target repository. Custom subject templates and non-github.com clouds require a separately implemented contract."
+            },
+            "previewSubject": { "$ref": "#/definitions/nonblank" },
+            "deploySubject": { "$ref": "#/definitions/nonblank" }
+          }
+        },
+        "runner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "group", "labels", "subnetResourceId"],
+          "properties": {
+            "mode": { "type": "string", "enum": ["github-hosted-private", "existing-private"] },
+            "group": { "$ref": "#/definitions/resourceName" },
+            "labels": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/resourceName" } },
+            "subnetResourceId": { "$ref": "#/definitions/subnetId" },
+            "networkConfigurationId": { "type": ["string", "null"], "pattern": "^[A-Za-z0-9_-]+$" }
+          },
+          "allOf": [{
+            "if": { "properties": { "mode": { "const": "github-hosted-private" } } },
+            "then": { "required": ["networkConfigurationId"], "properties": { "networkConfigurationId": { "type": "string", "minLength": 1 } } }
+          }]
+        }
+      }
+    },
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preview", "deploy", "workload", "developerObjectIds", "developerGroupObjectIds"],
+      "properties": {
+        "preview": { "$ref": "#/definitions/identity" },
+        "deploy": { "$ref": "#/definitions/identity" },
+        "workload": { "$ref": "#/definitions/identity" },
+        "developerObjectIds": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/guid" } },
+        "developerGroupObjectIds": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/guid" } }
+      }
+    },
+    "parameters": { "$ref": "#/definitions/bicepParameters" },
+    "gateway": {
+      "description": "The landing zone's gateway binding. Everything except workloadKey is the sealed Bicep gatewayConfiguration shape and is handed to apiManagementConfiguration verbatim; workloadKey is lifted into the separate apiManagementWorkloadKey parameter, so it is required here but absent there.",
+      "allOf": [
+        { "$ref": "#/definitions/gatewayServiceConfiguration" },
+        { "type": "object", "required": ["workloadKey"] }
+      ]
+    },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "registryResourceId", "imageRepository", "audience", "modelDeployment", "maxOutputTokens", "workspaceRepository", "workspaceRef"],
+      "properties": {
+        "name": { "type": "string", "minLength": 2, "maxLength": 32, "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" },
+        "registryResourceId": { "$ref": "#/definitions/registryId" },
+        "imageRepository": { "type": "string", "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$" },
+        "audience": { "$ref": "#/definitions/audience" },
+        "modelDeployment": { "$ref": "#/definitions/resourceName" },
+        "maxOutputTokens": { "$ref": "#/definitions/positiveInteger" },
+        "workspaceRepository": { "type": "string", "pattern": "^https://github\\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$" },
+        "workspaceRef": { "$ref": "#/definitions/sha" }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "runId", "runAttempt", "sourceSha", "workflow", "ref", "infrastructureVersion", "imageDigest", "artifactName"],
+      "properties": {
+        "repository": { "$ref": "#/definitions/repository" },
+        "runId": { "$ref": "#/definitions/positiveInteger" },
+        "runAttempt": { "$ref": "#/definitions/positiveInteger" },
+        "sourceSha": { "$ref": "#/definitions/sha" },
+        "workflow": { "type": "string", "pattern": "^\\.github/workflows/[A-Za-z0-9][A-Za-z0-9_-]*\\.ya?ml$" },
+        "ref": { "$ref": "#/definitions/gitRef" },
+        "infrastructureVersion": { "type": "string", "description": "Exact bundle/manifest version, including its v prefix when present. No normalization is performed during artifact identity verification.", "pattern": "^v?(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" },
+        "imageDigest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "artifactName": { "$ref": "#/definitions/resourceName" }
+      }
+    },
+    "governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assignmentPrefix", "policyEffect", "assessmentApproved", "allowedLocations", "allowedModelAssetIds", "allowedDeploymentSkus", "requiredTags", "budget", "inferenceAllowance"],
+      "properties": {
+        "assignmentPrefix": { "$ref": "#/definitions/resourceName" },
+        "policyEffect": { "type": "string", "enum": ["Audit", "Deny", "Disabled"] },
+        "assessmentApproved": { "type": "boolean" },
+        "allowedLocations": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/location" } },
+        "allowedModelAssetIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Exact OpenAI registry model path with trailing slash (all versions of that exact model), or an exact /versions/<model.version> path. No publisher, wildcard or prefix approval.",
+          "items": { "type": "string", "pattern": "^azureml://registries/azure-openai/models/[A-Za-z0-9][A-Za-z0-9._-]*/(?:versions/[A-Za-z0-9][A-Za-z0-9._-]*)?$" }
+        },
+        "allowedDeploymentSkus": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/resourceName" } },
+        "requiredTags": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/resourceName" } },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["amount", "currency", "startDate", "endDate", "actualThreshold", "forecastThreshold", "contactEmails", "contactGroups"],
+          "properties": {
+            "amount": { "$ref": "#/definitions/positiveNumber" },
+            "currency": { "$ref": "#/definitions/currency" },
+            "startDate": { "$ref": "#/definitions/date" },
+            "endDate": { "$ref": "#/definitions/date" },
+            "actualThreshold": { "$ref": "#/definitions/positiveNumber" },
+            "forecastThreshold": { "$ref": "#/definitions/positiveNumber" },
+            "contactEmails": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/email" } },
+            "contactGroups": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/actionGroupId" } }
+          }
+        },
+        "inferenceAllowance": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Operator-supplied estimates, not a currency enforcement ledger. allocatedTokens bounds the sum of caller/model quotas for their common tokenQuotaPeriod, not all Azure charges.",
+          "required": ["amount", "currency", "pricingDate", "pricingSources", "allocatedTokens"],
+          "properties": {
+            "amount": { "$ref": "#/definitions/positiveNumber" },
+            "currency": { "$ref": "#/definitions/currency" },
+            "pricingDate": { "$ref": "#/definitions/date" },
+            "pricingSources": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^https://[^\\s/@?#]+(?:/[^\\s?#]*)?$" } },
+            "allocatedTokens": { "$ref": "#/definitions/positiveInteger" }
+          }
+        }
+      }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hubAddressPrefixes", "runnerSubnetPrefix", "reservedAddressPrefixes"],
+      "properties": {
+        "hubAddressPrefixes": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/cidr" } },
+        "runnerSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "reservedAddressPrefixes": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "Other address allocations. Must not overlap spoke, hub, runner, gateway or another reserved allocation.",
+          "items": { "$ref": "#/definitions/cidr" }
+        }
+      }
+    },
+    "production": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approved", "identityIsolation", "dataIsolation", "residency", "capacity", "backupRecovery", "retention", "availability", "approverOwnership"],
+      "properties": {
+        "approved": { "type": "boolean" },
+        "identityIsolation": { "$ref": "#/definitions/nonblank" },
+        "dataIsolation": { "$ref": "#/definitions/nonblank" },
+        "residency": { "$ref": "#/definitions/nonblank" },
+        "capacity": { "$ref": "#/definitions/nonblank" },
+        "backupRecovery": { "$ref": "#/definitions/nonblank" },
+        "retention": { "$ref": "#/definitions/nonblank" },
+        "availability": { "$ref": "#/definitions/nonblank" },
+        "approverOwnership": { "$ref": "#/definitions/nonblank" }
+      }
+    }
+  },
+  "allOf": [{
+    "if": { "properties": { "environment": { "const": "prod" } } },
+    "then": { "required": ["production"], "properties": { "production": { "properties": { "approved": { "const": true } } } } }
+  }],
+  "definitions": {
+    "gatewayServiceConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "New GitHub profiles require an explicit name for the pre-preview APIM state lookup. Provisioning state is observed and hash-bound by P5, not supplied or guessed in this profile. workloadKey is listed so the profile's gateway block stays closed, but it is only required there, not in the composed apiManagementConfiguration ARM parameter.",
+      "required": ["enabled", "name", "sku", "capacity", "publisherEmail", "publisherName", "audience", "integrationSubnetName", "integrationSubnetPrefix", "privateDnsZoneResourceId", "stopNewRequests", "callerMappings"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "name": { "$ref": "#/definitions/resourceName" },
+        "workloadKey": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 24,
+          "pattern": "^[a-z0-9]+$",
+          "description": "Landing-zone-scoped key that keeps the API name, API path, backend, logger and named values unique when several landing zones share one gateway. Lowercase alphanumeric so it is valid as both an APIM resource name segment and a URL path segment. Must be distinct per landing zone; it must NOT be derived from subscription+environment+location, because two landing zones in the same subscription, environment and region would then collide."
+        },
+        "sku": { "type": "string", "enum": ["Developer", "Premium"], "description": "Classic VNet injection tiers. Developer for sandbox/dev/test (no SLA, capped at one unit); Premium for production. Both use the identical injection model, so one topology serves every subscription. The v2 tiers are rejected: Standard v2 cannot be injected at all, and Premium v2 uses a different delegated-subnet model with no migration path from classic." },
+        "capacity": { "$ref": "#/definitions/positiveInteger" },
+        "publisherEmail": { "$ref": "#/definitions/email" },
+        "publisherName": { "$ref": "#/definitions/nonblank" },
+        "audience": { "$ref": "#/definitions/audience" },
+        "integrationSubnetName": { "$ref": "#/definitions/resourceName" },
+        "integrationSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "privateDnsZoneResourceId": { "$ref": "#/definitions/gatewayPrivateDnsId" },
+        "stopNewRequests": { "type": "boolean" },
+        "foundryIntegration": { "type": "boolean", "const": false, "default": false },
+        "callerMappings": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/callerMapping" } }
+      },
+      "allOf": [{
+        "if": { "properties": { "enabled": { "const": true } } },
+        "then": { "properties": { "callerMappings": { "minItems": 1 } } }
+      }]
+    },
+    "nonblank": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "resourceName": { "type": "string", "minLength": 1, "maxLength": 90, "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9_-]$|^[A-Za-z0-9_]$" },
+    "location": { "type": "string", "pattern": "^[a-z][a-z0-9]+$" },
+    "guid": { "type": "string", "pattern": "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$", "not": { "const": "00000000-0000-0000-0000-000000000000" } },
+    "positiveInteger": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "positiveNumber": { "type": "number", "exclusiveMinimum": 0 },
+    "currency": { "type": "string", "pattern": "^[A-Z]{3}$" },
+    "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$", "not": { "const": "0000000000000000000000000000000000000000" } },
+    "email": { "type": "string", "pattern": "^[^\\s@<>]+@[^\\s@<>]+\\.[^\\s@<>]+$" },
+    "audience": {
+      "type": "string",
+      "description": "Exact expected Entra access-token aud claim: a nonzero API application client-ID GUID or an operator-approved api:// or https:// identifier URI. Preserved literally, including case and trailing slash; never rewritten to an invented URI. This is not a token scope. Whitespace, credentials, query strings and fragments are forbidden.",
+      "not": { "pattern": "\\s" },
+      "oneOf": [
+        { "$ref": "#/definitions/guid" },
+        { "type": "string", "pattern": "^(?:api|https)://[A-Za-z0-9][A-Za-z0-9./_-]*$" }
+      ]
+    },
+    "repository": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$" },
+    "gitRef": { "type": "string", "pattern": "^refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9_./-]*$" },
+    "cidr": { "type": "string", "pattern": "^(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}/(?:[0-9]|[12][0-9]|3[0-2])$" },
+    "armId": { "type": "string", "pattern": "^/subscriptions/[0-9A-Fa-f-]{36}/resourceGroups/[A-Za-z0-9_][A-Za-z0-9_.-]*/providers/[A-Za-z][A-Za-z0-9.]+(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*){2,}$" },
+    "identityId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.ManagedIdentity/userAssignedIdentities/[A-Za-z0-9_-]+$" }] },
+    "registryId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.ContainerRegistry/registries/[A-Za-z0-9]{5,50}$" }] },
+    "vnetId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.Network/virtualNetworks/[A-Za-z0-9_.-]+$" }] },
+    "subnetId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.Network/virtualNetworks/[A-Za-z0-9_.-]+/subnets/[A-Za-z0-9_.-]+$" }] },
+    "routeTableId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.Network/routeTables/[A-Za-z0-9_.-]+$" }] },
+    "privateDnsId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/Microsoft\\.Network/privateDnsZones/[a-z0-9.-]+$" }] },
+    "gatewayPrivateDnsId": {
+      "description": "Service-scoped private DNS zone for a classic VNet-injected API Management gateway: <gateway-name>.azure-api.net, holding an apex (@) A record for the instance private VIP. Internal mode registers nothing on public DNS, so this zone is what makes the gateway reachable. A privatelink.azure-api.net zone is INVALID here because injected classic instances cannot hold a private endpoint, and a zone for the bare apex azure-api.net is forbidden by Learn: it is a shared public Azure domain and an apex private zone breaks resolution for other Azure services.",
+      "allOf": [
+        { "$ref": "#/definitions/armId" },
+        { "pattern": "/providers/Microsoft\\.Network/privateDnsZones/[a-z0-9-]+\\.azure-api\\.net$" },
+        { "not": { "pattern": "/privateDnsZones/privatelink\\.azure-api\\.net$" } }
+      ]
+    },
+    "actionGroupId": { "allOf": [{ "$ref": "#/definitions/armId" }, { "pattern": "/providers/[Mm]icrosoft\\.[Ii]nsights/actionGroups/[A-Za-z0-9_.-]+$" }] },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clientId", "principalId", "resourceId"],
+      "properties": {
+        "clientId": { "$ref": "#/definitions/guid" },
+        "principalId": { "$ref": "#/definitions/guid" },
+        "resourceId": { "$ref": "#/definitions/identityId" }
+      }
+    },
+    "callerMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objectId", "project", "models", "tokensPerMinute", "tokenQuota", "tokenQuotaPeriod"],
+      "properties": {
+        "objectId": { "$ref": "#/definitions/guid" },
+        "project": { "$ref": "#/definitions/resourceName" },
+        "models": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/resourceName" } },
+        "tokensPerMinute": { "$ref": "#/definitions/positiveInteger" },
+        "tokenQuota": { "$ref": "#/definitions/positiveInteger" },
+        "tokenQuotaPeriod": { "type": "string", "enum": ["Hourly", "Daily", "Weekly", "Monthly", "Yearly"] }
+      }
+    },
+    "modelDeployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "model", "sku", "canonical_name", "apiVersion"],
+      "properties": {
+        "name": { "$ref": "#/definitions/resourceName" },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["format", "name", "version"],
+          "properties": {
+            "format": { "const": "OpenAI" },
+            "name": {
+              "type": "string",
+              "description": "Initial text-only Responses route contract. Additional modalities and model families require a route/metering change, not a wildcard approval.",
+              "enum": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.1", "gpt-5.2", "gpt-5.4", "o3", "o3-mini", "o4-mini"]
+            },
+            "version": { "$ref": "#/definitions/resourceName" }
+          }
+        },
+        "sku": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "capacity"],
+          "properties": {
+            "name": { "$ref": "#/definitions/resourceName" },
+            "capacity": { "$ref": "#/definitions/positiveInteger" }
+          }
+        },
+        "canonical_name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "apiVersion": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(?:-preview)?$" },
+        "raiPolicyName": { "$ref": "#/definitions/resourceName" },
+        "versionUpgradeOption": { "enum": ["NoAutoUpgrade", "OnceCurrentVersionExpired", "OnceNewDefaultVersionAvailable"] }
+      }
+    },
+    "workloadProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "workloadProfileType"],
+      "properties": {
+        "name": { "$ref": "#/definitions/resourceName" },
+        "workloadProfileType": { "$ref": "#/definitions/resourceName" },
+        "minimumCount": { "type": "integer", "minimum": 0 },
+        "maximumCount": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "databaseContainer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "canonical_name", "partitionKey"],
+      "properties": {
+        "name": { "$ref": "#/definitions/resourceName" },
+        "canonical_name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+        "partitionKey": { "type": "string", "pattern": "^/[A-Za-z0-9_/-]+$" },
+        "throughput": { "type": ["integer", "null"], "minimum": 1 },
+        "indexingPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "indexingMode": { "enum": ["consistent", "lazy", "none"] },
+            "automatic": { "type": "boolean" },
+            "includedPaths": { "type": "array", "items": { "$ref": "#/definitions/indexPath" } },
+            "excludedPaths": { "type": "array", "items": { "$ref": "#/definitions/indexPath" } },
+            "compositeIndexes": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["path", "order"],
+                  "properties": {
+                    "path": { "$ref": "#/definitions/nonblank" },
+                    "order": { "enum": ["Ascending", "Descending", "ascending", "descending"] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "indexPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": { "path": { "$ref": "#/definitions/nonblank" } }
+    },
+    "storageContainer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "canonical_name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 3, "maxLength": 63, "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "canonical_name": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" }
+      }
+    },
+    "bicepParameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Actual Bicep parameter names, never azd variables. Composed fields are optional but must exactly equal the resolver result. No secret or VM-password input is supported in v1. With all VM paths disabled, the resolver emits deployVM=false and an empty, unused ARM vmAdminPassword value without changing the Bicep parameter contract. The first explicit workloadProfiles entry selects the single smoke app's profile.",
+      "required": [
+        "deploymentMode", "deploymentTags", "networkIsolation", "allowedIpRanges", "policyManagedPrivateDns", "useExistingVNet", "sideBySideDeploy", "deploySubnets", "deployNsgs", "deployAzureFirewall",
+        "deployAiFoundry", "deployAfProject", "deployAiFoundrySubnet", "deployAAfAgentSvc", "aiFoundryDisableLocalAuth", "deployGroundingWithBing", "prepareHostedAgent", "deployHostedAgent", "enableAgenticRetrieval",
+        "deployAppConfig", "appRuntimeConfigurationMode", "deployKeyVault", "deployVmKeyVault", "deployLogAnalytics", "deployAppInsights", "enablePrivateLogAnalytics",
+        "deploySearchService", "deploySpeechService", "deployStorageAccount", "deployCosmosDb", "enableCosmosAnalyticalStorage",
+        "deployContainerApps", "deployContainerEnv", "deployContainerRegistry", "deployAcrTaskAgentPool", "deployJumpbox", "deployBastion", "deployNatGateway", "deploySoftware",
+        "useUAI", "useCAppAPIKey", "useZoneRedundancy", "publicIngress", "aiFoundryProjectName", "vnetAddressPrefixes",
+        "agentSubnetName", "agentSubnetPrefix", "acaEnvironmentSubnetName", "acaEnvironmentSubnetPrefix", "peSubnetName", "peSubnetPrefix",
+        "azureBastionSubnetName", "azureBastionSubnetPrefix", "azureFirewallSubnetName", "azureFirewallSubnetPrefix", "gatewaySubnetName", "gatewaySubnetPrefix",
+        "azureAppGatewaySubnetName", "azureAppGatewaySubnetPrefix", "jumpboxSubnetName", "jumpboxSubnetPrefix", "devopsBuildAgentsSubnetName", "devopsBuildAgentsSubnetPrefix",
+        "modelDeploymentList", "workloadProfiles", "databaseContainersList", "storageAccountContainersList"
+      ],
+      "properties": {
+        "environmentName": { "enum": ["dev", "test", "prod"] },
+        "location": { "$ref": "#/definitions/location" },
+        "cosmosLocation": { "$ref": "#/definitions/location" },
+        "searchServiceLocation": { "$ref": "#/definitions/location" },
+        "speechServiceLocation": { "$ref": "#/definitions/location" },
+        "privateEndpointLocation": { "$ref": "#/definitions/location" },
+        "privateEndpointResourceGroupName": { "$ref": "#/definitions/resourceName" },
+        "principalId": { "$ref": "#/definitions/guid" },
+        "principalType": { "type": "string", "enum": ["ServicePrincipal", "User", "Group"] },
+        "deploymentTags": { "type": "object", "minProperties": 1, "additionalProperties": { "$ref": "#/definitions/nonblank" } },
+        "deploymentMode": { "enum": ["standalone", "ailz-integrated"] },
+        "networkIsolation": { "type": "boolean" },
+        "allowedIpRanges": { "type": "array", "items": { "$ref": "#/definitions/cidr" } },
+        "policyManagedPrivateDns": { "type": "boolean" },
+        "useExistingVNet": { "type": "boolean" },
+        "existingVnetResourceId": { "$ref": "#/definitions/vnetId" },
+        "sideBySideDeploy": { "type": "boolean" },
+        "deploySubnets": { "type": "boolean" },
+        "deployNsgs": { "type": "boolean" },
+        "deployAzureFirewall": { "type": "boolean" },
+        "deployAiFoundry": { "type": "boolean" },
+        "deployAfProject": { "type": "boolean" },
+        "deployAiFoundrySubnet": { "type": "boolean" },
+        "deployAAfAgentSvc": { "type": "boolean" },
+        "aiFoundryDisableLocalAuth": { "type": "boolean" },
+        "deployGroundingWithBing": { "type": "boolean" },
+        "prepareHostedAgent": { "type": "boolean" },
+        "deployHostedAgent": { "type": "boolean" },
+        "enableAgenticRetrieval": { "type": "boolean" },
+        "deployAppConfig": { "type": "boolean" },
+        "appRuntimeConfigurationMode": { "type": "string", "enum": ["appConfig", "containerEnv", "none"] },
+        "appConfigLabel": { "$ref": "#/definitions/resourceName" },
+        "deployKeyVault": { "type": "boolean" },
+        "deployVmKeyVault": { "type": "boolean" },
+        "deployLogAnalytics": { "type": "boolean" },
+        "deployAppInsights": { "type": "boolean" },
+        "enablePrivateLogAnalytics": { "type": "boolean" },
+        "existingLogAnalyticsWorkspaceResourceId": { "$ref": "#/definitions/armId" },
+        "deploySearchService": { "type": "boolean" },
+        "deploySpeechService": { "type": "boolean" },
+        "speechServiceSku": { "enum": ["F0", "S0"] },
+        "deployStorageAccount": { "type": "boolean" },
+        "deployCosmosDb": { "type": "boolean" },
+        "enableCosmosAnalyticalStorage": { "type": "boolean" },
+        "deployContainerApps": { "type": "boolean" },
+        "deployContainerEnv": { "type": "boolean" },
+        "deployContainerRegistry": { "type": "boolean" },
+        "deployAcrTaskAgentPool": { "type": "boolean" },
+        "deployVM": { "type": "boolean", "description": "May be omitted or false. Full profile validation rejects true; resolution explicitly emits false." },
+        "deployJumpbox": { "type": "boolean" },
+        "deployBastion": { "type": "boolean" },
+        "deployNatGateway": { "type": "boolean" },
+        "deploySoftware": { "type": "boolean" },
+        "existingBastionResourceId": { "$ref": "#/definitions/armId" },
+        "existingNatGatewayResourceId": { "$ref": "#/definitions/armId" },
+        "existingJumpboxResourceId": { "$ref": "#/definitions/armId" },
+        "bastionSkuName": { "enum": ["Basic", "Standard", "Premium"] },
+        "bastionAllowedSourceIPs": { "type": "array", "items": { "$ref": "#/definitions/cidr" } },
+        "bastionEnableTunneling": { "type": "boolean" },
+        "extendFirewallForJumpboxBootstrap": { "type": "boolean" },
+        "extendFirewallForAcrTaskBuilds": { "type": "boolean" },
+        "enableAcsMediaEgress": { "type": "boolean" },
+        "useUAI": { "type": "boolean" },
+        "useCAppAPIKey": { "type": "boolean" },
+        "useZoneRedundancy": { "type": "boolean" },
+        "publicIngress": { "type": "object", "additionalProperties": false, "required": ["enabled"], "properties": { "enabled": { "type": "boolean", "const": false } } },
+        "hubIntegrationHubVnetResourceId": { "$ref": "#/definitions/vnetId" },
+        "hubIntegrationEgressNextHopIp": { "type": "string", "pattern": "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$" },
+        "hubIntegrationExistingRouteTableResourceId": { "$ref": "#/definitions/routeTableId" },
+        "hubIntegrationCreateHubPeering": { "type": "boolean" },
+        "hubIntegrationPeeringAllowGatewayTransit": { "type": "boolean" },
+        "hubIntegrationPeeringUseRemoteGateways": { "type": "boolean" },
+        "vnetAddressPrefixes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/cidr" } },
+        "agentSubnetName": { "$ref": "#/definitions/resourceName" },
+        "agentSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "acaEnvironmentSubnetName": { "$ref": "#/definitions/resourceName" },
+        "acaEnvironmentSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "peSubnetName": { "$ref": "#/definitions/resourceName" },
+        "peSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "azureBastionSubnetName": { "$ref": "#/definitions/resourceName" },
+        "azureBastionSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "azureFirewallSubnetName": { "$ref": "#/definitions/resourceName" },
+        "azureFirewallSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "gatewaySubnetName": { "$ref": "#/definitions/resourceName" },
+        "gatewaySubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "azureAppGatewaySubnetName": { "$ref": "#/definitions/resourceName" },
+        "azureAppGatewaySubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "jumpboxSubnetName": { "$ref": "#/definitions/resourceName" },
+        "jumpboxSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "devopsBuildAgentsSubnetName": { "$ref": "#/definitions/resourceName" },
+        "devopsBuildAgentsSubnetPrefix": { "$ref": "#/definitions/cidr" },
+        "dnsZoneLinkSuffix": { "type": "string", "pattern": "^[A-Za-z0-9_-]*$" },
+        "existingPrivateDnsZoneCogSvcsResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneOpenAiResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneAiServicesResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneSearchResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneCosmosResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneBlobResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneKeyVaultResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneAppConfigResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneContainerAppsResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneAcrResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneAzureMonitorResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneOmsOpsInsightsResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneOdsOpsInsightsResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneAzureAutomationResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "existingPrivateDnsZoneAppInsightsResourceId": { "$ref": "#/definitions/privateDnsId" },
+        "aiSearchResourceId": { "$ref": "#/definitions/armId" },
+        "aiFoundryStorageAccountResourceId": { "$ref": "#/definitions/armId" },
+        "aiFoundryCosmosDBAccountResourceId": { "$ref": "#/definitions/armId" },
+        "keyVaultResourceId": { "$ref": "#/definitions/armId" },
+        "aiFoundryStorageSku": { "enum": ["Standard_LRS", "Standard_GRS", "Standard_RAGRS", "Standard_ZRS", "Standard_GZRS", "Standard_RAGZRS", "Premium_LRS", "Premium_ZRS"] },
+        "resourceNamingMode": { "enum": ["caf", "legacy"] },
+        "cafWorkloadName": { "$ref": "#/definitions/resourceName" },
+        "cafEnvironmentName": { "$ref": "#/definitions/resourceName" },
+        "cafRegionName": { "$ref": "#/definitions/resourceName" },
+        "cafInstance": { "$ref": "#/definitions/resourceName" },
+        "aiFoundryAccountName": { "$ref": "#/definitions/resourceName" },
+        "aiFoundryProjectName": { "$ref": "#/definitions/resourceName" },
+        "aiFoundryProjectDisplayName": { "$ref": "#/definitions/nonblank" },
+        "aiFoundryProjectDescription": { "$ref": "#/definitions/nonblank" },
+        "aiFoundryStorageAccountName": { "$ref": "#/definitions/resourceName" },
+        "aiFoundrySearchServiceName": { "$ref": "#/definitions/resourceName" },
+        "aiFoundryCosmosDbName": { "$ref": "#/definitions/resourceName" },
+        "appConfigName": { "$ref": "#/definitions/resourceName" },
+        "appInsightsName": { "$ref": "#/definitions/resourceName" },
+        "containerEnvName": { "$ref": "#/definitions/resourceName" },
+        "containerRegistryName": { "$ref": "#/definitions/resourceName" },
+        "dbAccountName": { "$ref": "#/definitions/resourceName" },
+        "dbDatabaseName": { "$ref": "#/definitions/resourceName" },
+        "keyVaultName": { "$ref": "#/definitions/resourceName" },
+        "logAnalyticsWorkspaceName": { "$ref": "#/definitions/resourceName" },
+        "searchServiceName": { "$ref": "#/definitions/resourceName" },
+        "speechServiceName": { "$ref": "#/definitions/resourceName" },
+        "storageAccountName": { "$ref": "#/definitions/resourceName" },
+        "vnetName": { "$ref": "#/definitions/resourceName" },
+        "modelDeploymentList": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/modelDeployment" } },
+        "workloadProfiles": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/workloadProfile" } },
+        "databaseContainersList": { "type": "array", "items": { "$ref": "#/definitions/databaseContainer" } },
+        "dbDatabaseThroughput": { "type": ["integer", "null"], "minimum": 1 },
+        "storageAccountContainersList": { "type": "array", "items": { "$ref": "#/definitions/storageContainer" } },
+        "deployApiManagement": { "type": "boolean" },
+        "apiManagementConfiguration": { "$ref": "#/definitions/gatewayServiceConfiguration" },
+        "enableDeveloperExperience": { "type": "boolean" },
+        "developerExperience": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Frozen input-only handoff to main.bicep. Runtime environment variables, gateway URLs and App Configuration settings are derived by the parent, never copied here.",
+          "required": ["application", "workloadIdentity", "developerObjectIds", "developerGroupObjectIds", "release"],
+          "properties": {
+            "application": { "$ref": "#/properties/application" },
+            "workloadIdentity": { "$ref": "#/definitions/identity" },
+            "developerObjectIds": { "$ref": "#/properties/identities/properties/developerObjectIds" },
+            "developerGroupObjectIds": { "$ref": "#/properties/identities/properties/developerGroupObjectIds" },
+            "release": { "$ref": "#/properties/release" }
+          }
+        },
+        "containerAppsList": { "type": "array", "items": { "type": "object" } },
+        "acrDnsSuffix": { "const": "azurecr.io" }
+      }
+    }
+  }
+}

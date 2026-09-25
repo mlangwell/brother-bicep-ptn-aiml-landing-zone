@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Reviewed live gate observations v1",
+  "description": "A manifest and its sanitized JSON receipts, committed under environments/evidence/<environment>/. configurationHash is deployment.json's approved ARM parameter hash, not P4's separate resolution hash. These are reviewed operator observations, not automatically certified outcomes or cryptographic proof that an operator told the truth. The protected recorder verifies provenance, consistency and bytes; it never executes a procedure or an evidence file.",
+  "oneOf": [
+    { "$ref": "#/definitions/manifest" },
+    { "$ref": "#/definitions/receipt" }
+  ],
+  "definitions": {
+    "hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "not": { "anyOf": [{ "pattern": "\\s" }, { "const": "0000000000000000000000000000000000000000000000000000000000000000" }] }
+    },
+    "positiveInteger": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "environment": { "type": "string", "enum": ["dev", "test", "prod"] },
+    "text": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,7})?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "not": { "pattern": "\\s" }
+    },
+    "observer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["login", "id"],
+      "description": "The human operator's GitHub login and immutable user ID. The recorder verifies repository collaborator identity, not whether the operator actually performed the procedure.",
+      "properties": {
+        "login": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*$", "not": { "pattern": "\\s" } },
+        "id": { "$ref": "#/definitions/positiveInteger" }
+      }
+    },
+    "procedure": {
+      "type": "string",
+      "description": "Reference to the separately approved runbook procedure reviewed by the operators. It is a reference, never executable input or proof of authorization.",
+      "pattern": "^docs/[A-Za-z0-9_./-]+\\.md#[A-Za-z0-9_-]+$",
+      "not": { "pattern": "\\s|\\.\\.|//" }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary"],
+      "properties": {
+        "status": { "type": "string", "const": "passed" },
+        "summary": { "$ref": "#/definitions/text" }
+      }
+    },
+    "gate": {
+      "type": "string",
+      "enum": ["privateConnectivity", "identityIsolation", "applicationInference", "gatewayEnforcement", "meteringCoverage", "costOperations", "promotionIntegrity", "recovery", "developerWorkspace"]
+    },
+    "fileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^environments/evidence/(?:dev|test|prod)/receipts/[A-Za-z0-9_/-]+\\.json$",
+          "not": { "pattern": "\\s|\\.\\.|//" }
+        },
+        "sha256": { "$ref": "#/definitions/hash" }
+      }
+    },
+    "manifestGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observedAt", "observedBy", "procedure", "result", "evidence"],
+      "properties": {
+        "observedAt": { "$ref": "#/definitions/timestamp" },
+        "observedBy": { "$ref": "#/definitions/observer" },
+        "procedure": { "$ref": "#/definitions/procedure" },
+        "result": { "$ref": "#/definitions/result" },
+        "evidence": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/fileReference" } }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "evidenceKind", "environment", "releaseFingerprint", "deploymentRunId", "configurationHash", "checks"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "evidenceKind": { "type": "string", "const": "reviewed-live-observations" },
+        "environment": { "$ref": "#/definitions/environment" },
+        "releaseFingerprint": { "$ref": "#/definitions/hash" },
+        "deploymentRunId": { "$ref": "#/definitions/positiveInteger" },
+        "configurationHash": { "$ref": "#/definitions/hash" },
+        "checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["privateConnectivity", "identityIsolation", "applicationInference", "gatewayEnforcement", "meteringCoverage", "costOperations", "promotionIntegrity", "recovery", "developerWorkspace"],
+          "properties": {
+            "privateConnectivity": { "$ref": "#/definitions/manifestGate" },
+            "identityIsolation": { "$ref": "#/definitions/manifestGate" },
+            "applicationInference": { "$ref": "#/definitions/manifestGate" },
+            "gatewayEnforcement": { "$ref": "#/definitions/manifestGate" },
+            "meteringCoverage": { "$ref": "#/definitions/manifestGate" },
+            "costOperations": { "$ref": "#/definitions/manifestGate" },
+            "promotionIntegrity": { "$ref": "#/definitions/manifestGate" },
+            "recovery": { "$ref": "#/definitions/manifestGate" },
+            "developerWorkspace": { "$ref": "#/definitions/manifestGate" }
+          }
+        }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "evidenceKind", "environment", "releaseFingerprint", "deploymentRunId", "configurationHash", "gate", "observedAt", "observedBy", "procedure", "result", "observations"],
+      "properties": {
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "evidenceKind": { "type": "string", "const": "reviewed-live-observations" },
+        "environment": { "$ref": "#/definitions/environment" },
+        "releaseFingerprint": { "$ref": "#/definitions/hash" },
+        "deploymentRunId": { "$ref": "#/definitions/positiveInteger" },
+        "configurationHash": { "$ref": "#/definitions/hash" },
+        "gate": { "$ref": "#/definitions/gate" },
+        "observedAt": { "$ref": "#/definitions/timestamp" },
+        "observedBy": { "$ref": "#/definitions/observer" },
+        "procedure": { "$ref": "#/definitions/procedure" },
+        "result": { "$ref": "#/definitions/result" },
+        "observations": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Sanitized measured observations and the approved expected outcomes. Human review judges their meaning and truth. Do not include prompts, completions, headers or credentials.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["context", "name", "observed", "expected"],
+            "properties": {
+              "context": { "type": "string", "enum": ["human", "workload", "runner", "platform"] },
+              "name": { "$ref": "#/definitions/text" },
+              "observed": { "$ref": "#/definitions/text" },
+              "expected": { "$ref": "#/definitions/text" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

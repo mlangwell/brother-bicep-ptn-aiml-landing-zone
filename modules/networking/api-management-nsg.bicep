@@ -1,5 +1,12 @@
 targetScope = 'resourceGroup'
 
+// Landing-zone entry point for the API Management injection-subnet NSG
+// (ADR-001, ADR-002). It keeps ADR-001's fail-closed contract: at least one hub
+// firewall source CIDR is required, so a gateway created by this landing zone
+// never runs behind an NSG that admits the whole VirtualNetwork service tag.
+// The rules come from the shared module that platform/api-management/network.bicep
+// also uses, so the two gateway paths cannot drift.
+
 @description('Name of the network security group for the API Management subnet.')
 param name string
 
@@ -7,77 +14,33 @@ param name string
 param location string = resourceGroup().location
 
 @minLength(1)
-@description('Hub firewall source CIDRs allowed to reach the internal API Management gateway on TCP 443.')
-param ingressSourceAddressPrefixes array
+@description('Hub firewall source CIDRs allowed to reach the internal API Management gateway on TCP 443. For Azure Firewall this is the AzureFirewallSubnet prefix, because the firewall source-NATs to a back-end instance IP, not to its frontend private IP.')
+param ingressSourceAddressPrefixes string[]
+
+@description('Subnet CIDRs inside this spoke that may call the gateway on TCP 443 directly, without traversing the hub firewall.')
+param directCallerAddressPrefixes string[] = []
+
+@description('Address prefix of the API Management subnet. Scopes the rate-limit counter sync rule.')
+@minLength(1)
+param subnetAddressPrefix string
 
 @description('Tags to apply to the network security group.')
 param tags object = {}
 
-resource apiManagementNsg 'Microsoft.Network/networkSecurityGroups@2024-07-01' = {
-  name: name
-  location: location
-  tags: tags
-  properties: {
-    securityRules: [
-      {
-        name: 'AllowApiManagementControlPlane'
-        properties: {
-          access: 'Allow'
-          description: 'Allow Azure API Management control-plane access.'
-          destinationAddressPrefix: 'VirtualNetwork'
-          destinationPortRange: '3443'
-          direction: 'Inbound'
-          priority: 100
-          protocol: 'Tcp'
-          sourceAddressPrefix: 'ApiManagement'
-          sourcePortRange: '*'
-        }
-      }
-      {
-        name: 'AllowAzureLoadBalancerHealthProbe'
-        properties: {
-          access: 'Allow'
-          description: 'Allow Azure Load Balancer health probes for API Management.'
-          destinationAddressPrefix: 'VirtualNetwork'
-          destinationPortRange: '6390'
-          direction: 'Inbound'
-          priority: 110
-          protocol: 'Tcp'
-          sourceAddressPrefix: 'AzureLoadBalancer'
-          sourcePortRange: '*'
-        }
-      }
-      {
-        name: 'AllowHttpsFromHubFirewall'
-        properties: {
-          access: 'Allow'
-          description: 'Allow API gateway ingress after hub firewall DNAT.'
-          destinationAddressPrefix: 'VirtualNetwork'
-          destinationPortRange: '443'
-          direction: 'Inbound'
-          priority: 120
-          protocol: 'Tcp'
-          sourceAddressPrefixes: ingressSourceAddressPrefixes
-          sourcePortRange: '*'
-        }
-      }
-      {
-        name: 'DenyAllInbound'
-        properties: {
-          access: 'Deny'
-          description: 'Deny ingress that did not traverse the approved hub firewall path.'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '*'
-          direction: 'Inbound'
-          priority: 4096
-          protocol: '*'
-          sourceAddressPrefix: '*'
-          sourcePortRange: '*'
-        }
-      }
-    ]
+module rules 'api-management-injection-nsg.bicep' = {
+  name: take('${name}-rules', 64)
+  params: {
+    name: name
+    location: location
+    tags: tags
+    ingressSourceAddressPrefixes: ingressSourceAddressPrefixes
+    directCallerAddressPrefixes: directCallerAddressPrefixes
+    subnetAddressPrefix: subnetAddressPrefix
   }
 }
 
 @description('Resource ID of the API Management subnet network security group.')
-output resourceId string = apiManagementNsg.id
+output resourceId string = rules.outputs.id
+
+@description('Rule names deployed on the network security group, in declaration order.')
+output ruleNames array = rules.outputs.ruleNames
