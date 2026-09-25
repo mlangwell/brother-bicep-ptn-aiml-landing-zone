@@ -231,8 +231,16 @@ module workload './workload.bicep' = if (deployWorkload) {
 // private VIP. Learn: "it is impossible to anticipate the private IP of the API
 // Management instance prior to its deployment." Operators need this value to
 // create the DNS A record that makes the gateway reachable at all.
+// dependsOn is required: an existing resource compiles to a declared ARM
+// resource with a Read operation, which ARM runs as soon as the deployment
+// starts. On a first deployment the gateway does not exist yet, so that read
+// returned ResourceNotFound and failed the deployment after the 28-minute
+// create had already succeeded.
 resource deployedGateway 'Microsoft.ApiManagement/service@2024-05-01' existing = {
   name: name
+  dependsOn: [
+    gateway
+  ]
 }
 
 @description('Owned APIM service resource ID. Not evidence of private readiness: on classic injection readiness also requires the private DNS A record described in facts.operatorObligations.')

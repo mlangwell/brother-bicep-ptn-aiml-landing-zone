@@ -36,6 +36,7 @@ $hubVnetId = "/subscriptions/$hubSubscription/resourceGroups/rg-hub/providers/Mi
 $spokeVnetId = "/subscriptions/$spokeSubscription/resourceGroups/rg-spoke/providers/Microsoft.Network/virtualNetworks/vnet-spoke"
 $otherVnetId = "/subscriptions/$spokeSubscription/resourceGroups/rg-other/providers/Microsoft.Network/virtualNetworks/vnet-other"
 $searchId = "/subscriptions/$spokeSubscription/resourceGroups/rg-spoke/providers/Microsoft.Search/searchServices/srch-contract"
+$scopeId = "/subscriptions/$spokeSubscription/resourceGroups/rg-spoke/providers/microsoft.insights/privateLinkScopes/pls-contract"
 
 function Reset-Stub {
     $global:StubCalls = [System.Collections.Generic.List[string]]::new()
@@ -55,6 +56,8 @@ function Reset-Stub {
     $global:StubGroupExists = $true
     $global:StubGroupTags = @{ 'azd-env-name' = 'contract' }
     $global:StubLinks = [System.Collections.Generic.List[object]]::new()
+    $global:StubScopedResources = [System.Collections.Generic.List[object]]::new()
+    $global:StubScopeListFails = $false
     $global:StubStuckState = ''
     $global:StubDeleteFails = $false
     $global:StubReadHost = ''
@@ -124,10 +127,23 @@ function az {
                 })
             return (ConvertTo-Json -InputObject @{ value = $value } -Depth 10)
         }
+        '^resource list .*microsoft\.insights/privateLinkScopes' {
+            if ($global:StubScopeListFails) { $global:LASTEXITCODE = 1; return }
+            if (-not ($spokeScope -and (Test-Argument $joined '--resource-group' 'rg-spoke'))) { $global:LASTEXITCODE = 1; return }
+            return (ConvertTo-Json -AsArray -InputObject @(@{ id = $scopeId; name = 'pls-contract' }))
+        }
+        '^rest --method get --url \S*(/subscriptions\S+)/scopedResources\?' {
+            if ($Matches[1] -ne $scopeId) { $global:LASTEXITCODE = 1; return }
+            $value = @($global:StubScopedResources | ForEach-Object {
+                    @{ name = $_.name; id = $_.id; properties = @{ provisioningState = 'Succeeded'; linkedResourceId = $_.linked } }
+                })
+            return (ConvertTo-Json -InputObject @{ value = $value } -Depth 10)
+        }
         '^rest --method delete --url (\S+)\?' {
             $target = $Matches[1]
             if ($global:StubDeleteFails) { $global:LASTEXITCODE = 1; return }
             $global:StubLinks.RemoveAll({ param($link) $link.id -eq $target }) | Out-Null
+            $global:StubScopedResources.RemoveAll({ param($scoped) $target -like "*$($scoped.id)" }) | Out-Null
             return
         }
         default { $global:LASTEXITCODE = 1; return }
@@ -159,7 +175,8 @@ function azd {
             $global:LASTEXITCODE = 1
             return
         }
-        # azd down deletes the resource group before it purges.
+        # azd purges the Log Analytics workspace before it deletes the resource
+        # group, and purges the rest after, so it can fail on either side.
         '^down ' {
             if ($global:StubAzdDownDeletesGroup) { $global:StubGroupExists = $false }
             if ($global:StubAzdDownBreaksGroupLookup) { $global:StubGroupExistsFails = $true }
@@ -227,6 +244,9 @@ function Set-TeardownEnvironment {
     }
     foreach ($name in @('spl-srch-contract-blob-0', 'spl-srch-contract-openai_account-1')) {
         $global:StubLinks.Add([pscustomobject]@{ name = $name; id = "$searchId/sharedPrivateLinkResources/$name"; state = 'Succeeded' })
+    }
+    foreach ($name in @('log-contract', 'appi-contract')) {
+        $global:StubScopedResources.Add([pscustomobject]@{ name = $name; id = "$scopeId/scopedResources/$name"; linked = "/subscriptions/$spokeSubscription/resourceGroups/rg-spoke/providers/microsoft.operationalinsights/workspaces/$name" })
     }
 }
 
@@ -476,6 +496,23 @@ try {
     Assert-True ((Get-CallIndex 'pwsh *') -lt (Get-CallIndex 'az bicep build*')) 'Preflight must run before the What-If compilation.'
 
     # -----------------------------------------------------------------------
+    # Deploy-AilzIntegrated.ps1: a spoke deployed without the gateway must not
+    # record an ingress default. The Bicep parameter is inert while
+    # deployApiManagement is false, and the next hop's /32 is the one value
+    # ADR-002's live proof showed Azure Firewall never matches, because it
+    # source-NATs to a back-end address in AzureFirewallSubnet. Recording it
+    # would leave a working-looking default for anyone who later enables the
+    # gateway without re-resolving it.
+    # -----------------------------------------------------------------------
+    Reset-Stub
+    $global:StubAzdEnv = [ordered]@{ AZURE_SUBSCRIPTION_ID = $spokeSubscription; AZURE_RESOURCE_GROUP = 'rg-spoke' }
+    try { & $deploy @deployArguments 6>$null } catch { }
+    $ingressSets = @($global:StubCalls | Where-Object { $_ -like 'azd env set API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES*' })
+    Assert-True ($ingressSets.Count -eq 0) "A spoke without -DeployApiManagement must not record an ingress default (got: $($ingressSets -join '; '))."
+    Assert-True (-not ($global:StubCalls -match 'API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES.*/32')) 'The hub next hop /32 must never be recorded as an ingress source.'
+    Assert-True (@($global:StubCalls | Where-Object { $_ -like 'azd env set DEPLOY_API_MANAGEMENT false*' }).Count -eq 1) 'The gateway must still be recorded as disabled.'
+
+    # -----------------------------------------------------------------------
     # Remove-AilzEnvironment.ps1: nothing is deleted before every check passes.
     # -----------------------------------------------------------------------
     Reset-Stub; Set-TeardownEnvironment
@@ -537,12 +574,19 @@ try {
     $global:StubReadHost = 'rg-spoke'
     $message = Invoke-Teardown @{}
     Assert-True ($message -eq '') "A typed confirmation must proceed: $message"
-    Assert-True ((Get-DeleteCall).Count -eq 2) 'Both Search shared private links must be deleted.'
+    Assert-True ((Get-DeleteCall).Count -eq 4) 'Both Search shared private links and both Azure Monitor scoped resources must be deleted.'
     $down = @(Get-DownCall)
     Assert-True ($down.Count -eq 1 -and $down[0] -eq 'azd down --force --purge --environment contract') 'azd down must run once with --force --purge for the environment.'
     Assert-True ((Get-CallIndex 'azd auth login --check-status --output json') -lt (Get-CallIndex 'az rest --method delete*')) 'The azd sign-in must be checked before any deletion.'
     Assert-True ((Get-CallIndex 'az rest --method delete*' -Last) -lt (Get-CallIndex 'azd down*')) 'Every shared private link must be gone before azd down starts.'
     Assert-True ($global:StubLinks.Count -eq 0) 'No shared private link may remain.'
+    # azd down force-deletes the Log Analytics workspace before it deletes the
+    # resource group, and Azure refuses that while a scoped resource still links
+    # the workspace into an Azure Monitor Private Link Scope
+    # (CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes), so the scoped
+    # resources have to be gone first or azd down deletes nothing at all.
+    Assert-True ($global:StubScopedResources.Count -eq 0) 'No Azure Monitor private link scoped resource may remain.'
+    Assert-True ((Get-CallIndex 'az rest --method delete*https://management.azure.com*scopedResources*' -Last) -lt (Get-CallIndex 'azd down*')) 'Every scoped resource must be gone before azd down starts.'
     Assert-True (@($global:StubCalls -match "^az network vnet peering list --subscription $hubSubscription --resource-group rg-hub --vnet-name vnet-hub").Count -eq 1) 'The hub follow-up must read the hub peerings in the hub scope.'
 
     Reset-Stub; Set-TeardownEnvironment
@@ -557,10 +601,30 @@ try {
     Assert-True ($message -match "still 'Updating'") 'A link stuck in a nonterminal state must time out explicitly.'
     Assert-True ((Get-DownCall).Count -eq 0) 'azd down must not run while a shared private link remains.'
 
+    # A spoke with no AMPLS must still tear down, and one with no Search service
+    # must still clear its scoped resources.
+    Reset-Stub; Set-TeardownEnvironment
+    $global:StubScopedResources.Clear()
+    $message = Invoke-Teardown @{ Force = $true }
+    Assert-True ($message -eq '') "A spoke without an Azure Monitor private link scope must tear down: $message"
+    Assert-True ((Get-DeleteCall).Count -eq 2 -and (Get-DownCall).Count -eq 1) 'With no scoped resources only the Search links are deleted.'
+
+    Reset-Stub; Set-TeardownEnvironment
+    $global:StubLinks.Clear()
+    $message = Invoke-Teardown @{ Force = $true }
+    Assert-True ($message -eq '') "A rerun after the links are gone must still clear the scoped resources: $message"
+    Assert-True ($global:StubScopedResources.Count -eq 0 -and (Get-DownCall).Count -eq 1) 'A rerun must delete the remaining scoped resources and retry azd down.'
+
+    Reset-Stub; Set-TeardownEnvironment
+    $global:StubScopeListFails = $true
+    $message = Invoke-Teardown @{ Force = $true }
+    Assert-True ($message -ne '') 'An unreadable private link scope must stop the teardown rather than run azd down blind.'
+    Assert-True ((Get-DeleteCall).Count -eq 0 -and (Get-DownCall).Count -eq 0) 'Nothing may be deleted when the scoped resources cannot be enumerated.'
+
     Reset-Stub; Set-TeardownEnvironment
     $global:StubAzdDownExitCode = 1
     $message = Invoke-Teardown @{ Force = $true }
-    Assert-True ($message -match 'azd down failed with exit code 1\. No Search shared private links remain') 'A failed azd down must say the links are gone.'
+    Assert-True ($message -match 'azd down failed with exit code 1\. No Search shared private links or Azure Monitor private link scoped resources remain') 'A failed azd down must say the links and scoped resources are gone.'
     Assert-True ($message -match "resource group 'rg-spoke' still exists, so fix the error above and rerun this script") 'While the group survives, a rerun can finish the teardown.'
     Assert-True ($global:StubLinks.Count -eq 0) 'The links deleted before a failed azd down stay deleted.'
 

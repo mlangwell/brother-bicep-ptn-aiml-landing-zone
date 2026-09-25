@@ -1,7 +1,7 @@
 {
   "sourceCommit": "99c048e84acf4661ea0ec0a0ef1bb23ea29c0f3b",
   "approvedChanges": {
-    "Deploy-AilzIntegrated.ps1": "ADR-002 (approved 2026-09-23): with -DeployApiManagement and no explicit ingress sources, the default API Management ingress source is the hub AzureFirewallSubnet prefix, falling back to EgressNextHopIp/32 with a warning. 9d4349d re-wraps a single resolved prefix as a JSON array. ADR-003 (proposed 2026-09-24): -PreviewOutput Full runs scripts/Invoke-PreflightChecks.ps1 before its What-If, because that path bypasses the azd preprovision hook. Requires review by the script owner in PR #1.",
+    "Deploy-AilzIntegrated.ps1": "ADR-002 (approved 2026-09-23): with -DeployApiManagement and no explicit ingress sources, the default API Management ingress source is the hub AzureFirewallSubnet prefix, falling back to EgressNextHopIp/32 with a warning. 9d4349d re-wraps a single resolved prefix as a JSON array. ADR-003 (proposed 2026-09-24): -PreviewOutput Full runs scripts/Invoke-PreflightChecks.ps1 before its What-If, because that path bypasses the azd preprovision hook. ADR-003 live run (2026-09-24): without -DeployApiManagement the ingress default is no longer recorded at all. It previously wrote EgressNextHopIp/32 into the azd environment for a disabled feature, and that is the one value Azure Firewall never matches, so enabling the gateway by any route that did not re-resolve it built an unreachable gateway. Requires review by the script owner in PR #1.",
     "azure.yaml": "ADR-003 (proposed 2026-09-24): requiredVersions.azd '>= 1.25.5'. azd 1.23.4 (azure-dev#6694) is the first release that parses the pinned quoted array bindings as arrays; 1.25.5 (azure-dev#8493) fixes azd down --purge for Foundry accounts. Hooks and infra settings are unchanged. Requires review by the template owner in PR #1."
   },
   "parameters": {
@@ -1468,7 +1468,7 @@
     "azure.yaml": "aedf47237e207f7203612526d6e70209f33c4160c45a167d1566c38e7fbc8ec6",
     "manifest.json": "9182f38f9b088c51b5ac716be41846bd0b3fd96858d861682b88483fbf02e0dd",
     "install.ps1": "45cfdcc58aa58593ef3b961726734a272b3e73679fb9461f4ba8d5a310e98864",
-    "Deploy-AilzIntegrated.ps1": "922c542dbcdbaa576c694e9856bf804cfd167e021aaeebadfffdc0281530d510",
+    "Deploy-AilzIntegrated.ps1": "7bc6655dd20fdd30d99c7dec77d57dced9d80aa1b45c9f7a8ccad687de371111",
     "pipelines/azuredevops/cd-pipeline.yml": "4a0ff750111c1ff9149c86dc80bbfb2a628387c7f4254df9b651abca5d4fa219",
     "pipelines/azuredevops/ci-pipeline.yml": "bdad7e9517721d0ea7b1d2042d747a0eedfed875955797e2598f987147de344a",
     "pipelines/azuredevops/templates/deploy-bicep.yml": "31b00d0e98bf379806d4d006ea757ddea4dd5c4189e8b626e2acf39ccd958b83",

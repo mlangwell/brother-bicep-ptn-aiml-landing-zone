@@ -11,6 +11,13 @@
       * Azure AI Search refuses to delete a service that still has shared
         private link resources (LockedSPLResourceFound), which fails the
         resource group deletion. This script deletes those links first.
+      * Azure refuses to delete a Log Analytics workspace or an Application
+        Insights component that a scoped resource still links into an Azure
+        Monitor Private Link Scope
+        (CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes). azd down purges
+        the workspace before it deletes the resource group, so this fails
+        before anything is deleted. This script deletes those scoped resources
+        first.
       * azd releases older than 1.25.5 cannot read Foundry accounts that report
         networkInjections, so `azd down` fails before deleting anything
         (azure-dev#8493).
@@ -19,12 +26,12 @@
     target from the azd environment, refuses a resource group that azd did not
     create for this environment unless told otherwise, shows the plan, and asks
     you to type the resource group name. It then deletes the Search shared
-    private links, waits until they are gone, and runs
-    `azd down --force --purge`. Finally it prints the hub-side peering that the
-    hub owner must remove. It never changes the hub. If azd down fails before
-    it deletes the resource group, fix the reported error and rerun the script.
-    azd down deletes the group before it purges, so if the purge fails the
-    script names the commands that finish it.
+    private links and the Azure Monitor private link scoped resources, waits
+    until they are gone, and runs `azd down --force --purge`. Finally it prints
+    the hub-side peering that the hub owner must remove. It never changes the
+    hub. If azd down fails before it deletes the resource group, fix the
+    reported error and rerun the script. If it fails after deleting the group,
+    the script names the commands that finish the purge.
 
     Run it from the azd project root, where `azd down` finds azure.yaml.
 
@@ -40,9 +47,10 @@
     this template did not create.
 
 .PARAMETER SharedPrivateLinkTimeoutMinutes
-    How long to wait for each shared private link to reach a deletable state and
-    then disappear. Azure AI Search can hold a link in a nonterminal state for
-    hours in rare cases.
+    How long to wait for each Search shared private link or Azure Monitor
+    private link scoped resource to reach a deletable state and then disappear.
+    Azure AI Search can hold a link in a nonterminal state for hours in rare
+    cases.
 
 .EXAMPLE
     pwsh ./scripts/Remove-AilzEnvironment.ps1 -EnvironmentName ailz-dev -WhatIf
@@ -72,6 +80,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $searchApiVersion = '2025-05-01'
+# Azure Monitor Private Link Scope. 2021-09-01 is the only generally available
+# version of privateLinkScopes/scopedResources; the template writes them with a
+# preview version, but a teardown should not depend on a preview API.
+$monitorPrivateLinkScopeApiVersion = '2021-09-01'
 $pollSeconds = 15
 # azd down purges Foundry accounts only from 1.25.5 (azure-dev#8493), whatever
 # azure.yaml declares. azd down enforces a higher azure.yaml floor itself, so
@@ -214,6 +226,52 @@ function Remove-SharedPrivateLink {
     }
 }
 
+function Get-PrivateLinkScopedResource {
+    param([Parameter(Mandatory)][string] $ScopeId)
+
+    $response = Invoke-AzJson -Arguments @('rest', '--method', 'get', '--url', "https://management.azure.com$ScopeId/scopedResources?api-version=$monitorPrivateLinkScopeApiVersion")
+    return @(Get-OptionalProperty -InputObject $response -Name 'value')
+}
+
+function Remove-PrivateLinkScopedResource {
+    param(
+        [Parameter(Mandatory)][string] $ScopeId,
+        [Parameter(Mandatory)] $ScopedResource
+    )
+
+    # Azure refuses to delete a Log Analytics workspace or an Application
+    # Insights component while a scoped resource still links it into an Azure
+    # Monitor Private Link Scope (CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes),
+    # and the error names the scoped resources to remove first. azd down purges
+    # the workspace before it deletes the resource group, so the scoped
+    # resources have to go first or the purge fails and nothing is deleted.
+    # The delete is asynchronous, so poll until the scoped resource is gone.
+    $deadline = (Get-Date).AddMinutes($SharedPrivateLinkTimeoutMinutes)
+    $deleteRequested = $false
+    while ($true) {
+        $current = @(Get-PrivateLinkScopedResource -ScopeId $ScopeId | Where-Object { $_.name -ceq $ScopedResource.name })
+        if ($current.Count -eq 0) {
+            Write-Host "  Deleted $($ScopedResource.name)."
+            return
+        }
+
+        if (-not $deleteRequested) {
+            Write-Host "  Deleting $($ScopedResource.name) ($(Get-LinkState -Link $current[0] -Name 'provisioningState'))..."
+            & az rest --method delete --url "https://management.azure.com$($ScopedResource.id)?api-version=$monitorPrivateLinkScopeApiVersion" --only-show-errors --output none
+            if ($LASTEXITCODE -ne 0) {
+                throw "Deleting private link scoped resource '$($ScopedResource.name)' failed with exit code $LASTEXITCODE."
+            }
+            $deleteRequested = $true
+            continue
+        }
+
+        if ((Get-Date) -ge $deadline) {
+            throw "Private link scoped resource '$($ScopedResource.name)' still exists after $SharedPrivateLinkTimeoutMinutes minutes. Delete it and rerun."
+        }
+        Start-Sleep -Seconds $pollSeconds
+    }
+}
+
 foreach ($command in @('az', 'azd')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "Required command '$command' was not found. Install it and try again."
@@ -263,6 +321,14 @@ foreach ($service in $searchServices) {
     }
 }
 
+$scopedResources = @()
+$privateLinkScopes = @(Invoke-AzJson -Arguments @('resource', 'list', '--resource-group', $resourceGroupName, '--subscription', $subscriptionId, '--resource-type', 'microsoft.insights/privateLinkScopes'))
+foreach ($scope in $privateLinkScopes) {
+    foreach ($scoped in @(Get-PrivateLinkScopedResource -ScopeId ([string]$scope.id))) {
+        $scopedResources += [pscustomobject]@{ ScopeId = [string]$scope.id; ScopeName = [string]$scope.name; ScopedResource = $scoped }
+    }
+}
+
 Write-Host ''
 Write-Host "Teardown plan for azd environment '$EnvironmentName'"
 Write-Host "  Subscription   : $subscriptionId"
@@ -271,12 +337,16 @@ Write-Host "  Search shared private links deleted first: $($links.Count)"
 foreach ($entry in $links) {
     Write-Host ("    - {0}/{1} ({2}, {3})" -f $entry.SearchServiceName, $entry.Link.name, (Get-LinkState -Link $entry.Link -Name 'provisioningState'), (Get-LinkState -Link $entry.Link -Name 'status'))
 }
+Write-Host "  Azure Monitor private link scoped resources deleted first: $($scopedResources.Count)"
+foreach ($entry in $scopedResources) {
+    Write-Host ("    - {0}/{1} ({2})" -f $entry.ScopeName, $entry.ScopedResource.name, (Get-LinkState -Link $entry.ScopedResource -Name 'provisioningState'))
+}
 Write-Host '  Then azd down --force --purge deletes the resource group and purges its soft-deleted'
 Write-Host '  Key Vault, App Configuration, API Management, Foundry and Log Analytics resources.'
 Write-Host '  Purged resources cannot be recovered.'
 Write-Host ''
 
-if (-not $PSCmdlet.ShouldProcess("resource group '$resourceGroupName' in subscription '$subscriptionId'", 'Delete Search shared private links, then azd down --force --purge')) {
+if (-not $PSCmdlet.ShouldProcess("resource group '$resourceGroupName' in subscription '$subscriptionId'", 'Delete Search shared private links and Azure Monitor private link scoped resources, then azd down --force --purge')) {
     return
 }
 if (-not $Force -and (Read-Host "Type the resource group name '$resourceGroupName' to continue") -cne $resourceGroupName) {
@@ -288,10 +358,16 @@ foreach ($entry in $links) {
     Remove-SharedPrivateLink -SearchServiceId $entry.SearchServiceId -Link $entry.Link
 }
 
+foreach ($entry in $scopedResources) {
+    Remove-PrivateLinkScopedResource -ScopeId $entry.ScopeId -ScopedResource $entry.ScopedResource
+}
+
 & azd down --force --purge --environment $EnvironmentName
 if ($LASTEXITCODE -ne 0) {
-    # azd down deletes the resource group before it purges, so whether the
-    # group survived decides whether a rerun can finish the teardown.
+    # azd down force-deletes the Log Analytics workspace before it deletes the
+    # resource group, and purges the remaining soft-deleted resources after, so
+    # it can fail on either side of the group deletion. Whether the group
+    # survived decides whether a rerun can finish the teardown.
     $downExitCode = $LASTEXITCODE
     $groupRemains = $null
     try {
@@ -300,7 +376,7 @@ if ($LASTEXITCODE -ne 0) {
     catch {
         $groupRemains = $null
     }
-    $failure = "azd down failed with exit code $downExitCode. No Search shared private links remain"
+    $failure = "azd down failed with exit code $downExitCode. No Search shared private links or Azure Monitor private link scoped resources remain"
     if ($groupRemains -eq $true) {
         throw "$failure, and resource group '$resourceGroupName' still exists, so fix the error above and rerun this script."
     }

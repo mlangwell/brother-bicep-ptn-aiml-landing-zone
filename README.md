@@ -439,8 +439,10 @@ pwsh ./scripts/Remove-AilzEnvironment.ps1 -EnvironmentName "ailz-dev"
 ```
 
 `azd down` cannot tear this template down alone, because Azure AI Search
-refuses to delete a service that still has shared private links. The script
-does nothing destructive until its checks pass:
+refuses to delete a service that still has shared private links, and Azure
+refuses to delete a Log Analytics workspace that a scoped resource still links
+into an Azure Monitor Private Link Scope. The script does nothing destructive
+until its checks pass:
 
 1. Checks that azd is 1.25.5 or later, and at least the minimum in your
   `azure.yaml`.
@@ -454,21 +456,30 @@ does nothing destructive until its checks pass:
 5. Shows the plan and asks you to type the resource group name. `-Force` skips
   this prompt.
 6. Deletes each Search shared private link and waits until it is gone.
-7. Runs `azd down --force --purge`. This deletes the resource group and purges
+7. Deletes each Azure Monitor private link scoped resource and waits until it is
+  gone. `azd down` force-deletes the Log Analytics workspace before it deletes
+  the resource group, and Azure rejects that with
+  `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes` while a scoped resource
+  still links the workspace, which fails the teardown before anything is
+  deleted.
+8. Runs `azd down --force --purge`. This deletes the resource group and purges
   its soft-deleted Key Vault, App Configuration, API Management, Foundry and Log
   Analytics resources, which cannot then be recovered.
-8. Prints the hub-side peering that the hub owner must delete. The script never
+9. Prints the hub-side peering that the hub owner must delete. The script never
   changes the hub, and a `Disconnected` peering cannot be reused when the spoke
   is redeployed.
 
-The script deletes the shared private links with your Azure CLI identity, and
-`azd down` runs as your azd identity. Both need rights on the resource group.
+The script deletes the shared private links and scoped resources with your Azure
+CLI identity, and `azd down` runs as your azd identity. Both need rights on the
+resource group.
 
 If `azd down` fails before it deletes the resource group, fix the reported error
-and rerun the script; it finds no links and runs `azd down` again. azd deletes
-the group before it purges, so a purge failure cannot be redone by a rerun. The
-script then names the `az keyvault`, `az appconfig`, `az apim deletedservice` and
-`az cognitiveservices account` commands that list and purge what remains.
+and rerun the script; it finds no links or scoped resources and runs `azd down`
+again. azd purges the Log Analytics workspace before it deletes the group and
+purges the other resources after, so it can fail on either side of the group
+deletion. A purge failure after the group is gone cannot be redone by a rerun.
+The script then names the `az keyvault`, `az appconfig`, `az apim deletedservice`
+and `az cognitiveservices account` commands that list and purge what remains.
 Purging a soft-deleted Key Vault needs
 [permissions at subscription level](https://learn.microsoft.com/azure/key-vault/general/key-vault-recovery),
 which a role assigned only on the resource group does not grant.
@@ -478,6 +489,8 @@ To tear down by hand instead, run the same steps in order:
 ```powershell
 az search shared-private-link-resource list --service-name "<search-service>" --resource-group "<spoke-resource-group>" --output table
 az search shared-private-link-resource delete --name "<link-name>" --service-name "<search-service>" --resource-group "<spoke-resource-group>" --yes
+az monitor private-link-scope scoped-resource list --scope-name "<private-link-scope>" --resource-group "<spoke-resource-group>" --output table
+az monitor private-link-scope scoped-resource delete --name "<scoped-resource>" --scope-name "<private-link-scope>" --resource-group "<spoke-resource-group>" --yes
 azd down --force --purge
 ```
 

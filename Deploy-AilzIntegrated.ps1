@@ -436,11 +436,16 @@ $explicitApiManagementIngressSourceAddressPrefixes = @(
 
 # With API Management enabled and no explicit ingress sources, the default is
 # resolved after sign-in from the hub's AzureFirewallSubnet (ADR-002).
+# With API Management disabled the value is left unset rather than defaulted to
+# the next hop's /32. The Bicep parameter is inert while deployApiManagement is
+# false, azd substitutes the parameter file's [] for an unset variable, and a
+# written /32 would persist in the azd environment as a working-looking default
+# that Azure Firewall never matches: it source-NATs gateway traffic to a
+# back-end instance address in AzureFirewallSubnet, not to its frontend IP
+# (ADR-002 live proof, 2026-09-23). Enabling the gateway by any route that does
+# not re-resolve the default would then build an unreachable gateway.
 $defaultApiManagementIngressSourceAddressPrefixes = if ($explicitApiManagementIngressSourceAddressPrefixes.Count -gt 0) {
     ConvertTo-Json -InputObject $explicitApiManagementIngressSourceAddressPrefixes -Compress
-}
-elseif (-not $DeployApiManagement) {
-    ConvertTo-Json -InputObject @("$EgressNextHopIp/32") -Compress
 }
 else {
     ''

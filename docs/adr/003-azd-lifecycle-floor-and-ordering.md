@@ -209,11 +209,16 @@ prompts. No Bicep resource, parameter, output or binding changes.
    - a resource group tagged `azd-env-name=<environment>`, unless
      `-AllowExternalResourceGroup` is passed;
    - the typed confirmation.
-   It never changes the hub. azd down deletes the resource group before it
-   purges. If it fails while the group still exists, rerunning the script finds
-   no links and retries `azd down`. If the group is already gone, the purge
-   failed and a rerun cannot redo it. The script checks which case applies and
-   names the `az ... list-deleted` and `az ... purge` commands for Key Vault,
+   It then deletes the Azure AI Search shared private links and the Azure
+   Monitor private link scoped resources, both of which block a delete that
+   `azd down` performs, and only then runs `azd down --force --purge`. It never
+   changes the hub. azd purges the Log Analytics workspace before it deletes the
+   resource group and purges the remaining resources after, so it can fail on
+   either side of the group deletion. If it fails while the group still exists,
+   rerunning the script finds no links or scoped resources and retries
+   `azd down`. If the group is already gone, the purge failed and a rerun cannot
+   redo it. The script checks which case applies and names the
+   `az ... list-deleted` and `az ... purge` commands for Key Vault,
    App Configuration, API Management and Foundry.
 
 ## Consequences
@@ -269,14 +274,61 @@ prompts. No Bicep resource, parameter, output or binding changes.
   `azd` that answer only the expected scope. It is mutation-checked, runs in the
   local gate and in CI, and passed under PowerShell 7.6.6 on Linux as well as on
   Windows.
-- **Needs a live run:** a two-pass `-DeployApiManagement` deployment with
-  `APIM_HUB_PEERING_CONNECTED` before the second pass; `Remove-AilzEnvironment.ps1`
-  against a real environment with Search shared private links; azd 1.34.2
-  provisioning the quoted array bindings against ARM; gateway activation with
-  the hub-side peering's `allowForwardedTraffic` set to false. Preflight does not
-  require that flag, because gateway egress starts in the spoke. Most Microsoft
-  sources support that reading, but the `az` help and the peering
-  troubleshooter describe the flag differently.
+- **Live run, 2026-09-24.** A throwaway hub (`rg-ailzverify-hub`, VNet
+  10.100.0.0/16, Azure Firewall Standard) and spoke (`rg-ailzverify-spoke`, azd
+  environment `ailzverify`) in subscription `67e34e6c-…`, region eastus2, with
+  AI Search placed in eastus because eastus2 still reports
+  `InsufficientResourcesAvailable`. Deployed from `2ff19a5` on azd 1.34.2.
+  Everything was torn down and verified gone.
+
+  | Claim | Result |
+  | --- | --- |
+  | azd floor | `azd version` 1.34.2 ≥ 1.25.5 after `winget upgrade Microsoft.Azd` |
+  | Preflight blocks a gateway with no hub peering | After pass 1, `-DeployApiManagement -PreviewOnly` failed `[FAIL] APIM_HUB_PEERING_MISSING`, exit 1, throwing at `Deploy-AilzIntegrated.ps1:545` before `Invoke-CompletePreview`, so no What-If ran |
+  | Array parameters reach ARM as arrays | The pass-1 deployment recorded `apiManagementIngressSourceAddressPrefixes` as `Object[]`, not a string. The quoted `${…}` binding carried `["10.100.0.0/26"]` through azd 1.34.2 into the gateway NSG's `sourceAddressPrefixes` |
+  | Preflight passes once peered | `[INFO] APIM_HUB_PEERING_CONNECTED`, 0 fail, after `Add-HubSpokePeering.ps1` made both directions Connected and FullyInSync |
+  | Ingress default | `API Management ingress source: hub AzureFirewallSubnet 10.100.0.0/26.` |
+  | Gateway activates | Developer, Internal, private VIP 192.168.3.132, `provisioningState` Succeeded, no `ActivationFailed`. `networkstatus` reported 17 of 18 reachable, only the optional `Scm`; all three Monitoring dependencies succeeded, which is what failed on 2026-09-23 |
+  | Gateway NSG | `AllowHttpsFromHubFirewall` `sourceAddressPrefixes` `["10.100.0.0/26"]` |
+  | Spoke egress traverses the hub firewall | `AZFWNetworkRule` held 1534 rows, all `Allow`, none `Deny`; 1230 from the injection subnet on 443, 80, 1886, 123 and 1688 |
+  | Teardown | `-WhatIf` deleted nothing; the real run deleted the 4 Search shared private links, then `azd down --force --purge` purged the workspace, deleted the resource group and purged two Key Vaults, App Configuration, API Management and the Foundry account, with no `NetworkInjections` failure and no manual purge. Afterwards both resource groups were gone and `az keyvault list-deleted`, `az cognitiveservices account list-deleted`, `az apim deletedservice list` and `az appconfig list-deleted` matched the pre-run baseline exactly |
+
+  Two defects that only a first live gateway deployment can reach were found and
+  fixed on the branch:
+
+  - **The gateway module read itself back before it existed.**
+    `modules/api-management/main.bicep` declared the deployed service as an
+    `existing` resource to surface its private VIP. An `existing` resource
+    compiles to a declared ARM resource whose `Read` operation runs when the
+    deployment starts, so on a first deployment it returned `ResourceNotFound`
+    in 0.41 s and failed the deployment *after* the 28 m 44 s create had
+    succeeded. The service itself was `Succeeded` throughout, and an unchanged
+    rerun passed in 10 m 48 s, which confirms the ordering rather than the
+    resource was at fault. Fixed with `dependsOn: [gateway]`, which Bicep emits
+    onto the existing resource. ADR-002's proof never reached this point
+    because the gateway failed at `ActivationFailed` first, and neither
+    `az bicep build` nor What-If evaluates an `existing` read.
+  - **Teardown could not delete the Log Analytics workspace.** `azd down`
+    force-deletes the workspace *before* it deletes the resource group, and
+    Azure rejected that with `CannotDeleteWorkspaceWhenLinkedToPrivateLinkScopes`
+    while the Azure Monitor Private Link Scope still held scoped resources for
+    the workspace and Application Insights. Nothing was deleted.
+    `Remove-AilzEnvironment.ps1` now deletes those scoped resources alongside
+    the Search shared private links, which completed the teardown on the rerun.
+    This also corrects this ADR's earlier statement that azd deletes the
+    resource group before it purges: it purges the workspace first and the
+    remaining resources after, so `azd down` can fail on either side of the
+    group deletion. The script already tested which case applied, and that
+    logic was correct.
+
+  Still not verified live: gateway activation with the hub-side peering's
+  `allowForwardedTraffic` set to false, and ADR-002 phase 2 (Entra audience app,
+  token and 401/200/429 checks).
+- **Needs a live run:** gateway activation with the hub-side peering's
+  `allowForwardedTraffic` set to false. Preflight does not require that flag,
+  because gateway egress starts in the spoke. Most Microsoft sources support
+  that reading, but the `az` help and the peering troubleshooter describe the
+  flag differently.
 
 ## Documentation impact
 
