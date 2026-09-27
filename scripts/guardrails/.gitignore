@@ -1,0 +1,8 @@
+# The real configuration. Never commit it - it names the customer's tenant,
+# subscription and alert recipients.
+.env
+.env.*
+!.env.example
+
+# Per-run evidence. Contains live subscription and resource IDs.
+evidence/

@@ -12,6 +12,7 @@ $files = @(
     Get-ChildItem -LiteralPath (Join-Path $root 'tests\github') -File | Where-Object Extension -in @('.ps1', '.psm1')
     Get-ChildItem -LiteralPath (Join-Path $root 'samples\developer-smoke') -File -Recurse | Where-Object Extension -in @('.ps1', '.psm1')
     Get-ChildItem -LiteralPath (Join-Path $root 'platform') -File -Recurse | Where-Object Extension -in @('.ps1', '.psm1')
+    Get-ChildItem -LiteralPath (Join-Path $root 'scripts\guardrails') -File -Recurse | Where-Object Extension -in @('.ps1', '.psm1')
     Get-Item -LiteralPath (Join-Path $root 'scripts\Measure-MainJsonSize.ps1')
 )
 if ($files.Count -eq 0) { throw 'No PowerShell surfaces were found to lint.' }

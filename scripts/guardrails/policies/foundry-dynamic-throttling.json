@@ -1,0 +1,70 @@
+{
+  "_comment": [
+    "Dynamic quota must be explicitly off.",
+    "",
+    "WHY THIS EXISTS: dynamic quota lets a Standard deployment exceed its TPM",
+    "opportunistically. Microsoft documents the consequence plainly:",
+    "",
+    "  'With dynamic quota, there is no call enforcement of a ceiling quota or",
+    "   throughput... If you need to control the rate of spend even when quota",
+    "   is less constrained, your application code needs to hold back requests",
+    "   accordingly.'",
+    "",
+    "and: 'The extra requests are still billed at the regular pricing rates.'",
+    "",
+    "NO DEFAULT STATE IS PUBLISHED for dynamicThrottlingEnabled, and there is",
+    "no metric or log indicating when quota has been dynamically raised. That",
+    "combination - an unpublished default with no observability and a direct",
+    "cost consequence - is precisely why this is pinned declaratively rather",
+    "than left to whatever the platform happens to do.",
+    "",
+    "WHY A POLICY AND NOT A PATCH: the property is READ-ONLY on",
+    "accounts/deployments (the SDK documents it as server-populated only). It",
+    "is settable on the parent account. A policy is also durable in a way a",
+    "one-off imperative PATCH is not: it keeps applying to accounts created",
+    "later, which matters for a configuration that will be held unchanged for",
+    "years.",
+    "",
+    "ALIAS VERIFIED against the live provider:",
+    "  Microsoft.CognitiveServices/accounts/dynamicThrottlingEnabled"
+  ],
+  "properties": {
+    "displayName": "Foundry and AI Services accounts must not enable dynamic quota",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "description": "Denies or audits Microsoft.CognitiveServices accounts with dynamicThrottlingEnabled set to true. Dynamic quota permits opportunistic throughput above the assigned TPM ceiling, billed at normal rates, with no enforcement ceiling and no metric or log indicating when it engaged.",
+    "metadata": {
+      "category": "Cognitive Services",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.CognitiveServices/accounts"
+          },
+          {
+            "field": "Microsoft.CognitiveServices/accounts/dynamicThrottlingEnabled",
+            "equals": "true"
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

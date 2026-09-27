@@ -22,3 +22,18 @@ hooks:
       run: ./scripts/Invoke-PreflightChecks.ps1
       continueOnError: false
       interactive: true
+  # Post-deployment governance. Dry run by default and a no-op when
+  # scripts/guardrails/.env is absent, so it can never fail a provision that
+  # succeeded; continueOnError keeps a governance finding advisory rather than
+  # fatal. Set GUARDRAILS_AUTO_APPLY=true in the azd environment to apply.
+  postprovision:
+    posix:
+      shell: pwsh
+      run: ./scripts/guardrails/Invoke-GuardrailsAzdHook.ps1
+      continueOnError: true
+      interactive: false
+    windows:
+      shell: pwsh
+      run: ./scripts/guardrails/Invoke-GuardrailsAzdHook.ps1
+      continueOnError: true
+      interactive: false

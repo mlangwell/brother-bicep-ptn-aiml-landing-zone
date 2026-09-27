@@ -1,0 +1,156 @@
+{
+  "_comment": [
+    "Container Apps scale ceiling: workload profile type, profile node count",
+    "and per-app replica count.",
+    "",
+    "WHY THIS EXISTS: the custom role grants Microsoft.App/*, which includes",
+    "managedEnvironments/write and containerApps/write. A dedicated workload",
+    "profile bills per provisioned node by size, for as long as the profile",
+    "exists, whether or not anything runs on it - so the profile TYPE and the",
+    "number of nodes it may scale to are both cost decisions. Per-app",
+    "maxReplicas is the same decision one layer down.",
+    "",
+    "WHY A CUSTOM DEFINITION: no built-in is cost-related. Verified",
+    "2026-09-25 - all 11 Container Apps built-ins were enumerated and every",
+    "one is HTTPS-only, authentication, managed identity, network ingress or",
+    "zone redundancy. None reads a workload profile or a replica count.",
+    "",
+    "ARRAY ALIASES DO NOT BEHAVE LIKE SCALAR FIELDS, AND THIS IS THE THING",
+    "TO GET RIGHT:",
+    "",
+    "  workloadProfiles[*] is an ARRAY alias. A bare 'field' + 'notIn' on an",
+    "  array alias does not mean 'any member violates' - the [*] form on its",
+    "  own evaluates to true only when EVERY member satisfies the condition,",
+    "  which is the opposite of what a ceiling needs. The correct construct",
+    "  is a count expression with a 'where' clause: count the members that",
+    "  violate, and match when that count is greater than zero.",
+    "  https://learn.microsoft.com/azure/governance/policy/concepts/definition-structure-alias#understanding-the-array-alias",
+    "",
+    "  An environment with no workloadProfiles at all (Consumption-only) has",
+    "  a count of zero, so it is correctly left alone.",
+    "",
+    "ONE PARAMETER, TWO CEILINGS - SAY SO PLAINLY: maxReplicas bounds BOTH",
+    "workloadProfiles[*].maximumCount (the most nodes a dedicated profile may",
+    "scale to) and containerApps template.scale.maxReplicas (the most",
+    "replicas one app may scale to). They are different units, but they are",
+    "the same question - how many billed instances may this scale to - and",
+    "they are deliberately governed by a single number so there is one dial",
+    "to turn rather than two that can drift apart.",
+    "",
+    "ALIASES VERIFIED against the live provider:",
+    "  Microsoft.App/managedEnvironments/workloadProfiles[*].workloadProfileType",
+    "  Microsoft.App/managedEnvironments/workloadProfiles[*].maximumCount",
+    "  Microsoft.App/containerApps/template.scale.maxReplicas",
+    "",
+    "NOTE ON exists: the workloadProfileType test is guarded inside the where",
+    "clause because a negative condition (notIn) on an absent field matches,",
+    "which would make an incomplete payload look like a violation. The",
+    "maximumCount and maxReplicas tests are positive comparisons and an",
+    "absent value cannot satisfy them, but maxReplicas is guarded anyway for",
+    "the same reason the rest of this pack is - an omitted optional property",
+    "is not a violation."
+  ],
+  "properties": {
+    "displayName": "Container Apps environments and apps must stay within the approved scale ceiling",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "description": "Denies or audits Microsoft.App managed environments that declare a workload profile outside the approved types or above the approved node count, and container apps that scale above the approved replica count. Dedicated workload profiles bill per provisioned node whether or not anything runs on them.",
+    "metadata": {
+      "category": "Container Apps",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      },
+      "allowedWorkloadProfileTypes": {
+        "type": "Array",
+        "defaultValue": [ "Consumption", "D4", "D8" ],
+        "metadata": {
+          "displayName": "Allowed workload profile types",
+          "description": "Permitted workloadProfileType values. Consumption is scale-to-zero and bills only on use; the dedicated D-series entries are the small end. The GPU profiles and the large general-purpose and memory-optimised profiles are deliberately absent."
+        }
+      },
+      "maxReplicas": {
+        "type": "Integer",
+        "defaultValue": 10,
+        "metadata": {
+          "displayName": "Maximum scale count",
+          "description": "Bounds both the maximum node count of a dedicated workload profile and the maximum replica count of a container app. One dial for 'how many billed instances may this scale to'."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "anyOf": [
+          {
+            "allOf": [
+              {
+                "field": "type",
+                "equals": "Microsoft.App/managedEnvironments"
+              },
+              {
+                "anyOf": [
+                  {
+                    "count": {
+                      "field": "Microsoft.App/managedEnvironments/workloadProfiles[*]",
+                      "where": {
+                        "allOf": [
+                          {
+                            "field": "Microsoft.App/managedEnvironments/workloadProfiles[*].workloadProfileType",
+                            "exists": "true"
+                          },
+                          {
+                            "field": "Microsoft.App/managedEnvironments/workloadProfiles[*].workloadProfileType",
+                            "notIn": "[parameters('allowedWorkloadProfileTypes')]"
+                          }
+                        ]
+                      }
+                    },
+                    "greater": 0
+                  },
+                  {
+                    "count": {
+                      "field": "Microsoft.App/managedEnvironments/workloadProfiles[*]",
+                      "where": {
+                        "field": "Microsoft.App/managedEnvironments/workloadProfiles[*].maximumCount",
+                        "greater": "[parameters('maxReplicas')]"
+                      }
+                    },
+                    "greater": 0
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "allOf": [
+              {
+                "field": "type",
+                "equals": "Microsoft.App/containerApps"
+              },
+              {
+                "field": "Microsoft.App/containerApps/template.scale.maxReplicas",
+                "exists": "true"
+              },
+              {
+                "field": "Microsoft.App/containerApps/template.scale.maxReplicas",
+                "greater": "[parameters('maxReplicas')]"
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

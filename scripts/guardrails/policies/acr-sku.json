@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "Azure Container Registry SKU allow-list.",
+    "",
+    "WHY THIS EXISTS: the custom role grants Microsoft.ContainerRegistry/*,",
+    "which includes registries/write. ACR bills a flat daily rate per",
+    "registry by tier, so the SKU is the whole cost decision - Premium is a",
+    "large step up from Standard and buys capabilities (geo-replication,",
+    "higher throughput, private link) an innovation sandbox does not need.",
+    "",
+    "WHY A CUSTOM DEFINITION: the only SKU-touching built-in for ACR is",
+    "bd560fc0-3c69-498a-ae9f-aa8eb7de0e13, 'Container registries should have",
+    "SKUs that support Private Links'. Verified 2026-09-25 - that policy",
+    "pushes registries UP to Premium, because Premium is the tier that",
+    "supports private link. It is the exact OPPOSITE of a cost ceiling and",
+    "cannot be reused as one.",
+    "",
+    "That tension is real and worth stating: if this workload later requires",
+    "private link on its registry, Premium becomes a requirement and the two",
+    "controls genuinely conflict. Resolve it by adding Premium to",
+    "ACR_ALLOWED_SKUS deliberately, with the cost accepted - not by removing",
+    "the ceiling.",
+    "",
+    "ALIAS VERIFIED against the live provider:",
+    "  Microsoft.ContainerRegistry/registries/sku.name"
+  ],
+  "properties": {
+    "displayName": "Container registries must use an approved SKU",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "description": "Denies or audits Microsoft.ContainerRegistry registries created with a SKU outside the approved list. ACR bills a flat daily rate per registry by tier, so the SKU is the cost decision. Premium is excluded by default.",
+    "metadata": {
+      "category": "Container Registry",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      },
+      "allowedSkus": {
+        "type": "Array",
+        "defaultValue": [ "Basic", "Standard" ],
+        "metadata": {
+          "displayName": "Allowed container registry SKUs",
+          "description": "Permitted sku.name values for Microsoft.ContainerRegistry/registries. Premium is deliberately excluded as the cost tier; add it only with the spend accepted."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.ContainerRegistry/registries"
+          },
+          {
+            "field": "Microsoft.ContainerRegistry/registries/sku.name",
+            "exists": "true"
+          },
+          {
+            "field": "Microsoft.ContainerRegistry/registries/sku.name",
+            "notIn": "[parameters('allowedSkus')]"
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

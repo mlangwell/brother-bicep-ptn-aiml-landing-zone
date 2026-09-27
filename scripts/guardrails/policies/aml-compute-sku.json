@@ -1,0 +1,107 @@
+{
+  "_comment": [
+    "Azure Machine Learning compute VM size allow-list.",
+    "",
+    "WHY THIS EXISTS: this is the single largest hole the custom role leaves",
+    "open. ROLE_ALLOWED_PROVIDERS includes Microsoft.MachineLearningServices,",
+    "and the role builder expands every provider to '<provider>/*' - so the",
+    "role grants workspaces/computes/write. That operation creates a GPU",
+    "cluster at ANY size. RBAC cannot see the vmSize in the request body, so",
+    "without this definition the role can stand up an ND96 cluster and the",
+    "only thing that notices is the invoice.",
+    "",
+    "WHY A CUSTOM DEFINITION: no built-in restricts AML compute VM SKUs.",
+    "Verified 2026-09-25 - all 30 built-ins in the Machine Learning category",
+    "were enumerated; they cover private link, public network access, local",
+    "auth, CMK, user-assigned identity, approved registries/modules/",
+    "environments and compute idle shutdown. Not one of them constrains the",
+    "VM size. 'Azure Machine Learning Computes should have local",
+    "authentication methods disabled' (7804b5c7-01dc-4723-969b-ae300cc07ff1)",
+    "is the closest neighbour: same resource type, and it is the shape",
+    "reference for the two structural decisions below.",
+    "",
+    "MODE IS 'All' AND THAT IS MANDATORY. workspaces/computes is a CHILD",
+    "resource type. Indexed only evaluates resource types that support tags",
+    "and location, so an Indexed definition here would match NOTHING - it",
+    "would deploy cleanly, report 100% compliant, and enforce nothing at all.",
+    "That is a worse outcome than having no policy, because it looks like a",
+    "control. Microsoft's own built-in for this same type uses mode All.",
+    "",
+    "WHY THE computeType GATE: workspaces/computes is a polymorphic type.",
+    "AmlCompute and ComputeInstance carry properties.properties.vmSize;",
+    "AKS, Databricks, Synapse Spark, HDInsight and attached VM computes do",
+    "not. Without the gate this rule reaches resources whose payload has no",
+    "such path, which is both wrong and noisy. The gate is copied from the",
+    "built-in named above.",
+    "",
+    "ABOUT THE DEFAULT LIST: it deliberately excludes EVERY GPU size - the",
+    "whole NC, ND and NV series - and every large memory-optimised size. That",
+    "is the point of the ceiling, not an oversight. Adding a GPU size to",
+    "AML_ALLOWED_VM_SIZES is a deliberate cost decision and should be made by",
+    "whoever owns the budget, not by whoever needs the cluster today.",
+    "",
+    "ALIASES VERIFIED against the live provider:",
+    "  Microsoft.MachineLearningServices/workspaces/computes/vmSize",
+    "      (defaultPath properties.properties.vmSize)",
+    "  Microsoft.MachineLearningServices/workspaces/computes/computeType",
+    "",
+    "NOTE ON exists: vmSize is not present on every compute payload even",
+    "within the gated compute types, so the value test is guarded by an",
+    "exists check and an omitted property is not treated as a violation."
+  ],
+  "properties": {
+    "displayName": "Azure ML compute must use an approved VM size",
+    "policyType": "Custom",
+    "mode": "All",
+    "description": "Denies or audits Azure Machine Learning AmlCompute clusters and ComputeInstances created with a VM size outside the approved list. The default list is CPU-only: GPU sizes are excluded because a GPU cluster is a committed-spend decision, not an innovation one.",
+    "metadata": {
+      "category": "Machine Learning",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      },
+      "allowedVmSizes": {
+        "type": "Array",
+        "defaultValue": [ "Standard_DS3_v2", "Standard_DS11_v2", "Standard_D4s_v3", "Standard_E4s_v3" ],
+        "metadata": {
+          "displayName": "Allowed Azure ML compute VM sizes",
+          "description": "Permitted vmSize values for AmlCompute and ComputeInstance. The default is CPU-only and excludes every GPU size (NC, ND and NV series). Adding a GPU size is a deliberate cost decision."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.MachineLearningServices/workspaces/computes"
+          },
+          {
+            "field": "Microsoft.MachineLearningServices/workspaces/computes/computeType",
+            "in": [ "AmlCompute", "ComputeInstance" ]
+          },
+          {
+            "field": "Microsoft.MachineLearningServices/workspaces/computes/vmSize",
+            "exists": "true"
+          },
+          {
+            "field": "Microsoft.MachineLearningServices/workspaces/computes/vmSize",
+            "notIn": "[parameters('allowedVmSizes')]"
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}
