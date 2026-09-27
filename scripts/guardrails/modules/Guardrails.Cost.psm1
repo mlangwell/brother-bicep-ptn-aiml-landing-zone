@@ -152,7 +152,7 @@ function Set-SubscriptionBudget {
         -Reference 'https://learn.microsoft.com/azure/cost-management-billing/costs/tutorial-acm-create-budgets' `
         -Probe {
             $existing = Invoke-AzRestJson -Method get -Url $url -AllowNotFound
-            if (-not $existing) { return @{ Compliant = $false; Detail = 'no subscription-scope budget exists' } }
+            if (-not $existing) { return @{ Compliant = $false; Detail = 'no subscription-scope budget exists'; Evidence = @{ present = $false } } }
 
             # Create-only. An existing budget is the operator's, not ours.
             $properties = $existing.properties
@@ -233,8 +233,11 @@ function Set-GuardrailResourceLock {
                 '--resource-type', $ResourceType,
                 '-o', 'json'
             )
-            if ($existing) { return @{ Compliant = $true; Detail = 'lock already present'; Evidence = @{ id = [string]$existing.id } } }
-            return @{ Compliant = $false; Detail = 'no delete lock' }
+            if ($existing) { return @{ Compliant = $true; Detail = 'lock already present'; Evidence = @{ present = $true; id = [string]$existing.id } } }
+            # Teardown must remove this lock before the resource it protects can
+            # be deleted, and `present=$false` records that we are the ones who
+            # added it rather than an operator whose lock should survive.
+            return @{ Compliant = $false; Detail = 'no delete lock'; Evidence = @{ present = $false; lockName = $lockName } }
         } `
         -Action {
             $result = Invoke-AzCli -Arguments @(
@@ -282,7 +285,7 @@ function New-CostActionGroup {
                 'monitor', 'action-group', 'show',
                 '--name', $name, '--resource-group', $Target.ResourceGroup, '-o', 'json'
             )
-            if (-not $existing) { return @{ Compliant = $false; Detail = 'action group does not exist' } }
+            if (-not $existing) { return @{ Compliant = $false; Detail = 'action group does not exist'; Evidence = @{ present = $false } } }
 
             $liveEmails = @()
             if ($existing.PSObject.Properties.Name -contains 'emailReceivers' -and $existing.emailReceivers) {
@@ -359,7 +362,11 @@ function Set-TagInheritance {
         -WouldDo "Enable tag inheritance at subscription scope with preferContainerTags=$prefer" `
         -Probe {
             $live = Invoke-AzRestJson -Method get -Url $url -AllowNotFound
-            if (-not $live) { return @{ Compliant = $false; Detail = 'not enabled' } }
+            # `present=$false` is the whole point of this record. Tag inheritance
+            # has no documented unset operation - Microsoft publishes only how to
+            # ENABLE it - so "it was off before" is the one fact that makes the
+            # change reversible, and it is only observable now.
+            if (-not $live) { return @{ Compliant = $false; Detail = 'not enabled'; Evidence = @{ present = $false } } }
 
             $current = $null
             if ($live.PSObject.Properties.Name -contains 'properties' -and $live.properties -and
@@ -368,9 +375,9 @@ function Set-TagInheritance {
             }
 
             if ($null -ne $current -and $current -eq $prefer) {
-                return @{ Compliant = $true; Detail = "already enabled (preferContainerTags=$current)"; Evidence = @{ preferContainerTags = $current } }
+                return @{ Compliant = $true; Detail = "already enabled (preferContainerTags=$current)"; Evidence = @{ present = $true; preferContainerTags = $current } }
             }
-            return @{ Compliant = $false; Detail = "enabled but preferContainerTags=$current, want $prefer" }
+            return @{ Compliant = $false; Detail = "enabled but preferContainerTags=$current, want $prefer"; Evidence = @{ present = $true; preferContainerTags = $current } }
         } `
         -Action {
             $result = Invoke-AzRestJson -Method put -Url $url -Body @{
@@ -426,7 +433,7 @@ function Set-CostAnomalyAlert {
         -WouldDo "Create anomaly alert '$name' at subscription scope, notifying $($Config.CostAlertEmails -join ', ')" `
         -Probe {
             $live = Invoke-AzRestJson -Method get -Url $url -AllowNotFound
-            if (-not $live) { return @{ Compliant = $false; Detail = 'alert does not exist' } }
+            if (-not $live) { return @{ Compliant = $false; Detail = 'alert does not exist'; Evidence = @{ present = $false } } }
 
             $liveProperties = $live.properties
             $livePropertyNames = $liveProperties.PSObject.Properties.Name
@@ -440,9 +447,9 @@ function Set-CostAnomalyAlert {
 
             $missing = @($Config.CostAlertEmails | Where-Object { $_ -notin $recipients })
             if ($status -eq 'Enabled' -and $missing.Count -eq 0) {
-                return @{ Compliant = $true; Detail = "enabled, notifying $($recipients.Count) recipient(s)"; Evidence = @{ status = $status; to = $recipients } }
+                return @{ Compliant = $true; Detail = "enabled, notifying $($recipients.Count) recipient(s)"; Evidence = @{ present = $true; status = $status; to = $recipients } }
             }
-            return @{ Compliant = $false; Detail = "status=$status, missing recipient(s): $($missing -join ', ')" }
+            return @{ Compliant = $false; Detail = "status=$status, missing recipient(s): $($missing -join ', ')"; Evidence = @{ present = $true; status = $status; to = $recipients } }
         } `
         -Action {
             $body = @{
@@ -513,8 +520,8 @@ function Set-SavedCostView {
         -WouldDo "Create saved view '$name' at subscription scope, daily actual cost grouped by service name" `
         -Probe {
             $live = Invoke-AzRestJson -Method get -Url $url -AllowNotFound
-            if (-not $live) { return @{ Compliant = $false; Detail = 'view does not exist' } }
-            return @{ Compliant = $true; Detail = 'view already exists'; Evidence = @{ id = [string]$live.id } }
+            if (-not $live) { return @{ Compliant = $false; Detail = 'view does not exist'; Evidence = @{ present = $false } } }
+            return @{ Compliant = $true; Detail = 'view already exists'; Evidence = @{ present = $true; id = [string]$live.id } }
         } `
         -Action {
             $body = @{
@@ -743,10 +750,10 @@ function Set-PrecapAlert {
         -WouldDo "Create log search alert '$name' on the documented OverQuota signal, routed to the cost action group" `
         -Probe {
             $live = Invoke-AzRestJson -Method get -Url $url -AllowNotFound
-            if (-not $live) { return @{ Compliant = $false; Detail = 'alert rule does not exist' } }
+            if (-not $live) { return @{ Compliant = $false; Detail = 'alert rule does not exist'; Evidence = @{ present = $false } } }
             $enabled = if ($live.properties.PSObject.Properties.Name -contains 'enabled') { [bool]$live.properties.enabled } else { $false }
-            if ($enabled) { return @{ Compliant = $true; Detail = 'alert rule exists and is enabled'; Evidence = @{ id = [string]$live.id } } }
-            return @{ Compliant = $false; Detail = 'alert rule exists but is disabled' }
+            if ($enabled) { return @{ Compliant = $true; Detail = 'alert rule exists and is enabled'; Evidence = @{ present = $true; enabled = $true; id = [string]$live.id } } }
+            return @{ Compliant = $false; Detail = 'alert rule exists but is disabled'; Evidence = @{ present = $true; enabled = $false; id = [string]$live.id } }
         } `
         -Action {
             $body = @{

@@ -35,6 +35,23 @@ $ErrorActionPreference = 'Stop'
 $script:PolicyApiVersion = '2025-11-01'
 $script:ContributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
 
+# Set once per run by Invoke-PolicyGuardrails. Module state rather than a
+# threaded parameter on purpose: every writer reads it from one place, so a new
+# call site cannot silently create an object without it. An unstamped object is
+# one that teardown can never safely identify, so the writers fail closed rather
+# than create one.
+$script:OwnerStamp = ''
+
+function Assert-OwnerStamp {
+    [CmdletBinding()]
+    param()
+
+    if ([string]::IsNullOrWhiteSpace($script:OwnerStamp)) {
+        throw 'Internal error: the guardrail ownership stamp was not set before a policy object was created. Refusing to create an object that teardown could not identify.'
+    }
+    return $script:OwnerStamp
+}
+
 # GUID hints. Each is verified against its expected display name at runtime
 # before it is ever assigned - the hint is a lookup shortcut, never the
 # authority. See Resolve-BuiltInPolicy.
@@ -199,6 +216,23 @@ function Set-CustomPolicyDefinition {
     # Strip the review comments; ARM rejects unknown top-level members.
     $body = @{ properties = $raw.properties }
 
+    # Stamp ownership without discarding the definition's own metadata, which
+    # carries category, version and the source citation each policy documents.
+    $stamp = Assert-OwnerStamp
+    $metadata = [ordered]@{}
+    if ($raw.properties.PSObject.Properties.Name -contains 'metadata' -and $raw.properties.metadata) {
+        foreach ($property in $raw.properties.metadata.PSObject.Properties) {
+            $metadata[$property.Name] = $property.Value
+        }
+    }
+    $metadata['ailz-owner'] = $stamp
+    $body.properties = [ordered]@{}
+    foreach ($property in $raw.properties.PSObject.Properties) {
+        if ($property.Name -eq 'metadata') { continue }
+        $body.properties[$property.Name] = $property.Value
+    }
+    $body.properties['metadata'] = $metadata
+
     $url = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Authorization/policyDefinitions/$Name" +
            "?api-version=$script:PolicyApiVersion"
 
@@ -227,6 +261,10 @@ function Set-PolicyAssignment {
         displayName        = $DisplayName
         policyDefinitionId = $PolicyDefinitionId
         enforcementMode    = $EnforcementMode
+        # Written on every assignment so removal can enumerate and filter on
+        # ownership instead of reconstructing names through Get-AssignmentName's
+        # SHA-256 truncation. See Get-GuardrailOwnerStamp.
+        metadata           = @{ 'ailz-owner' = (Assert-OwnerStamp) }
     }
 
     if ($Parameters.Count -gt 0) {
@@ -321,6 +359,16 @@ function Invoke-PolicyGuardrails {
     $enforcement = if ($Config.PolicyEffect -eq 'Deny') { 'Default' } else { 'DoNotEnforce' }
     $effectValue = $Config.PolicyEffect
 
+    # Must be set before anything in this plane writes. Every definition and
+    # assignment created below carries it, and it is the only thing that lets a
+    # later teardown tell this playbook's objects apart from the Bicep-owned
+    # ones that share the same prefix at the same scope.
+    $script:OwnerStamp = Get-GuardrailOwnerStamp -SubscriptionId $Target.SubscriptionId -Prefix $prefix
+
+    Add-GuardrailResult -Plane $plane -Name 'Ownership stamp' -Status 'Compliant' `
+        -Detail "Every definition and assignment this plane creates is tagged metadata['ailz-owner']='$script:OwnerStamp'. Removal filters on this; it never reconstructs names." `
+        -Evidence @{ ailzOwner = $script:OwnerStamp } | Out-Null
+
     # Report the honest status. DoNotEnforce is not a compliant end state - it is
     # a soak phase. Calling it Compliant makes the one line an operator scans to
     # see whether the ceilings are live say "yes" when the answer is "no".
@@ -396,19 +444,35 @@ function Invoke-PolicyGuardrails {
                     'policy', 'definition', 'show', '--name', $definitionName,
                     '--subscription', $Target.SubscriptionId, '-o', 'json'
                 )
-                if (-not $existing) { return @{ Compliant = $false; Detail = 'definition does not exist' } }
+                if (-not $existing) { return @{ Compliant = $false; Detail = 'definition does not exist'; Evidence = @{ present = $false } } }
 
                 $desired = (Get-Content -LiteralPath $definitionPath -Raw | ConvertFrom-Json -Depth 40).properties
                 if ($existing.PSObject.Properties.Name -notcontains 'policyRule') {
-                    return @{ Compliant = $false; Detail = 'existing definition has no readable policyRule' }
+                    return @{ Compliant = $false; Detail = 'existing definition has no readable policyRule'; Evidence = @{ present = $true; id = [string]$existing.id } }
                 }
                 $liveRule = $existing.policyRule | ConvertTo-Json -Depth 40 -Compress
                 $wantRule = $desired.policyRule  | ConvertTo-Json -Depth 40 -Compress
 
-                if ($liveRule -eq $wantRule) {
-                    return @{ Compliant = $true; Detail = 'definition already current'; Evidence = @{ id = [string]$existing.id } }
+                # Same reasoning as the assignment probe: a definition without
+                # our stamp cannot be safely claimed by a teardown, so a missing
+                # or foreign stamp is drift to repair rather than a state to
+                # report compliant.
+                $liveOwner = ''
+                if (($existing.PSObject.Properties.Name -contains 'metadata') -and $existing.metadata -and
+                    ($existing.metadata.PSObject.Properties.Name -contains 'ailz-owner')) {
+                    $liveOwner = [string]$existing.metadata.'ailz-owner'
                 }
-                return @{ Compliant = $false; Detail = 'policy rule differs from the file'; Evidence = @{ id = [string]$existing.id } }
+
+                $evidence = @{ id = [string]$existing.id; ailzOwner = $liveOwner }
+
+                if ($liveRule -ne $wantRule) {
+                    return @{ Compliant = $false; Detail = 'policy rule differs from the file'; Evidence = $evidence }
+                }
+                if ($liveOwner -ne $script:OwnerStamp) {
+                    $detail = if ($liveOwner) { "ailz-owner is '$liveOwner', want '$script:OwnerStamp'" } else { 'no ailz-owner stamp' }
+                    return @{ Compliant = $false; Detail = $detail; Evidence = $evidence }
+                }
+                return @{ Compliant = $true; Detail = 'definition already current'; Evidence = $evidence }
             } `
             -Action {
                 $result = Set-CustomPolicyDefinition -SubscriptionId $Target.SubscriptionId `
@@ -571,7 +635,7 @@ function New-GuardrailAssignment {
         -Probe {
             $url = "https://management.azure.com$assignmentId" + "?api-version=$script:PolicyApiVersion"
             $existing = Invoke-AzRestJson -Method get -Url $url -AllowNotFound
-            if (-not $existing) { return @{ Compliant = $false; Detail = 'assignment does not exist' } }
+            if (-not $existing) { return @{ Compliant = $false; Detail = 'assignment does not exist'; Evidence = @{ present = $false } } }
 
             $drift = @()
             $liveProperties = $existing.properties
@@ -585,6 +649,20 @@ function New-GuardrailAssignment {
             $liveDefinitionId = if ($livePropertyNames -contains 'policyDefinitionId') { [string]$liveProperties.policyDefinitionId } else { '' }
             if ($liveDefinitionId -ne $DefinitionId) {
                 $drift += 'points at a different definition'
+            }
+
+            # An assignment without our stamp is one a teardown could not
+            # safely claim. Treat a missing or foreign stamp as drift so a
+            # rerun repairs anything created before stamping existed, rather
+            # than reporting it compliant and leaving it unidentifiable.
+            $liveOwner = ''
+            if (($livePropertyNames -contains 'metadata') -and $liveProperties.metadata -and
+                ($liveProperties.metadata.PSObject.Properties.Name -contains 'ailz-owner')) {
+                $liveOwner = [string]$liveProperties.metadata.'ailz-owner'
+            }
+            if ($liveOwner -ne $script:OwnerStamp) {
+                $drift += if ($liveOwner) { "ailz-owner is '$liveOwner', want '$script:OwnerStamp'" }
+                          else { 'no ailz-owner stamp' }
             }
 
             foreach ($parameterName in $Parameters.Keys) {
@@ -608,11 +686,15 @@ function New-GuardrailAssignment {
                 return @{
                     Compliant = $true
                     Detail    = "already current (enforcementMode=$EnforcementMode)"
-                    Evidence  = @{ id = $assignmentId; principalId = $livePrincipal }
+                    Evidence  = @{ present = $true; id = $assignmentId; principalId = $livePrincipal; ailzOwner = $liveOwner }
                 }
             }
 
-            return @{ Compliant = $false; Detail = ($drift -join '; '); Evidence = @{ id = $assignmentId; principalId = $livePrincipal } }
+            return @{
+                Compliant = $false
+                Detail    = ($drift -join '; ')
+                Evidence  = @{ present = $true; id = $assignmentId; principalId = $livePrincipal; ailzOwner = $liveOwner }
+            }
         } `
         -Action {
             $splat = @{

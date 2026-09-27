@@ -274,6 +274,20 @@ a coin toss there is the same cross-engagement hazard.
 **Idempotent.** Every action reads current state first and is skipped when the desired
 state already holds. Reruns converge; they do not duplicate.
 
+**Every policy object is stamped with its owner.** Definitions and assignments created here
+carry `metadata['ailz-owner'] = 'ailz-guardrails:<subscription>:<prefix>'`, a distinct
+namespace from the Bicep template's `ailz-governance:`. This is what makes removal possible
+at all: the playbook reuses the template's `ASSIGNMENT_PREFIX`, so name alone cannot tell
+the two apart. A missing or foreign stamp is treated as drift and repaired on the next run,
+so nothing created before stamping existed stays unidentifiable.
+
+**An apply records what it replaced.** Each result carries `PriorState` — the probe's
+reading from *before* the change — alongside the evidence of the write itself. Three of
+these changes are settings rather than resources (tag inheritance, the Log Analytics daily
+cap, the Foundry tier-upgrade policy) and for those the pre-change value is the only way
+back. Absence is recorded explicitly as `present: false` rather than left null, because
+"it was off" and "we did not look" are different facts.
+
 **GUID verification.** Every built-in policy is resolved by GUID and then checked against
 its expected display name. A GUID that resolves to a different policy than you think is a
 silent, expensive mistake, so a mismatch fails the run rather than assigning something
@@ -323,6 +337,102 @@ You will also need `ROLE_REQUIRE_ENFORCING_CEILINGS=false` for the duration, bec
 run otherwise refuses to create a role whose ceilings do not enforce — and the role *is*
 unbounded until you flip. Microsoft publishes no soak duration, so pick one from your own
 release rhythm and write down the date you will flip.
+
+---
+
+## Removing the guardrails
+
+There is **no `Remove-AiGuardrails.ps1` yet** — that is deliberate, and this section is
+what stands in for it. Removal is by hand, from this runbook.
+
+Everything below is at **subscription** scope. `azd down` and
+`scripts/Remove-AilzEnvironment.ps1` tear down the landing zone's *resource group* and do
+not touch any of it. Removing the landing zone does not remove its guardrails.
+
+### How to tell what is yours
+
+Every policy definition and assignment this playbook creates carries
+`metadata['ailz-owner'] = 'ailz-guardrails:<subscription-id>:<prefix>'`. The dry-run output
+prints the exact value under **Ownership stamp**.
+
+**Filter on that stamp. Never reconstruct names.** The landing-zone Bicep uses the *same*
+`ASSIGNMENT_PREFIX` at the same scope and stamps its own objects
+`ailz-governance:` — so name prefixes alone cannot tell the two apart, and
+`Get-AssignmentName` SHA-256 truncates anything over 24 characters. A removal that
+rebuilds names will, on the first hashed name, find nothing and report success over a live
+enforcing `Deny` assignment.
+
+```powershell
+$stamp = 'ailz-guardrails:<subscription-id>:<prefix>'   # copy from the dry-run output
+$sub   = '<subscription-id>'
+
+# What this playbook owns, and nothing else:
+az policy assignment list --scope "/subscriptions/$sub" --query "[?metadata.\"ailz-owner\"=='$stamp'].name" -o tsv
+az policy definition list  --subscription $sub          --query "[?metadata.\"ailz-owner\"=='$stamp'].name" -o tsv
+```
+
+### Order matters
+
+Dependencies, not planes, set the order. Each step fails while the one above it is undone.
+
+**1. Revoke the policy identities' role grants — before deleting the assignments.**
+Deleting an assignment destroys its system-assigned identity, which leaves an unresolvable
+"Identity not found" grant that can no longer be looked up by principal.
+
+```powershell
+foreach ($name in (az policy assignment list --scope "/subscriptions/$sub" --query "[?metadata.\"ailz-owner\"=='$stamp'].name" -o tsv)) {
+  $pid = az policy assignment show --name $name --scope "/subscriptions/$sub" --query identity.principalId -o tsv
+  if ($pid -and $pid -ne 'null') { az role assignment delete --assignee-object-id $pid --scope "/subscriptions/$sub" }
+}
+```
+
+**2. Delete the assignments.** Definitions will not delete while assigned.
+
+**3. Delete the custom definitions** (filtered by the stamp, as above).
+
+**4. Remove both `CanNotDelete` locks, then the resources they protect.** There are two —
+the action group and the pre-cap alert rule — each named `<resource>-nodelete`.
+
+```powershell
+az lock delete --name "<resource>-nodelete" --resource-group <rg> --resource-name <resource> --resource-type <type>
+```
+
+**5. Delete the resources:** action group, cost anomaly alert, saved cost view,
+subscription budget, pre-cap log search alert.
+
+**6. Delete the custom role — enumerate its live assignments first.** Do not replay
+`ROLE_ASSIGN_PRINCIPAL_IDS`; an operator may have added their own, and the role will not
+delete while any assignment remains. Orphaned assignments whose principal no longer exists
+must be deleted by assignment **id**, not by `--assignee-object-id`.
+
+```powershell
+az role assignment list --role "<ROLE_NAME>" --scope "/subscriptions/$sub" --query "[].id" -o tsv |
+  ForEach-Object { az role assignment delete --ids $_ }
+az role definition delete --name "<ROLE_NAME>"
+```
+
+### The three settings do not "delete"
+
+These are settings, not resources. Their previous values are in the evidence file for the
+run that changed them, under `PriorState` — but **the semantics differ per setting**, and a
+uniform "restore the captured value" is wrong for two of the three.
+
+| Setting | Prior state recorded | How to undo |
+|---|---|---|
+| **Log Analytics daily cap** | `dailyQuotaGb`, with `-1` meaning unlimited | Restorable. `az monitor log-analytics workspace update --quota <prior>`. Confirm `-1` genuinely clears it — Microsoft documents setting the cap but publishes no unset sentinel |
+| **Cost Management tag inheritance** | `{ present: false }` when it was off | **Not a restore.** Microsoft documents only how to *enable* tag inheritance and publishes no unset operation. If `present` was `false`, the undo is a `DELETE` of the `taginheritance` setting — PUT-ing `preferContainerTags=false` leaves the feature **enabled** and silently changes billing-record tagging |
+| **Foundry `tierUpgradePolicy`** | `tierUpgradePolicy`, plus `readable` and `wasUnset` | **Report, do not revert.** Preview surface, and PATCH-ing a captured `null` back is not a defined operation. If `wasUnset` was true, record it as not reverted rather than guessing |
+
+`readable: false` on the Foundry record means the value could not be read at that
+api-version — that is *unknown*, not *unset*. Do not restore from it.
+
+### Why the script is deferred
+
+The hard part of a removal tool is "identify only what we created", and that can only be
+validated against real objects. The first `-Apply` produces the specification: real IDs,
+real ordering failures, real error text. Writing it before then is building the difficult
+half blind. The ownership stamp is the part that had to ship first, because an object
+created **without** it can never be safely identified afterwards.
 
 ---
 

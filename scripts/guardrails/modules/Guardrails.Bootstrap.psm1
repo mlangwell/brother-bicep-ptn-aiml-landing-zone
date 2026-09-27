@@ -379,6 +379,13 @@ function Get-GuardrailPrefixDiscovery {
         the prefix back out of that is exact, where deriving it from the project
         and environment names would be a guess that silently points the playbook
         at governance it does not own.
+
+        Only the `ailz-governance:` namespace counts. The playbook stamps its own
+        creations `ailz-guardrails:` (see Get-GuardrailOwnerStamp), and matching
+        those too would make discovery circular: on a subscription where the
+        landing-zone governance was never deployed, it would read back a prefix
+        the playbook itself had written and report success instead of the honest
+        "governance may have been deployed with enabled=false".
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ResourceGroup)
@@ -401,6 +408,7 @@ function Get-GuardrailPrefixDiscovery {
         $owner = ''
         try { $owner = [string]$assignment.metadata.'ailz-owner' } catch { continue }
         if ([string]::IsNullOrWhiteSpace($owner)) { continue }
+        if (-not $owner.StartsWith('ailz-governance:')) { continue }
 
         $segments = $owner -split ':'
         if ($segments.Count -lt 2) { continue }

@@ -420,6 +420,45 @@ function Get-EvidenceValue {
     return $null
 }
 
+function Get-GuardrailOwnerStamp {
+    <#
+    .SYNOPSIS
+        The ownership marker written onto every policy object this playbook
+        creates, and the only safe way to identify them again.
+
+    .DESCRIPTION
+        THIS IS A TEARDOWN PREREQUISITE, NOT A NICETY.
+
+        The landing-zone Bicep stamps the objects IT owns with
+        `ailz-owner: ailz-governance:<scope>:<prefix>` (see
+        platform/policy/contracts.bicep). This playbook deliberately reuses the
+        same ASSIGNMENT_PREFIX - the bootstrap recovers it from that very stamp -
+        so playbook-created and Bicep-created objects share a name namespace at
+        the same scope. Telling them apart by name alone means maintaining a
+        hardcoded key list, and `Get-AssignmentName` additionally SHA-256
+        truncates any name over 24 characters. Anything that tried to remove
+        objects by reconstructing names would, on the first name that hashed,
+        quietly find nothing and report a clean teardown over a live enforcing
+        Deny assignment.
+
+        So removal must ENUMERATE and FILTER on this stamp, never reconstruct.
+        The value is keyed on the subscription rather than on each object's own
+        scope, so one filter matches everything a run created regardless of
+        whether it landed at subscription or resource-group scope.
+
+        `ailz-guardrails:` is a distinct namespace from Bicep's
+        `ailz-governance:`, so filtering on it can never select a Bicep-owned
+        object. That is what stops a teardown deleting the template's work.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$Prefix
+    )
+
+    return "ailz-guardrails:$($SubscriptionId.ToLowerInvariant()):$Prefix"
+}
+
 function Add-GuardrailResult {
     <#
     .SYNOPSIS
@@ -434,6 +473,7 @@ function Add-GuardrailResult {
         [string]$Status,
         [Parameter(Mandatory)][string]$Detail,
         [object]$Evidence,
+        [object]$PriorState,
         [string]$Remediation,
         [string]$Reference
     )
@@ -447,6 +487,14 @@ function Add-GuardrailResult {
         Remediation = $Remediation
         Reference   = $Reference
         Evidence    = $Evidence
+        # What was there BEFORE this run changed it. Distinct from Evidence,
+        # which on an Applied record is what the write returned. Three of the
+        # playbook's changes are subscription or workspace SETTINGS rather than
+        # resources - tag inheritance, the Log Analytics daily cap and the
+        # Foundry tier-upgrade policy - and for those the only way back is the
+        # value they held beforehand. An apply is the single opportunity to
+        # record it, so it is recorded even when nothing will ever read it.
+        PriorState  = $PriorState
     }
 
     $script:Results.Add($record)
@@ -517,17 +565,21 @@ function Invoke-GuardrailAction {
 
     if (-not $script:ApplyMode) {
         return Add-GuardrailResult -Plane $Plane -Name $Name -Status 'WouldApply' `
-            -Detail "$WouldDo (current: $($state.Detail))" -Evidence $state.Evidence -Reference $Reference
+            -Detail "$WouldDo (current: $($state.Detail))" -Evidence $state.Evidence `
+            -PriorState $state.Evidence -Reference $Reference
     }
 
     try {
         $result = & $Action
+        # Evidence is what the write returned; PriorState is what it replaced.
+        # Keeping both is the difference between a run that can be undone and
+        # one that merely records that it happened.
         return Add-GuardrailResult -Plane $Plane -Name $Name -Status 'Applied' `
-            -Detail $WouldDo -Evidence $result -Reference $Reference
+            -Detail $WouldDo -Evidence $result -PriorState $state.Evidence -Reference $Reference
     }
     catch {
         return Add-GuardrailResult -Plane $Plane -Name $Name -Status 'Failed' `
-            -Detail $_.Exception.Message -Reference $Reference
+            -Detail $_.Exception.Message -PriorState $state.Evidence -Reference $Reference
     }
 }
 
@@ -619,6 +671,7 @@ Export-ModuleMember -Function @(
     'Initialize-GuardrailRun'
     'Test-GuardrailApplyMode'
     'Assert-GuardrailTarget'
+    'Get-GuardrailOwnerStamp'
     'Invoke-AzCli'
     'Invoke-AzRestJson'
     'Resolve-ProbeState'

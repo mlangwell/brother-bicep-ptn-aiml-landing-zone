@@ -232,7 +232,7 @@ function Invoke-AccessGuardrails {
         -WouldDo "Create or update the role with $($desired.Actions.Count) actions and $($desired.NotActions.Count) notActions at $scope" `
         -Probe {
             if (-not $existing) {
-                return @{ Compliant = $false; Detail = 'role does not exist'; Evidence = $null }
+                return @{ Compliant = $false; Detail = 'role does not exist'; Evidence = @{ present = $false } }
             }
 
             $comparison = Test-RoleDefinitionMatches -Desired $desired -Existing $existing
@@ -315,7 +315,7 @@ function Invoke-RoleAssignments {
                 if ($existing -and @($existing).Count -gt 0) {
                     return @{ Compliant = $true; Detail = 'assignment already exists'; Evidence = @($existing)[0] }
                 }
-                return @{ Compliant = $false; Detail = 'not assigned'; Evidence = $null }
+                return @{ Compliant = $false; Detail = 'not assigned'; Evidence = @{ present = $false } }
             } `
             -Action {
                 # --assignee-object-id avoids a Graph lookup, so this works for

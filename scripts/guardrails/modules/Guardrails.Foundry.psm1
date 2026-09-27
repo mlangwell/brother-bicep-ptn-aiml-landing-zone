@@ -81,7 +81,15 @@ function Set-QuotaTierPolicy {
         -Probe {
             $live = Invoke-AzRestJson -Method get -Url $url -AllowNotFound
             if (-not $live) {
-                return @{ Compliant = $false; Detail = "quotaTiers/default is not readable at api-version $($Config.FoundryQuotaApiVersion)" }
+                # `readable=$false` matters: without it, "we could not read it"
+                # and "it was explicitly unset" both land as a null prior value,
+                # and a teardown cannot tell a value it may restore from one it
+                # must report as unknown.
+                return @{
+                    Compliant = $false
+                    Detail    = "quotaTiers/default is not readable at api-version $($Config.FoundryQuotaApiVersion)"
+                    Evidence  = @{ readable = $false }
+                }
             }
 
             $current = $null
@@ -95,11 +103,15 @@ function Set-QuotaTierPolicy {
                 return @{
                     Compliant = $true
                     Detail    = "already '$current'"
-                    Evidence  = @{ tierUpgradePolicy = $current; currentTier = $(if ($live.properties.PSObject.Properties.Name -contains 'currentTierName') { $live.properties.currentTierName } else { $null }) }
+                    Evidence  = @{ readable = $true; tierUpgradePolicy = $current; currentTier = $(if ($live.properties.PSObject.Properties.Name -contains 'currentTierName') { $live.properties.currentTierName } else { $null }) }
                 }
             }
 
-            return @{ Compliant = $false; Detail = "currently '$(if ($current) { $current } else { 'unset' })'"; Evidence = @{ tierUpgradePolicy = $current } }
+            return @{
+                Compliant = $false
+                Detail    = "currently '$(if ($current) { $current } else { 'unset' })'"
+                Evidence  = @{ readable = $true; tierUpgradePolicy = $current; wasUnset = ($null -eq $current) }
+            }
         } `
         -Action {
             $result = Invoke-AzRestJson -Method patch -Url $url -Body @{
