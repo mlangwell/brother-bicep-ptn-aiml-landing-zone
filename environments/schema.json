@@ -240,6 +240,15 @@
         "privateDnsZoneResourceId": { "$ref": "#/definitions/gatewayPrivateDnsId" },
         "stopNewRequests": { "type": "boolean" },
         "foundryIntegration": { "type": "boolean", "const": false, "default": false },
+        "allowStreaming": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether callers may set stream:true. Defaults to false - a deliberate tightening, see ADR-004. Microsoft documents that when streaming is enabled, llm-token-limit ALWAYS estimates prompt tokens regardless of estimate-prompt-tokens, and estimates completion tokens too - categorically, with no setting that changes it. Note that streamed Responses calls DO report usage (response.completed carries a required usage object); the include_usage remedy Microsoft publishes is a Chat Completions parameter that does not exist on the Responses API and is unnecessary there. The gap is that the policy estimates regardless, and Microsoft documents no way to make it consume that usage. A streaming caller is therefore enforced on estimates with nothing request-side to correct it. Enable only where estimate-based enforcement is an accepted, recorded trade-off."
+        },
+        "defaultCallsPerMinute": {
+          "$ref": "#/definitions/positiveInteger",
+          "description": "Gateway-wide call-rate backstop applied to any caller without its own callsPerMinute. Absent uses the module default of 600. The platform caps rate-limit-by-key renewal-period at 300 seconds, so this is necessarily per minute."
+        },
         "callerMappings": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/callerMapping" } }
       },
       "allOf": [{
@@ -305,7 +314,18 @@
         "models": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/definitions/resourceName" } },
         "tokensPerMinute": { "$ref": "#/definitions/positiveInteger" },
         "tokenQuota": { "$ref": "#/definitions/positiveInteger" },
-        "tokenQuotaPeriod": { "type": "string", "enum": ["Hourly", "Daily", "Weekly", "Monthly", "Yearly"] }
+        "tokenQuotaPeriod": { "type": "string", "enum": ["Hourly", "Daily", "Weekly", "Monthly", "Yearly"] },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._-]*$",
+          "description": "Optional stable, human-readable billing label emitted as the caller metric dimension instead of the raw Entra object ID. An object ID is unreadable in a cost dashboard and puts a directory identifier into telemetry. Absent falls back to the object ID. Keep the set of distinct labels well under the documented 100-unique-values-per-dimension cap - past it, API Management silently discards the metric data. Note this value is carried in the base64 configuration named value and so consumes part of the 4096-character budget."
+        },
+        "callsPerMinute": {
+          "$ref": "#/definitions/positiveInteger",
+          "description": "Optional per-caller call-rate backstop, overriding the gateway defaultCallsPerMinute. Bounds request VOLUME, where tokensPerMinute bounds token CONSUMPTION. Both are needed: one request can be a hundred tokens or a hundred thousand, so a token limit only bites after the tokens have been counted."
+        }
       }
     },
     "modelDeployment": {

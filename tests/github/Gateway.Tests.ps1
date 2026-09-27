@@ -79,7 +79,8 @@ try {
 using none
 import { renderPolicy, gatewayNamedValues } from '$policyFile'
 var configuration = loadJsonContent('./gateway.json')
-param policy = renderPolicy('$owner', '$apiPath', configuration.callerMappings)
+param policy = renderPolicy('$owner', '$apiPath', configuration)
+param streamingPolicy = renderPolicy('$owner', '$apiPath', union(configuration, { allowStreaming: true }))
 param namedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure.tenantId)', configuration, '$backendEndpoint', false)
 param guidNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure.tenantId)', union(configuration, { audience: '$guidAudience' }), '$backendEndpoint', false)
 param initialNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure.tenantId)', configuration, '$backendEndpoint', true)
@@ -93,10 +94,19 @@ param stoppedNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure
     Assert-True (@($rendered.parameters.stoppedNamedValues.value | Where-Object displayName -CEQ "$owner-stop")[0].value -ceq 'true') 'A steady deployment must preserve the approved stop setting.'
     Assert-True (@($rendered.parameters.namedValues.value | Where-Object displayName -CEQ "$owner-stop")[0].value -ceq 'false') 'A private steady deployment must honor the approved resume setting.'
     $xmlText = $rendered.parameters.policy.value
+    $streamingXmlText = $rendered.parameters.streamingPolicy.value
     foreach ($value in $rendered.parameters.namedValues.value) {
         $xmlText = $xmlText.Replace(('{{' + $value.displayName + '}}'), [Security.SecurityElement]::Escape([string]$value.value))
+        $streamingXmlText = $streamingXmlText.Replace(('{{' + $value.displayName + '}}'), [Security.SecurityElement]::Escape([string]$value.value))
     }
     Assert-True ($xmlText -notmatch '__[A-Z_]+__|\{\{') 'Unresolved generated policy placeholder.'
+    Assert-True ($streamingXmlText -notmatch '__[A-Z_]+__|\{\{') 'Unresolved generated policy placeholder in the streaming-enabled variant.'
+    # ADR-004. The default refuses stream:true, because llm-token-limit silently
+    # falls back to estimating BOTH prompt and completion tokens when streaming,
+    # and the documented remedy (include_usage) does not exist on the Responses
+    # API - ResponseStreamOptions carries only include_obfuscation.
+    Assert-True ($xmlText -match 'streaming-forbidden') 'Streaming must be refused unless the configuration opts in.'
+    Assert-True ($streamingXmlText -notmatch 'streaming-forbidden') 'allowStreaming must actually lift the streaming refusal.'
     # Classic VNet injection cannot hold a private endpoint, so
     # context.Request.PrivateEndpointConnection is always null on this gateway.
     # A policy that required it rejected every request (ADR-002); privacy comes
@@ -125,11 +135,16 @@ param stoppedNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure
     Assert-True ($policy.SelectNodes('//trace//metadata[@name="authorization" or @name="prompt" or @name="completion"]').Count -eq 0) 'Sensitive telemetry field.'
 
     # Compile the actual generated C# expressions, not a second PowerShell authorizer.
+    # Both variants contribute, because the streaming-enabled policy renders a
+    # different request-check expression and must be executed, not just matched.
+    [xml]$streamingPolicy = $streamingXmlText
     $expressions = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
-    foreach ($node in $policy.SelectNodes('//@*|//set-body|//value|//message')) {
-        $text = if ($node -is [Xml.XmlAttribute]) { $node.Value } else { $node.InnerText }
-        if ($text.StartsWith('@(') -or $text.StartsWith('@{')) {
-            if (-not $expressions.ContainsKey($text)) { $expressions.Add($text, "E$($expressions.Count)") }
+    foreach ($document in @($policy, $streamingPolicy)) {
+        foreach ($node in $document.SelectNodes('//@*|//set-body|//value|//message')) {
+            $text = if ($node -is [Xml.XmlAttribute]) { $node.Value } else { $node.InnerText }
+            if ($text.StartsWith('@(') -or $text.StartsWith('@{')) {
+                if (-not $expressions.ContainsKey($text)) { $expressions.Add($text, "E$($expressions.Count)") }
+            }
         }
     }
     $methods = foreach ($entry in $expressions.GetEnumerator()) {
@@ -182,8 +197,10 @@ namespace P3GatewayTests {
         public bool IdentityUsed;
         public bool ValidToken = true;
         public int NativeFailure;
+        public int RateLimitFailure;
         public int BackendStatus = 200;
         public string Counter;
+        public string CallCounter;
         public List<string> TraceMetadata = new List<string>();
     }
     public static class Extensions {
@@ -209,7 +226,7 @@ namespace P3GatewayTests {
         return $Value
     }
     function Invoke-PolicyNodes {
-        param($Nodes, $Context)
+        param($Nodes, $Context, $Policy = $policy)
         foreach ($node in $Nodes) {
             if ($node -isnot [Xml.XmlElement]) { continue }
             switch ($node.LocalName) {
@@ -217,7 +234,7 @@ namespace P3GatewayTests {
                 'choose' {
                     foreach ($branch in $node.ChildNodes) {
                         if ($branch.LocalName -eq 'otherwise' -or ($branch.LocalName -eq 'when' -and (Get-PolicyValue $branch.GetAttribute('condition') $Context))) {
-                            if (Invoke-PolicyNodes $branch.ChildNodes $Context) { return $true }
+                            if (Invoke-PolicyNodes $branch.ChildNodes $Context $Policy) { return $true }
                             break
                         }
                     }
@@ -226,7 +243,7 @@ namespace P3GatewayTests {
                     $jwt = $Context.Variables['validated-jwt']
                     if (-not $Context.ValidToken -or $jwt.Claims['tid'][0] -cne $node.'tenant-id') {
                         $Context.Response.StatusCode = 401
-                        [void](Invoke-PolicyNodes $policy.policies.'on-error'.ChildNodes $Context)
+                        [void](Invoke-PolicyNodes $Policy.policies.'on-error'.ChildNodes $Context $Policy)
                         return $true
                     }
                 }
@@ -250,7 +267,19 @@ namespace P3GatewayTests {
                     if ($Context.NativeFailure) {
                         $Context.Response.StatusCode = $Context.NativeFailure
                         $Context.Response.Headers['Retry-After'] = @('17')
-                        [void](Invoke-PolicyNodes $policy.policies.'on-error'.ChildNodes $Context)
+                        [void](Invoke-PolicyNodes $Policy.policies.'on-error'.ChildNodes $Context $Policy)
+                        return $true
+                    }
+                }
+                'rate-limit-by-key' {
+                    # Volume backstop. It sits beside the token limit rather than
+                    # replacing it: a token limit only engages after tokens have
+                    # been counted, so it cannot refuse a retry storm cheaply.
+                    $Context.CallCounter = [string](Get-PolicyValue $node.'counter-key' $Context)
+                    if ($Context.RateLimitFailure) {
+                        $Context.Response.StatusCode = $Context.RateLimitFailure
+                        $Context.Response.Headers['Retry-After'] = @('19')
+                        [void](Invoke-PolicyNodes $Policy.policies.'on-error'.ChildNodes $Context $Policy)
                         return $true
                     }
                 }
@@ -279,10 +308,10 @@ namespace P3GatewayTests {
         return $c
     }
     function Invoke-Request {
-        param($Context)
-        if (-not (Invoke-PolicyNodes $policy.policies.inbound.ChildNodes $Context)) {
-            [void](Invoke-PolicyNodes $policy.policies.backend.ChildNodes $Context)
-            [void](Invoke-PolicyNodes $policy.policies.outbound.ChildNodes $Context)
+        param($Context, $Policy = $policy)
+        if (-not (Invoke-PolicyNodes $Policy.policies.inbound.ChildNodes $Context $Policy)) {
+            [void](Invoke-PolicyNodes $Policy.policies.backend.ChildNodes $Context $Policy)
+            [void](Invoke-PolicyNodes $Policy.policies.outbound.ChildNodes $Context $Policy)
         }
         return $Context
     }
@@ -353,9 +382,49 @@ namespace P3GatewayTests {
         $c = Invoke-Request $c
         Assert-True (-not $c.Forwarded -and -not $c.IdentityUsed) 'An unauthorized route, caller, network, or header reached inference.'
     }
-    $streaming = New-Context
-    $streaming.Request.Body.Text = '{"model":"synthetic-chat","input":"text","max_output_tokens":16,"stream":true}'
-    Assert-True ((Invoke-Request $streaming).Forwarded) 'Approved text streaming must remain a supported, live-validation-pending path.'
+    # ADR-004. Streaming is refused by default and permitted only on opt-in.
+    # This is the one deliberately breaking change in that ADR: the old contract
+    # forwarded stream:true, which silently downgraded llm-token-limit to
+    # estimate-only enforcement with no documented remedy on the Responses API.
+    $streamingBody = '{"model":"synthetic-chat","input":"text","max_output_tokens":16,"stream":true}'
+    $streamingDenied = New-Context
+    $streamingDenied.Request.Body.Text = $streamingBody
+    $streamingDenied = Invoke-Request $streamingDenied
+    Assert-True (-not $streamingDenied.Forwarded -and -not $streamingDenied.IdentityUsed) 'Streaming must not reach inference while allowStreaming is off, because the token limit would then enforce on estimates.'
+    Assert-True ($streamingDenied.Response.StatusCode -eq 403) 'A refused streaming request must use the existing 403 rejection contract.'
+    Assert-True (@($streamingDenied.TraceMetadata) -contains 'reason=streaming-forbidden') 'A refused streaming request must state streaming-forbidden as its reason.'
+
+    $streamingAllowed = New-Context
+    $streamingAllowed.Request.Body.Text = $streamingBody
+    $streamingAllowed = Invoke-Request $streamingAllowed $streamingPolicy
+    Assert-True ($streamingAllowed.Forwarded -and $streamingAllowed.IdentityUsed) 'allowStreaming must restore the approved text streaming path.'
+
+    # The volume backstop sits beside the token limit and must not share its counter.
+    $rateLimited = New-Context
+    $rateLimited.RateLimitFailure = 429
+    $rateLimited = Invoke-Request $rateLimited
+    Assert-True (-not $rateLimited.Forwarded) 'A caller over its call-rate backstop must not reach inference.'
+    Assert-True ($rateLimited.Response.StatusCode -eq 429 -and $rateLimited.Response.Headers['Retry-After']) 'Native rate-limit status and Retry-After must not be translated.'
+    Assert-True ($valid.CallCounter -cne $valid.Counter -and $valid.CallCounter.EndsWith('|calls')) 'The call-rate counter must be distinct from the token counter so the two cannot interfere.'
+    Assert-True ($policy.SelectNodes('//rate-limit-by-key').Count -eq $profile.gateway.callerMappings.Count) 'Each caller needs its own explicit call-rate backstop.'
+    foreach ($limit in $policy.SelectNodes('//rate-limit-by-key')) {
+        Assert-True ([int]$limit.calls -gt 0) 'Unlimited call rate.'
+        Assert-True ([int]$limit.'renewal-period' -le 300) 'rate-limit-by-key renewal-period is capped at 300 seconds by the platform.'
+    }
+
+    # The caller metric dimension must not leak a raw directory object ID when a
+    # billing label is configured; traces deliberately keep the object ID.
+    # These two sets are fixture PRECONDITIONS, not incidental facts. Assert them:
+    # the checks below are guarded by Count, so a profile that lost its label
+    # would otherwise skip them silently and still report a green run.
+    $labelled = @($profile.gateway.callerMappings | Where-Object { $_.Contains('label') -and $_.label })
+    $unlabelled = @($profile.gateway.callerMappings | Where-Object { -not $_.Contains('label') -or -not $_.label })
+    Assert-True ($labelled.Count -gt 0) 'The synthetic profile must keep at least one labelled caller, or the billing-label assertion below tests nothing.'
+    Assert-True ($unlabelled.Count -gt 0) 'The synthetic profile must keep at least one unlabelled caller, or the object-ID fallback assertion below tests nothing.'
+    $labelContext = Invoke-Request (New-Context $labelled[0].objectId)
+    Assert-True ($labelContext.Variables['caller-label'] -ceq $labelled[0].label) 'A configured billing label must be emitted as the caller metric dimension.'
+    $fallbackContext = Invoke-Request (New-Context $unlabelled[0].objectId)
+    Assert-True ($fallbackContext.Variables['caller-label'] -ceq $unlabelled[0].objectId.ToLowerInvariant()) 'Without a label the caller dimension must fall back to the object ID, so existing profiles are unaffected.'
     foreach ($code in @(403, 429)) {
         $c = New-Context
         $c.NativeFailure = $code
@@ -632,3 +701,5 @@ finally {
         Remove-Item -LiteralPath $scratch
     }
 }
+
+

@@ -47,6 +47,11 @@
       </when>
     </choose>
     <set-variable name="project" value="@((string)JObject.Parse((string)context.Variables[&quot;mapping&quot;])[&quot;project&quot;])" />
+    <set-variable name="caller-label" value="@{
+      var mapping = JObject.Parse((string)context.Variables[&quot;mapping&quot;]);
+      var label = mapping[&quot;label&quot;] == null ? null : (string)mapping[&quot;label&quot;];
+      return String.IsNullOrWhiteSpace(label) ? (string)context.Variables[&quot;caller-id&quot;] : label;
+    }" />
     <set-variable name="request-check" value="@{
       if (context.Request.Method != &quot;POST&quot; || context.Request.Url.Path != &quot;/__API_PATH__/v1/responses&quot; ||
           !String.IsNullOrEmpty(context.Request.Url.QueryString)) { return &quot;route-forbidden&quot;; }
@@ -78,6 +83,7 @@
       var maximum = (decimal)body[&quot;max_output_tokens&quot;];
       if (maximum &lt;= 0 || maximum &gt; Math.Min((long)mapping[&quot;tokensPerMinute&quot;], (long)mapping[&quot;tokenQuota&quot;])) { return &quot;invalid-output-limit&quot;; }
       if (body[&quot;stream&quot;] != null &amp;&amp; body[&quot;stream&quot;].Type != JTokenType.Boolean) { return &quot;unsupported-stream&quot;; }
+      __STREAM_CHECK__
       if (body[&quot;store&quot;] != null &amp;&amp; (body[&quot;store&quot;].Type != JTokenType.Boolean || (bool)body[&quot;store&quot;])) { return &quot;storage-forbidden&quot;; }
       return &quot;approved&quot;;
     }" />
@@ -139,7 +145,7 @@
     </choose>
     <llm-emit-token-metric namespace="ailz-inference">
       <dimension name="environment" value="@((string)context.Variables[&quot;environment&quot;])" />
-      <dimension name="caller" value="@((string)context.Variables[&quot;caller-id&quot;])" />
+      <dimension name="caller" value="@((string)context.Variables[&quot;caller-label&quot;])" />
       <dimension name="project" value="@((string)context.Variables[&quot;project&quot;])" />
       <dimension name="model" value="@((string)context.Variables[&quot;model&quot;])" />
     </llm-emit-token-metric>

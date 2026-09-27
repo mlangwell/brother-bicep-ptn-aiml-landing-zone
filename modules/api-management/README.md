@@ -110,6 +110,29 @@ background, conversation/previous-response references and every other field are
 rejected. Accepted JSON is serialized again before forwarding so duplicate JSON
 keys cannot give the validator and backend different model selections.
 
+**`stream:true` is refused unless `allowStreaming` is set** ([ADR-004](../../docs/adr/004-gateway-streaming-and-rate-backstop.md)).
+The default is `false`, and the rejection reason is `streaming-forbidden`.
+Microsoft documents that when streaming is enabled, `llm-token-limit` *always*
+estimates prompt tokens regardless of `estimate-prompt-tokens`, and estimates
+completion tokens too. That statement is categorical, with no documented setting
+that changes it.
+
+The obvious inference — that streamed responses simply lack token counts — is
+**wrong**, and worth stating plainly because it changes what a reader should go
+looking for. A streamed Responses call *does* report usage: the terminal
+`response.completed` event carries a required `usage` object with no opt-in.
+Microsoft's published remedy, the `include_usage` request parameter, is a Chat
+Completions parameter that **does not exist on the Responses API** —
+`ResponseStreamOptions` carries only `include_obfuscation` — and it is unnecessary
+there precisely because usage is already unconditional. The real gap is that
+`llm-token-limit` estimates regardless of what the response later reports, and
+Microsoft publishes no way to make the policy consume the usage that is already on
+the wire. A streaming caller is therefore enforced on estimates, and no request
+parameter can correct it. Set `allowStreaming: true` only where estimate-based
+enforcement is an accepted, recorded trade-off. The request schema still types
+`stream` as a boolean; **the policy is authoritative**, because the schema file is
+static and cannot vary per environment.
+
 Entra validation precedes identity lookup. Counters include the validated tenant
 and OID, configured environment/project, and exact approved model. Caller
 project/model/stop/routing headers do not control these values. The strict header
@@ -128,9 +151,36 @@ the profile. Restore the approved profile value only after private completion.
 Authentication, exact authorization and native quota policies remain installed
 while the stop is active.
 
+A `rate-limit-by-key` backstop sits in the same per-caller branch as the token
+limit, on a distinct `|calls` counter key so the two counters cannot interfere.
+It bounds request **volume**, where the token limit bounds **consumption** — both
+are needed, because one request can be a hundred tokens or a hundred thousand, so
+a token limit only engages after the tokens have been counted. Resolution order is
+`callerMapping.callsPerMinute`, then `gatewayConfiguration.defaultCallsPerMinute`,
+then the module fallback of 600. The platform caps `renewal-period` at 300
+seconds, so this is necessarily per minute. Microsoft's caveat applies: rate
+limiting "is never completely accurate" under distributed throttling, and
+counters are per gateway rather than aggregated across the instance. Developer is
+a classic tier using a sliding window while the v2 tiers use a token bucket, so
+sandbox throttling results are directional, not predictive.
+
 Telemetry consists of explicit correlation/caller/project/approved-model,
 status/rejection and token metadata traces, plus native `llm-emit-token-metric`
-dimensions. There is no prompt/completion/auth-header logging in these policies.
+dimensions. The `caller` **metric dimension** emits `callerMapping.label` when
+configured and falls back to the Entra object ID otherwise — an object ID is
+unreadable in a cost dashboard and puts a directory identifier into retained
+telemetry. **Trace** metadata deliberately keeps the object ID, because
+operational correlation needs the real identity and traces are metadata-only.
+Dimension values are already bounded by configuration, because a caller that
+matches no mapping is rejected with 403 before any metric is emitted; the binding
+constraint is the documented **100 unique values per dimension**, past which API
+Management *silently discards* the data. Labels are also carried in the base64
+configuration named value and so consume part of its 4,096-character budget:
+measured, `label` plus `callsPerMinute` costs about **68 base64 characters per
+caller**, lowering the ceiling from roughly **16 callers to 12**. Profiles that
+omit both fields serialise identically to before. Overflow throws on
+`*named-value*` before deployment rather than failing quietly.
+There is no prompt/completion/auth-header logging in these policies.
 API request/dependency sampling is zero and `alwaysLog` is explicitly null:
 automatic URL/error telemetry could otherwise capture a secret in a malicious
 query or validation error. Service diagnostics export metrics only. API body
@@ -138,7 +188,10 @@ bytes are explicitly zero, header capture is limited to correlation, and client
 IP logging is off. Microsoft documents that `trace` is independent of sampling.
 Custom token metrics require the existing Insights component's **custom metrics
 with dimensions** setting; this separate operational prerequisite is output,
-not falsely automated as native Foundry integration.
+not falsely automated as native Foundry integration. Note that Azure Monitor
+custom metrics are **public preview and will not reach general availability** —
+Microsoft names Application Insights with OpenTelemetry as the successor — so
+chargeback built on this metric rests on a preview surface.
 
 Privileged APIM debug tracing can expose content independently of these defaults.
 Governed users/workloads/runners must not receive debug-credential, policy-write,

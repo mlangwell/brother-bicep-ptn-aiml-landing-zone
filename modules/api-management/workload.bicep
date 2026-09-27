@@ -180,7 +180,7 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = 
   name: 'policy'
   properties: {
     format: 'rawxml'
-    value: renderPolicy(owner, apiPath, configuration.callerMappings)
+    value: renderPolicy(owner, apiPath, configuration)
   }
   dependsOn: [namedValues, backend, diagnostic]
 }

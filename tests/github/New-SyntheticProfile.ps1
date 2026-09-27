@@ -181,6 +181,9 @@ $profile = @{
         stopNewRequests = $false
         foundryIntegration = $false
         callerMappings = @(
+            # First caller carries a label and its own call rate, so the tests
+            # exercise the configured path; the second omits both, so the
+            # object-ID fallback and the gateway default are exercised too.
             @{
                 objectId = '00000000-0000-4000-8000-000000000032'
                 project = 'synthetic-project'
@@ -188,6 +191,8 @@ $profile = @{
                 tokensPerMinute = 100
                 tokenQuota = 1000
                 tokenQuotaPeriod = 'Daily'
+                label = 'synthetic-team-one'
+                callsPerMinute = 120
             }
             @{
                 objectId = '00000000-0000-4000-8000-000000000041'

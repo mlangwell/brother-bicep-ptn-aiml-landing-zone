@@ -221,8 +221,8 @@ import { renderPolicy, gatewayNamedValues } from '$relativePolicy'
 var configuration = loadJsonContent('./gateway.json')
 param firstNamedValues = gatewayNamedValues('ailz-inference-dev-$firstKey', 'dev', '$tenantId', configuration, '$backendEndpoint', false)
 param secondNamedValues = gatewayNamedValues('ailz-inference-dev-$secondKey', 'dev', '$tenantId', configuration, '$backendEndpoint', false)
-param firstPolicy = renderPolicy('ailz-inference-dev-$firstKey', 'inference/$firstKey', configuration.callerMappings)
-param secondPolicy = renderPolicy('ailz-inference-dev-$secondKey', 'inference/$secondKey', configuration.callerMappings)
+param firstPolicy = renderPolicy('ailz-inference-dev-$firstKey', 'inference/$firstKey', configuration)
+param secondPolicy = renderPolicy('ailz-inference-dev-$secondKey', 'inference/$secondKey', configuration)
 "@ | Set-Content -LiteralPath $parametersFile
 
     $renderedFile = Join-Path $scratch 'collision.parameters.json'
@@ -311,3 +311,4 @@ if ($failures.Count -gt 0) {
 }
 
 Write-Host "`nAPI Management workload-isolation contract checks passed." -ForegroundColor Green
+

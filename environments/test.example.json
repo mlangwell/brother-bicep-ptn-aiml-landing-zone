@@ -85,9 +85,11 @@
     "publisherEmail": null, "publisherName": null, "audience": null,
     "integrationSubnetName": null, "integrationSubnetPrefix": null,
     "privateDnsZoneResourceId": null, "stopNewRequests": false, "foundryIntegration": false,
+    "allowStreaming": false, "defaultCallsPerMinute": 600,
     "callerMappings": [{
       "objectId": null, "project": null, "models": [],
-      "tokensPerMinute": null, "tokenQuota": null, "tokenQuotaPeriod": null
+      "tokensPerMinute": null, "tokenQuota": null, "tokenQuotaPeriod": null,
+      "label": null, "callsPerMinute": null
     }]
   },
   "application": {
@@ -116,3 +118,4 @@
   },
   "network": { "hubAddressPrefixes": [], "runnerSubnetPrefix": null, "reservedAddressPrefixes": [] }
 }
+
