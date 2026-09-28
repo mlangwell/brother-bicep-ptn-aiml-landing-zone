@@ -74,6 +74,8 @@ try {
     }
     $gatewayConfiguration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath (Join-Path $scratch 'gateway.json')
     $policyFile = [IO.Path]::GetRelativePath($scratch, (Join-Path $root 'modules\api-management\policy.bicep')).Replace('\', '/')
+    $minimalCallerId = '00000000-0000-4000-8000-0000000000ff'
+    $minimalCallerModel = $profile.gateway.callerMappings[0].models[0]
     $parametersFile = Join-Path $scratch 'policy.bicepparam'
     @"
 using none
@@ -85,6 +87,12 @@ param namedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure.tenant
 param guidNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure.tenantId)', union(configuration, { audience: '$guidAudience' }), '$backendEndpoint', false)
 param initialNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure.tenantId)', configuration, '$backendEndpoint', true)
 param stoppedNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure.tenantId)', union(configuration, { stopNewRequests: true }), '$backendEndpoint', false)
+// ADR-008. A caller that supplies only objectId/project/models must still get a
+// governed limit, and the same resolved numbers must reach the configuration
+// named value - the policy reads tokensPerMinute and tokenQuota back out of it.
+param defaultedPolicy = renderPolicy('$owner', '$apiPath', union(configuration, { callerMappings: [ { objectId: '$minimalCallerId', project: 'defaulted', models: ['$minimalCallerModel'] } ] }))
+param gatewayDefaultedPolicy = renderPolicy('$owner', '$apiPath', union(configuration, { defaultTokensPerMinute: 4321, defaultTokenQuota: 8765, defaultTokenQuotaPeriod: 'Weekly', callerMappings: [ { objectId: '$minimalCallerId', project: 'defaulted', models: ['$minimalCallerModel'] } ] }))
+param defaultedNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure.tenantId)', union(configuration, { callerMappings: [ { objectId: '$minimalCallerId', project: 'defaulted', models: ['$minimalCallerModel'] } ] }), '$backendEndpoint', false)
 "@ | Set-Content -LiteralPath $parametersFile
     Invoke-Bicep @('build-params', $parametersFile, '--outfile', (Join-Path $scratch 'policy.parameters.json'))
     $rendered = Get-Content -LiteralPath (Join-Path $scratch 'policy.parameters.json') -Raw | ConvertFrom-Json -AsHashtable
@@ -128,6 +136,25 @@ param stoppedNamedValues = gatewayNamedValues('$owner', 'dev', '$($profile.azure
         $limitIndex++
     }
     Assert-True ($policy.SelectNodes('//llm-emit-token-metric/dimension').Count -eq 4) 'Token metrics must use bounded environment/caller/project/model dimensions, not correlation IDs.'
+    # ADR-008. A caller may omit the three token fields and inherit a gateway or
+    # module default. Three things have to hold together, and the third is the one
+    # that breaks silently: the rendered policy must carry real numbers, an
+    # explicit gateway default must beat the module default, and the SAME resolved
+    # numbers must be materialised into the configuration named value. The policy
+    # re-reads tokensPerMinute and tokenQuota from that named value to validate the
+    # mapping and to bound max_output_tokens, so a mapping that arrived there
+    # without them would be refused as unapproved rather than defaulted.
+    $defaultedLimits = ([xml]$rendered.parameters.defaultedPolicy.value).SelectNodes('//llm-token-limit')
+    Assert-True ($defaultedLimits.Count -eq 1) 'A caller supplying only objectId/project/models must still render exactly one token limit.'
+    Assert-True ([long]$defaultedLimits[0].'tokens-per-minute' -eq 10000) 'The module token-rate default drifted from the ADR-008 value.'
+    Assert-True ([long]$defaultedLimits[0].'token-quota' -eq 5000000) 'The module token-quota default drifted from the ADR-008 value.'
+    Assert-True ($defaultedLimits[0].'token-quota-period' -ceq 'Monthly') 'The module quota-period default drifted from the ADR-008 value.'
+    $gatewayDefaulted = ([xml]$rendered.parameters.gatewayDefaultedPolicy.value).SelectNodes('//llm-token-limit')[0]
+    Assert-True ([long]$gatewayDefaulted.'tokens-per-minute' -eq 4321 -and [long]$gatewayDefaulted.'token-quota' -eq 8765 -and $gatewayDefaulted.'token-quota-period' -ceq 'Weekly') 'A gateway-level token default must override the module default.'
+    $defaultedConfiguration = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(
+            [string](@($rendered.parameters.defaultedNamedValues.value | Where-Object displayName -CEQ "$owner-configuration")[0].value))) | ConvertFrom-Json
+    $defaultedMapping = @($defaultedConfiguration.callerMappings)[0]
+    Assert-True ([long]$defaultedMapping.tokensPerMinute -eq 10000 -and [long]$defaultedMapping.tokenQuota -eq 5000000 -and $defaultedMapping.tokenQuotaPeriod -ceq 'Monthly') 'Defaults must be materialised into the configuration named value, or the policy refuses the caller it just defaulted.'
     Assert-True ($policy.policies.inbound.'authentication-managed-identity'.resource -ceq 'https://cognitiveservices.azure.com') 'Wrong backend identity audience.'
     Assert-True ($policy.policies.backend.'forward-request'.'buffer-response' -ceq 'false') 'Streaming must not be buffered.'
     Assert-True ($policy.policies.backend.'forward-request'.'fail-on-error-status-code' -ceq 'false') 'Backend failures must retain their status and headers.'

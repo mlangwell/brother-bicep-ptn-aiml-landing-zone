@@ -124,7 +124,8 @@ GitHub path and the compatibility baseline are untouched.
 
 ## Follow-up: gateway-level token defaults
 
-Not done here, and recorded so it is not lost. `responses-policy.xml:30-33` requires every
+**Done in ADR-008 (accepted 2026-09-28).** The analysis below is what drove that change;
+it is kept because it records why the policy XML was left alone. `responses-policy.xml:30-33` requires every
 `callerMappings` entry to supply `tokensPerMinute`, `tokenQuota` and a valid
 `tokenQuotaPeriod`; a mapping missing any of them resolves to `{}` and the caller is
 refused. That is the main reason a gateway configuration is tedious to author, and it is

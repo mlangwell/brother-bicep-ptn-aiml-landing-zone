@@ -3557,11 +3557,14 @@ module apiManagement 'modules/api-management/main.bicep' = if (_createApiManagem
       privateDnsZoneResourceId: _apiManagementConfiguration.privateDnsZoneResourceId
       stopNewRequests: _apiManagementConfiguration.stopNewRequests
       foundryIntegration: _apiManagementConfiguration.?foundryIntegration ?? false
-      // ADR-004. See the note on the shared-gateway composition below: these two
-      // are consumed by policy.bicep and must be forwarded, or the documented
-      // allowStreaming opt-in and the call-rate backstop override are inert.
+      // ADR-004/ADR-008. These are consumed by policy.bicep and must be
+      // forwarded, or the documented allowStreaming opt-in, the call-rate
+      // backstop override and the gateway token defaults are all inert.
       allowStreaming: _apiManagementConfiguration.?allowStreaming
       defaultCallsPerMinute: _apiManagementConfiguration.?defaultCallsPerMinute
+      defaultTokensPerMinute: _apiManagementConfiguration.?defaultTokensPerMinute
+      defaultTokenQuota: _apiManagementConfiguration.?defaultTokenQuota
+      defaultTokenQuotaPeriod: _apiManagementConfiguration.?defaultTokenQuotaPeriod
       callerMappings: _apiManagementConfiguration.callerMappings
     } : null
     // The GitHub environment pipeline adopts only gateways carrying its own
@@ -3616,13 +3619,16 @@ module apiManagementWorkload 'modules/api-management/workload.bicep' = if (deplo
       privateDnsZoneResourceId: _apiManagementConfiguration.privateDnsZoneResourceId
       stopNewRequests: _apiManagementConfiguration.stopNewRequests
       foundryIntegration: _apiManagementConfiguration.?foundryIntegration ?? false
-      // ADR-004. Both are optional in gatewayConfiguration and both are read by
-      // modules/api-management/policy.bicep, so they must be forwarded here or
-      // the module silently falls back to its own defaults and the documented
-      // opt-in has no effect. Passed through as-is rather than defaulted, so an
-      // absent value still resolves to the module default.
+      // ADR-004/ADR-008. All are optional in gatewayConfiguration and all are
+      // read by modules/api-management/policy.bicep, so they must be forwarded
+      // here or the module silently falls back to its own defaults and the
+      // documented opt-ins have no effect. Passed through as-is rather than
+      // defaulted, so an absent value still resolves to the module default.
       allowStreaming: _apiManagementConfiguration.?allowStreaming
       defaultCallsPerMinute: _apiManagementConfiguration.?defaultCallsPerMinute
+      defaultTokensPerMinute: _apiManagementConfiguration.?defaultTokensPerMinute
+      defaultTokenQuota: _apiManagementConfiguration.?defaultTokenQuota
+      defaultTokenQuotaPeriod: _apiManagementConfiguration.?defaultTokenQuotaPeriod
       callerMappings: _apiManagementConfiguration.callerMappings
     }
     backendAccountResourceId: aiFoundryAccountResourceId

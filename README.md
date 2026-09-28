@@ -421,9 +421,22 @@ not in the list is refused with `403 gateway_forbidden` before the limit is even
 evaluated — the gateway operates a closed allow-list, so it cannot serve a caller it has
 not been told about.
 
-Note that the three token fields are currently **required on every caller**; there is no
-gateway-level default for them yet, the way `defaultCallsPerMinute` backstops
-`callsPerMinute`. See ADR-007 for the follow-up.
+The three token fields are optional (ADR-008). A caller entry needs only `objectId`,
+`project` and `models`; anything omitted falls back to the gateway-level
+`defaultTokensPerMinute` / `defaultTokenQuota` / `defaultTokenQuotaPeriod`, and then to
+the module defaults of 10,000 TPM and 5,000,000 tokens monthly. Microsoft publishes no
+default for `llm-token-limit`, so those numbers are this template's, and ADR-008 records
+why they were chosen.
+
+Two things about them are worth knowing before you lower them. The policy refuses any
+request whose `max_output_tokens` exceeds `min(tokensPerMinute, tokenQuota)`, because
+Azure charges the rate limit on an estimate taken at request time that includes the
+declared output size — so too small a rate surfaces as a `403`, not a `429`. And
+per-caller limits do not add up to a shared budget: several callers at the default admit
+several times the default against one model deployment, and past that deployment's TPM
+the *model* refuses the excess, which costs the caller the `Retry-After` and
+remaining-quota headers a gateway refusal would have carried.
+`Deploy-AilzIntegrated.ps1` warns when it sees that.
 
 The GitHub environment-profile path
 (`scripts/github/Invoke-EnvironmentDeployment.ps1` with an `environments/<env>.json`

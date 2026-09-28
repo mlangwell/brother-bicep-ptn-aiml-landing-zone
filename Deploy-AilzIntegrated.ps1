@@ -129,7 +129,7 @@ function Read-GatewayConfiguration {
         throw "GatewayConfigurationPath '$Path' must declare at least one callerMappings entry. The gateway is a closed allow-list; a caller with no mapping is refused with 403 gateway_forbidden."
     }
 
-    $callerRequired = @('objectId', 'project', 'models', 'tokensPerMinute', 'tokenQuota', 'tokenQuotaPeriod')
+    $callerRequired = @('objectId', 'project', 'models')
     for ($i = 0; $i -lt $callers.Count; $i++) {
         $caller = $callers[$i]
         $callerMissing = @($callerRequired | Where-Object { -not $caller.PSObject.Properties[$_] })
@@ -144,7 +144,72 @@ function Read-GatewayConfiguration {
         }
     }
 
+    # $PSScriptRoot is the repository root for this script, where main.parameters.json
+    # lives. Guarded because it is empty when the function is dot-sourced outside a
+    # script file, and an advisory check must never be the thing that breaks a deploy.
+    $parametersPath = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        'main.parameters.json'
+    }
+    else {
+        Join-Path $PSScriptRoot 'main.parameters.json'
+    }
+    Test-GatewayTokenOversubscription -Configuration $configuration -ParametersPath $parametersPath
+
     return ConvertTo-Json -InputObject $configuration -Depth 12 -Compress
+}
+
+function Test-GatewayTokenOversubscription {
+    param(
+        [Parameter(Mandatory)] $Configuration,
+        [Parameter(Mandatory)][string] $ParametersPath
+    )
+
+    # Each llm-token-limit counter is keyed per caller AND per model - the policy
+    # builds counter-key as owner|environment|tid|caller-id|project|model - so a
+    # caller's tokensPerMinute applies separately to every model it may call. What
+    # the callers actually share is the model deployment's own TPM assignment.
+    #
+    # Compare per model: if the callers permitted on a deployment sum past what
+    # that deployment was assigned, the excess is refused by the MODEL, not by the
+    # gateway. That matters because a gateway refusal carries Retry-After and a
+    # remaining-quota count, whereas a model refusal surfaces as an opaque backend
+    # error. Warn rather than fail: the capacity-to-TPM ratio is model-specific and
+    # this assumes the published chat-class figure, so a wrong guess must not block
+    # a deployment.
+    if (-not (Test-Path -LiteralPath $ParametersPath)) { return }
+    try {
+        $deployments = @((Get-Content -LiteralPath $ParametersPath -Raw | ConvertFrom-Json).parameters.modelDeploymentList.value)
+    }
+    catch {
+        return
+    }
+    if ($deployments.Count -eq 0) { return }
+
+    $gatewayDefault = if ($Configuration.PSObject.Properties['defaultTokensPerMinute']) {
+        [long]$Configuration.defaultTokensPerMinute
+    }
+    else {
+        10000
+    }
+
+    foreach ($deployment in $deployments) {
+        $capacity = 0L
+        if ($deployment.PSObject.Properties['sku'] -and $deployment.sku.PSObject.Properties['capacity']) {
+            $capacity = [long]$deployment.sku.capacity
+        }
+        if ($capacity -le 0) { continue }
+        $assignedTpm = $capacity * 1000
+
+        $demand = 0L
+        foreach ($caller in @($Configuration.callerMappings)) {
+            if (@($caller.models) -notcontains [string]$deployment.name) { continue }
+            $demand += if ($caller.PSObject.Properties['tokensPerMinute']) { [long]$caller.tokensPerMinute } else { $gatewayDefault }
+        }
+
+        if ($demand -gt $assignedTpm) {
+            Write-Warning ("Model deployment '{0}' has capacity {1} (about {2} TPM), but the gateway admits {3} TPM across the callers mapped to it. The model will refuse the excess instead of the gateway, so the caller gets an opaque backend error rather than Retry-After. Lower defaultTokensPerMinute, set per-caller tokensPerMinute, or raise the deployment capacity. Assumes the published 1 unit = 1,000 TPM chat-class ratio, which Microsoft notes varies by model." -f $deployment.name, $capacity, $assignedTpm, $demand)
+        }
+    }
 }
 
 function Assert-ApiManagementIngressSource {

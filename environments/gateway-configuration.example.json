@@ -67,9 +67,41 @@
   ],
   "defaultCallsPerMinute": 600,
 
+  "$comment_token_defaults": [
+    "Gateway-wide token limits, used for any caller that does not set its own.",
+    "Omit all three and the module defaults apply: 10000 TPM, 5000000 tokens Monthly.",
+    "",
+    "Microsoft publishes no default for llm-token-limit - the policy reference lists",
+    "these with Default = N/A - so these numbers are ours, not vendor guidance.",
+    "10000 assumes roughly four callers sharing the default 'chat' deployment, which",
+    "ships at capacity 40 (Learn: 1 unit = 1,000 TPM for chat-class models, moved in",
+    "1,000 increments). Change the model or the capacity and you should revisit this.",
+    "",
+    "TWO THINGS THAT SURPRISE PEOPLE:",
+    "",
+    "1. These also cap each request. The gateway refuses any request whose",
+    "   max_output_tokens exceeds min(tokensPerMinute, tokenQuota), with",
+    "   403 gateway_request_rejected / invalid-output-limit. With the defaults that",
+    "   ceiling is 10000. Set tokensPerMinute too low and callers get a 403 that",
+    "   looks like a permissions problem but is really a quota one.",
+    "",
+    "2. Per-caller limits do not add up to a shared budget. Four callers at 10000 TPM",
+    "   admit 40000 TPM of demand against ONE model deployment. If that exceeds the",
+    "   TPM assigned to the deployment, the model refuses the excess instead of the",
+    "   gateway, and the caller gets a backend error with nothing actionable in it.",
+    "   Deploy-AilzIntegrated.ps1 warns when the sum looks oversubscribed."
+  ],
+  "defaultTokensPerMinute": 10000,
+  "defaultTokenQuota": 5000000,
+  "defaultTokenQuotaPeriod": "Monthly",
+
   "$comment_callers": [
     "At least one entry is required. There is no unlimited path: a caller whose",
     "object ID is not listed here is refused with 403 gateway_forbidden.",
+    "",
+    "Only objectId, project and models are required - the token fields fall back to",
+    "the gateway defaults above, then to the module defaults. Set them per caller",
+    "only where one caller genuinely needs different limits from the rest.",
     "",
     "objectId is the Entra OBJECT ID (a GUID) of the service principal, managed",
     "identity or group that calls the gateway - find it with:",
@@ -84,11 +116,7 @@
       "objectId": "00000000-0000-0000-0000-000000000000",
       "project": "default",
       "models": [ "chat", "text-embedding" ],
-      "tokensPerMinute": 20000,
-      "tokenQuota": 5000000,
-      "tokenQuotaPeriod": "Monthly",
-      "label": "example-workload",
-      "callsPerMinute": 600
+      "label": "example-workload"
     }
   ]
 }

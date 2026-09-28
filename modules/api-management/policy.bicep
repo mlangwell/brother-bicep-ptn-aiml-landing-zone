@@ -12,6 +12,33 @@ var fallbackCallsPerMinute = 600
 // backstop is necessarily expressed per minute. It cannot be widened to an hour.
 var rateLimitRenewalPeriod = 60
 
+// Token backstops used when neither the caller nor the gateway sets one.
+//
+// Microsoft publishes NO default for llm-token-limit: the reference lists
+// tokens-per-minute, token-quota and token-quota-period with Default = N/A and
+// requires only that a rate limit, a quota, or both be supplied. These values
+// are therefore ours, and are chosen rather than cited.
+//
+// 10,000 TPM assumes roughly four callers sharing the landing zone's default
+// `chat` deployment, which ships at capacity 40. Learn publishes 1 unit =
+// 1,000 TPM for chat-class models and states TPM moves in 1,000 increments, so
+// four callers at this value sum to that deployment's assignment. It warns the
+// ratio varies by model, so an operator who changes the model or the capacity
+// should revisit this rather than inherit it.
+//
+// Sizing matters more than it looks. Azure charges the TPM rate limit on an
+// estimate taken when the request arrives, and that estimate includes the
+// declared max output size even when the real response is far shorter. Set this
+// too low and callers are throttled on tokens they never consumed; the template
+// also refuses any request whose max_output_tokens exceeds min(tokensPerMinute,
+// tokenQuota), so too low a value surfaces as a 403 rather than a 429.
+var fallbackTokensPerMinute = 10000
+
+// A budget, not a rate. Saturating 10,000 TPM for a month would be three orders
+// of magnitude past this; the quota is what stops a slow leak going unnoticed.
+var fallbackTokenQuota = 5000000
+var fallbackTokenQuotaPeriod = 'Monthly'
+
 // Injected when allowStreaming is false. Ordering matters: the template's own
 // line has already rejected a non-boolean `stream`, so by the time this runs
 // the value is known to be a boolean or absent.
@@ -45,7 +72,7 @@ func renderPolicy(owner string, apiPath string, configuration gatewayConfigurati
     (configuration.?allowStreaming ?? false) ? '' : streamingForbiddenCheck
   ),
   '__TOKEN_LIMITS__',
-  join(map(configuration.callerMappings, caller => '<when condition="@((string)context.Variables[&quot;caller-id&quot;] == &quot;${toLower(caller.objectId)}&quot;)"><llm-token-limit counter-key="@((string)context.Variables[&quot;counter-key&quot;])" tokens-per-minute="${caller.tokensPerMinute}" token-quota="${caller.tokenQuota}" token-quota-period="${caller.tokenQuotaPeriod}" estimate-prompt-tokens="true" tokens-consumed-variable-name="consumed-tokens" remaining-quota-tokens-variable-name="remaining-quota" /><rate-limit-by-key calls="${caller.?callsPerMinute ?? configuration.?defaultCallsPerMinute ?? fallbackCallsPerMinute}" renewal-period="${rateLimitRenewalPeriod}" counter-key="@((string)context.Variables[&quot;counter-key&quot;] + &quot;|calls&quot;)" retry-after-header-name="Retry-After" remaining-calls-header-name="x-ratelimit-remaining-calls" /></when>'), '\n')
+  join(map(configuration.callerMappings, caller => '<when condition="@((string)context.Variables[&quot;caller-id&quot;] == &quot;${toLower(caller.objectId)}&quot;)"><llm-token-limit counter-key="@((string)context.Variables[&quot;counter-key&quot;])" tokens-per-minute="${caller.?tokensPerMinute ?? configuration.?defaultTokensPerMinute ?? fallbackTokensPerMinute}" token-quota="${caller.?tokenQuota ?? configuration.?defaultTokenQuota ?? fallbackTokenQuota}" token-quota-period="${caller.?tokenQuotaPeriod ?? configuration.?defaultTokenQuotaPeriod ?? fallbackTokenQuotaPeriod}" estimate-prompt-tokens="true" tokens-consumed-variable-name="consumed-tokens" remaining-quota-tokens-variable-name="remaining-quota" /><rate-limit-by-key calls="${caller.?callsPerMinute ?? configuration.?defaultCallsPerMinute ?? fallbackCallsPerMinute}" renewal-period="${rateLimitRenewalPeriod}" counter-key="@((string)context.Variables[&quot;counter-key&quot;] + &quot;|calls&quot;)" retry-after-header-name="Retry-After" remaining-calls-header-name="x-ratelimit-remaining-calls" /></when>'), '\n')
 )
 
 @export()
@@ -60,7 +87,17 @@ func gatewayNamedValues(owner string, environmentName string, tenantId string, c
       environment: environmentName
       tenantId: toLower(tenantId)
       backendHost: toLower(split(backendEndpoint, '/')[2])
-      callerMappings: configuration.callerMappings
+      // Resolved here, not only in renderPolicy. responses-policy.xml reads these
+      // three back out of THIS named value twice - the `mapping` validator, and
+      // the max_output_tokens ceiling min(tokensPerMinute, tokenQuota) - so a
+      // mapping that reached the policy without them would be refused as
+      // unapproved rather than defaulted. Materialising them here keeps the
+      // policy's own validation intact instead of relaxing it.
+      callerMappings: map(configuration.callerMappings, caller => union(caller, {
+        tokensPerMinute: caller.?tokensPerMinute ?? configuration.?defaultTokensPerMinute ?? fallbackTokensPerMinute
+        tokenQuota: caller.?tokenQuota ?? configuration.?defaultTokenQuota ?? fallbackTokenQuota
+        tokenQuotaPeriod: caller.?tokenQuotaPeriod ?? configuration.?defaultTokenQuotaPeriod ?? fallbackTokenQuotaPeriod
+      }))
     }))
   }
   {
