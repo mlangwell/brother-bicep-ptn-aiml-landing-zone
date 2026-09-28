@@ -3529,6 +3529,11 @@ module apiManagement 'modules/api-management/main.bicep' = if (_createApiManagem
       privateDnsZoneResourceId: apiManagementConfiguration.privateDnsZoneResourceId
       stopNewRequests: apiManagementConfiguration.stopNewRequests
       foundryIntegration: apiManagementConfiguration.?foundryIntegration ?? false
+      // ADR-004. See the note on the shared-gateway composition below: these two
+      // are consumed by policy.bicep and must be forwarded, or the documented
+      // allowStreaming opt-in and the call-rate backstop override are inert.
+      allowStreaming: apiManagementConfiguration.?allowStreaming
+      defaultCallsPerMinute: apiManagementConfiguration.?defaultCallsPerMinute
       callerMappings: apiManagementConfiguration.callerMappings
     } : null
     // The GitHub environment pipeline adopts only gateways carrying its own
@@ -3579,6 +3584,13 @@ module apiManagementWorkload 'modules/api-management/workload.bicep' = if (deplo
       privateDnsZoneResourceId: apiManagementConfiguration.privateDnsZoneResourceId
       stopNewRequests: apiManagementConfiguration.stopNewRequests
       foundryIntegration: apiManagementConfiguration.?foundryIntegration ?? false
+      // ADR-004. Both are optional in gatewayConfiguration and both are read by
+      // modules/api-management/policy.bicep, so they must be forwarded here or
+      // the module silently falls back to its own defaults and the documented
+      // opt-in has no effect. Passed through as-is rather than defaulted, so an
+      // absent value still resolves to the module default.
+      allowStreaming: apiManagementConfiguration.?allowStreaming
+      defaultCallsPerMinute: apiManagementConfiguration.?defaultCallsPerMinute
       callerMappings: apiManagementConfiguration.callerMappings
     }
     backendAccountResourceId: aiFoundryAccountResourceId
