@@ -547,6 +547,29 @@ function Test-Topology {
         $ingressPrefixes = Get-ArrayValue $P['apiManagementIngressSourceAddressPrefixes']
         $directCallerPrefixes = Get-ArrayValue $P['apiManagementDirectCallerAddressPrefixes']
 
+        # Both gateway-configuration surfaces populated. main.bicep resolves this
+        # safely by preferring the object, so the GitHub profile path can never be
+        # overridden by a stale azd variable - but silently ignoring an operator's
+        # input is its own failure mode, so fail here rather than deploy something
+        # they did not ask for.
+        $configurationObject = $P['apiManagementConfiguration']
+        $hasConfigurationObject = ($null -ne $configurationObject -and $configurationObject.PSObject.Properties.Count -gt 0)
+        $hasConfigurationJson = -not [string]::IsNullOrWhiteSpace((Get-StringValue $P['apiManagementConfigurationJson']))
+        if ($hasConfigurationObject -and $hasConfigurationJson) {
+            Add-Finding -Severity FAIL -Code 'APIM_CONFIGURATION_CONFLICT' `
+                -Message 'Both apiManagementConfiguration and apiManagementConfigurationJson are set. main.bicep would use the object and ignore the JSON.' `
+                -Hint 'Supply exactly one. The GitHub environment-profile path sets the object; the azd path sets API_MANAGEMENT_CONFIGURATION. Run: azd env set API_MANAGEMENT_CONFIGURATION ""  to clear the JSON.'
+        }
+
+        # A gateway with no workload configuration is a service that serves
+        # nothing: no workload API, no named values, no llm-token-limit (ADR-007).
+        # It still bills, so say so rather than let it look like a success.
+        if (-not $hasConfigurationObject -and -not $hasConfigurationJson) {
+            Add-Finding -Severity WARN -Code 'APIM_GATEWAY_WITHOUT_WORKLOAD' `
+                -Message 'API Management will be deployed with no gateway configuration, so it gets no workload API, no named values and no llm-token-limit. The gateway will contain only the stock echo-api while billing for the tier.' `
+                -Hint 'Pass -GatewayConfigurationPath to Deploy-AilzIntegrated.ps1 with a completed copy of environments/gateway-configuration.example.json, or accept an unconfigured gateway deliberately.'
+        }
+
         if ($publisherEmail -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
             Add-Finding -Severity FAIL -Code 'APIM_PUBLISHER_EMAIL_INVALID' `
                 -Message 'deployApiManagement=true requires a valid apiManagementPublisherEmail.' `
@@ -1226,12 +1249,47 @@ function Get-PeeringProperty {
     return $value
 }
 
+function Resolve-ApiManagementConfiguration {
+    <#
+    .SYNOPSIS
+        Mirror main.bicep's gateway-configuration resolution.
+    .DESCRIPTION
+        main.bicep accepts the gateway configuration as an object
+        (apiManagementConfiguration, used by the GitHub environment-profile path)
+        or as a JSON string (apiManagementConfigurationJson, used by the azd path,
+        because azd cannot substitute an object). The object wins when both are
+        present. Preflight must resolve it the same way or it validates the wrong
+        subnet: Expand-ParamValue only substitutes into strings and never parses
+        the JSON, so without this every CIDR check would silently run against the
+        default prefix rather than the one being deployed.
+    #>
+    param([hashtable]$P)
+
+    $configuration = $P['apiManagementConfiguration']
+    if ($null -ne $configuration -and $configuration.PSObject.Properties.Count -gt 0) {
+        return $configuration
+    }
+
+    $json = (Get-StringValue $P['apiManagementConfigurationJson']).Trim()
+    if (-not $json) { return $null }
+
+    try {
+        return ($json | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        Add-Finding -Severity FAIL -Code 'APIM_CONFIGURATION_UNPARSEABLE' `
+            -Message "apiManagementConfigurationJson is not valid JSON: $($_.Exception.Message)" `
+            -Hint 'Validate the document against the gatewayServiceConfiguration definition in environments/schema.json, then set it with -GatewayConfigurationPath.'
+        return $null
+    }
+}
+
 function Get-ApiManagementSubnetPrefix {
-    # Mirrors main.bicep: apiManagementConfiguration.integrationSubnetPrefix
+    # Mirrors main.bicep: the resolved configuration's integrationSubnetPrefix
     # takes precedence over apiManagementSubnetPrefix, whose Bicep default is
     # read from main.bicep when the parameters file leaves it unset.
     param([hashtable]$P)
-    $configuration = $P['apiManagementConfiguration']
+    $configuration = Resolve-ApiManagementConfiguration -P $P
     if ($null -ne $configuration -and -not [string]::IsNullOrWhiteSpace([string]$configuration.integrationSubnetPrefix)) {
         return ([string]$configuration.integrationSubnetPrefix).Trim()
     }

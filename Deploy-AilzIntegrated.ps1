@@ -40,6 +40,7 @@ param(
     [string] $ApiManagementPublisherEmail,
     [string] $ApiManagementPublisherName = 'AI Landing Zone',
     [string[]] $ApiManagementIngressSourceAddressPrefixes = @(),
+    [string] $GatewayConfigurationPath,
     [hashtable] $AdditionalEnvironmentVariables = @{},
     [ValidateSet('Full', 'Slim')]
     [string] $PreviewOutput = 'Slim',
@@ -72,6 +73,78 @@ function Get-HubFirewallSubnetPrefix {
     }
 
     return ([string]$prefix).Trim()
+}
+
+function Read-GatewayConfiguration {
+    param([Parameter(Mandatory)][string] $Path)
+
+    # Without a gateway configuration the deployment produces an API Management
+    # instance carrying only the stock echo-api: no workload API, no named
+    # values and no llm-token-limit (ADR-007). This reads the operator's
+    # configuration and hands it to azd as a compact JSON string, because azd
+    # cannot substitute an object into a Bicep object parameter.
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "GatewayConfigurationPath '$Path' was not found."
+    }
+
+    $raw = Get-Content -LiteralPath $Path -Raw
+    try {
+        $configuration = $raw | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "GatewayConfigurationPath '$Path' is not valid JSON: $($_.Exception.Message)"
+    }
+
+    # Drop $-prefixed annotation keys so a documented example file can be copied
+    # and filled in directly. main.bicep rebuilds the configuration field by
+    # field and would ignore them anyway, but there is no reason to carry
+    # commentary into the azd environment.
+    $clean = [ordered]@{}
+    foreach ($property in $configuration.PSObject.Properties) {
+        if ($property.Name.StartsWith('$')) { continue }
+        $clean[$property.Name] = $property.Value
+    }
+    $configuration = [pscustomobject]$clean
+
+    # Validated here rather than left to ARM, because main.bicep rebuilds the
+    # gatewayConfiguration field by field: a missing required key surfaces as an
+    # opaque evaluation failure inside a nested deployment, minutes in, while an
+    # unexpected key is silently dropped.
+    $required = @(
+        'sku', 'capacity', 'publisherEmail', 'publisherName', 'audience',
+        'integrationSubnetName', 'integrationSubnetPrefix',
+        'privateDnsZoneResourceId', 'stopNewRequests', 'callerMappings'
+    )
+    $missing = @($required | Where-Object { -not $configuration.PSObject.Properties[$_] })
+    if ($missing.Count -gt 0) {
+        throw ("GatewayConfigurationPath '$Path' is missing required field(s): {0}. See environments/gateway-configuration.example.json and the gatewayServiceConfiguration definition in environments/schema.json." -f ($missing -join ', '))
+    }
+
+    if ($configuration.sku -notin @('Developer', 'Premium')) {
+        throw "GatewayConfigurationPath '$Path' has sku '$($configuration.sku)'. Only Developer and Premium support classic VNet injection."
+    }
+
+    $callers = @($configuration.callerMappings)
+    if ($callers.Count -lt 1) {
+        throw "GatewayConfigurationPath '$Path' must declare at least one callerMappings entry. The token limit is enforced per caller; a caller with no mapping is refused with 403 gateway_mapping_missing."
+    }
+
+    $callerRequired = @('objectId', 'project', 'models', 'tokensPerMinute', 'tokenQuota', 'tokenQuotaPeriod')
+    for ($i = 0; $i -lt $callers.Count; $i++) {
+        $caller = $callers[$i]
+        $callerMissing = @($callerRequired | Where-Object { -not $caller.PSObject.Properties[$_] })
+        if ($callerMissing.Count -gt 0) {
+            throw ("callerMappings[$i] is missing required field(s): {0}." -f ($callerMissing -join ', '))
+        }
+        if ([string]$caller.objectId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            throw "callerMappings[$i].objectId '$($caller.objectId)' is not an Entra object ID (GUID). This is the object ID of the service principal or group that calls the gateway, not an application ID URI."
+        }
+        if (@($caller.models).Count -lt 1) {
+            throw "callerMappings[$i].models must name at least one deployed model."
+        }
+    }
+
+    return ConvertTo-Json -InputObject $configuration -Depth 12 -Compress
 }
 
 function Assert-ApiManagementIngressSource {
@@ -451,6 +524,21 @@ else {
     ''
 }
 
+# Read and validate before sign-in, so a malformed configuration fails in
+# seconds rather than after a preview. An empty string clears any value left in
+# the azd environment by an earlier run, which matters because a stale
+# configuration would otherwise be silently reused.
+$resolvedGatewayConfiguration = if ($PSBoundParameters.ContainsKey('GatewayConfigurationPath') -and
+    -not [string]::IsNullOrWhiteSpace($GatewayConfigurationPath)) {
+    if (-not $DeployApiManagement) {
+        throw 'GatewayConfigurationPath requires -DeployApiManagement. The configuration only has an effect when a gateway is deployed.'
+    }
+    Read-GatewayConfiguration -Path $GatewayConfigurationPath
+}
+else {
+    ''
+}
+
 $settings = [ordered]@{
     AZURE_LOCATION                           = $Location
     DEPLOYMENT_MODE                         = 'ailz-integrated'
@@ -460,6 +548,7 @@ $settings = [ordered]@{
     API_MANAGEMENT_PUBLISHER_EMAIL          = $ApiManagementPublisherEmail
     API_MANAGEMENT_PUBLISHER_NAME           = $ApiManagementPublisherName
     API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES = $defaultApiManagementIngressSourceAddressPrefixes
+    API_MANAGEMENT_CONFIGURATION            = $resolvedGatewayConfiguration
     HUB_INTEGRATION_HUB_VNET_RESOURCE_ID    = $HubVnetResourceId
     HUB_INTEGRATION_EGRESS_NEXT_HOP_IP      = $EgressNextHopIp
     HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID = ''
@@ -534,8 +623,15 @@ try {
     }
 
     foreach ($setting in $settings.GetEnumerator()) {
+        # Empty values are normally skipped so an unset option does not overwrite
+        # something an operator set by hand. These two are written even when
+        # empty, because a value left over from a previous run is actively
+        # harmful: a stale route table breaks the gateway topology, and a stale
+        # gateway configuration would silently redeploy a caller set and token
+        # limits the operator did not ask for on this run.
+        $alwaysWrite = @('HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID', 'API_MANAGEMENT_CONFIGURATION')
         if (-not [string]::IsNullOrWhiteSpace([string]$setting.Value) -or
-            [string]$setting.Key -eq 'HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID') {
+            $alwaysWrite -contains [string]$setting.Key) {
             Invoke-Azd -Arguments @('env', 'set', [string]$setting.Key, [string]$setting.Value)
         }
     }

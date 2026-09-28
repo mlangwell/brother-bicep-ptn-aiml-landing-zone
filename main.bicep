@@ -87,8 +87,18 @@ param appConfigLabel string = 'ai-lz'
 @description('Optional. Accelerator-specific App Configuration key-values appended verbatim to the App Configuration store. This lets a consuming accelerator publish its own settings without the landing zone needing to know about them. Values are stored as plaintext in App Configuration, so never pass secrets here (use Key Vault references instead). Each entry must have a unique name+label. On a name+label collision with a workload configuration key the landing zone already emits, the passthrough entry wins. Do not redefine reserved infrastructure keys emitted by other modules (the Cosmos identifiers COSMOS_DB_ACCOUNT_RESOURCE_ID and COSMOS_DB_ENDPOINT, and the per-app <APP>_APIKEY Key Vault references); reusing those names would create a duplicate key-value and fail the deployment. Note: this is only applied on non network-isolated deployments, where the landing zone writes App Configuration at deploy time. Network-isolated deployments configure App Configuration from the accelerator post-provision step, so pass these values through that path instead.')
 param additionalAppConfigurationSettings additionalAppConfigurationSettingType[] = []
 
-@description('Optional structured gateway configuration, resolved from the GitHub environment profile. Leave empty to deploy the gateway alone from the flat apiManagement* parameters. When supplied it must be a complete gatewayConfiguration (modules/api-management/types.bicep): it selects the SKU and capacity and adds this landing zone\'s workload API, with explicit caller/model mappings and token limits. Its publisher and integration-subnet fields take precedence over the flat parameters.')
+@description('Optional structured gateway configuration, resolved from the GitHub environment profile. Leave empty to deploy the gateway alone from the flat apiManagement* parameters. When supplied it must be a complete gatewayConfiguration (modules/api-management/types.bicep): it selects the SKU and capacity and adds this landing zone\'s workload API, with explicit caller/model mappings and token limits. Its publisher and integration-subnet fields take precedence over the flat parameters. azd cannot populate this parameter, because a substitution carrying an object would terminate at the first closing brace; use apiManagementConfigurationJson from the azd path instead.')
 param apiManagementConfiguration object = {}
+
+@description('The same gatewayConfiguration as apiManagementConfiguration, supplied as a JSON string so the azd path can reach it. Without this, only the GitHub environment-profile path can add the workload API, and an azd deployment produces a gateway that serves nothing (ADR-007). Ignored when apiManagementConfiguration is non-empty, so a profile-supplied object can never be silently overridden; preflight fails when both are set. Validate the document against the gatewayServiceConfiguration definition in environments/schema.json before passing it.')
+param apiManagementConfigurationJson string = ''
+
+@description('Ownership marker stamped on a created gateway as the `ailz-managed-by` tag. The GitHub environment pipeline adopts only gateways carrying its own marker, so this must identify the path that actually deployed the gateway. Defaults to the safe value; only scripts/github/Environment.psm1 opts in to `github-dev-environment`. Do not derive this from whether a workload configuration is present: both paths can now supply one.')
+@allowed([
+  'ai-landing-zone'
+  'github-dev-environment'
+])
+param apiManagementManagedBy string = 'ai-landing-zone'
 
 @description('Landing-zone-scoped key that keeps every per-workload gateway resource unique when several landing zones share one API Management gateway. It keys the API name, the public API path, the backend, the logger and the named values. Defaults to a deterministic hash of this resource group, which is unique per landing zone because this template is resource-group scoped. Do NOT derive it from `resourceToken` or the CAF workload token: both hash only subscription + environment + location, so two landing zones in the same subscription, environment and region would produce the same value and collide. Must be lowercase alphanumeric to be valid as both an APIM resource name segment and a URL path segment.')
 @minLength(3)
@@ -1283,8 +1293,26 @@ var _apiManagementIngressSourceAddressPrefixes = apiManagementIngressSourceAddre
 //   - the explicit tag prevents drift when Microsoft retags `:aspnetapp`.
 var _containerDummyImageName = 'mcr.microsoft.com/dotnet/samples:aspnetapp-9.0'
 
-var _apiManagementName = !empty(apiManagementConfiguration.?name ?? '')
-  ? string(apiManagementConfiguration.name)
+// One gateway implementation, three input surfaces (ADR-002, ADR-007). The flat
+// apiManagement* parameters deploy the gateway alone. A complete
+// gatewayConfiguration additionally adds this landing zone's workload API, its
+// named values and the token-limit policy, and may arrive either as an object
+// (the GitHub environment-profile path, which builds its own parameter file) or
+// as a JSON string (the azd path, because azd cannot substitute an object).
+//
+// The object wins when both are present, so a profile-supplied configuration can
+// never be silently replaced by a stale azd environment variable — notably
+// initialProvisioning, which scripts/github/Deployment.psm1 mutates and which
+// governs whether the gateway stops during initial provisioning. That is a
+// safe-by-construction precedence, not a licence to set both: preflight fails
+// with APIM_CONFIGURATION_CONFLICT when it sees both, because silently ignoring
+// an operator's input is its own failure mode.
+var _apiManagementConfiguration = !empty(apiManagementConfiguration)
+  ? apiManagementConfiguration
+  : (!empty(apiManagementConfigurationJson) ? json(apiManagementConfigurationJson) : {})
+
+var _apiManagementName = !empty(_apiManagementConfiguration.?name ?? '')
+  ? string(_apiManagementConfiguration.name)
   : resourceNames.apiManagementName
 
 // ----------------------------------------------------------------------
@@ -1307,17 +1335,17 @@ var _effectiveApiManagementName = _hasExistingApiManagement ? last(_apimSegments
 var _apiManagementPrincipalId = existingApiManagementPrincipalId ?? ''
 
 // One gateway implementation, two input surfaces (ADR-002). The flat
-// apiManagement* parameters deploy the gateway alone. A non-empty
-// apiManagementConfiguration also selects the tier and adds this landing
-// zone's workload API; its fields take precedence where both are set.
-var _apiManagementWorkloadEnabled = !empty(apiManagementConfiguration)
+// apiManagement* parameters deploy the gateway alone. A non-empty resolved
+// configuration also selects the tier and adds this landing zone's workload
+// API; its fields take precedence where both are set.
+var _apiManagementWorkloadEnabled = !empty(_apiManagementConfiguration)
 var _apiManagementGatewayBound    = _createApiManagement || (deployApiManagement && _hasExistingApiManagement)
-var _apiManagementSku             = apiManagementConfiguration.?sku ?? 'Developer'
-var _apiManagementCapacity        = apiManagementConfiguration.?capacity ?? 1
-var _apiManagementPublisherEmail  = apiManagementConfiguration.?publisherEmail ?? apiManagementPublisherEmail
-var _apiManagementPublisherName   = apiManagementConfiguration.?publisherName ?? apiManagementPublisherName
-var _apiManagementSubnetName      = apiManagementConfiguration.?integrationSubnetName ?? apiManagementSubnetName
-var _apiManagementSubnetPrefix    = apiManagementConfiguration.?integrationSubnetPrefix ?? apiManagementSubnetPrefix
+var _apiManagementSku             = _apiManagementConfiguration.?sku ?? 'Developer'
+var _apiManagementCapacity        = _apiManagementConfiguration.?capacity ?? 1
+var _apiManagementPublisherEmail  = _apiManagementConfiguration.?publisherEmail ?? apiManagementPublisherEmail
+var _apiManagementPublisherName   = _apiManagementConfiguration.?publisherName ?? apiManagementPublisherName
+var _apiManagementSubnetName      = _apiManagementConfiguration.?integrationSubnetName ?? apiManagementSubnetName
+var _apiManagementSubnetPrefix    = _apiManagementConfiguration.?integrationSubnetPrefix ?? apiManagementSubnetPrefix
 // The developer application calls the gateway from the Container Apps subnet,
 // inside the spoke, so that subnet is a named direct caller (ADR-002).
 var _apiManagementDirectCallerAddressPrefixes = union(apiManagementDirectCallerAddressPrefixes, enableDeveloperExperience ? [acaEnvironmentSubnetPrefix] : [])
@@ -1328,7 +1356,7 @@ var _inferenceGatewayEndpoint = _apiManagementGatewayBound && _apiManagementWork
 var _developerRuntimeSettings = enableDeveloperExperience ? [
   { name: 'INFERENCE_ACCESS_MODE', value: 'gateway', label: appConfigLabel, contentType: 'text/plain' }
   { name: 'INFERENCE_GATEWAY_ENDPOINT', value: _inferenceGatewayEndpoint, label: appConfigLabel, contentType: 'text/plain' }
-  { name: 'INFERENCE_GATEWAY_AUDIENCE', value: apiManagementConfiguration.?audience ?? '', label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'INFERENCE_GATEWAY_AUDIENCE', value: _apiManagementConfiguration.?audience ?? '', label: appConfigLabel, contentType: 'text/plain' }
   { name: 'SMOKE_API_AUDIENCE', value: developerExperience.application.audience, label: appConfigLabel, contentType: 'text/plain' }
   { name: 'SMOKE_ALLOWED_OBJECT_IDS', value: string(developerExperience.developerObjectIds), label: appConfigLabel, contentType: 'application/json' }
   { name: 'SMOKE_ALLOWED_GROUP_IDS', value: string(developerExperience.developerGroupObjectIds), label: appConfigLabel, contentType: 'application/json' }
@@ -3523,28 +3551,32 @@ module apiManagement 'modules/api-management/main.bicep' = if (_createApiManagem
       capacity: _apiManagementCapacity
       publisherEmail: _apiManagementPublisherEmail
       publisherName: _apiManagementPublisherName
-      audience: apiManagementConfiguration.audience
+      audience: _apiManagementConfiguration.audience
       integrationSubnetName: _apiManagementSubnetName
       integrationSubnetPrefix: _apiManagementSubnetPrefix
-      privateDnsZoneResourceId: apiManagementConfiguration.privateDnsZoneResourceId
-      stopNewRequests: apiManagementConfiguration.stopNewRequests
-      foundryIntegration: apiManagementConfiguration.?foundryIntegration ?? false
+      privateDnsZoneResourceId: _apiManagementConfiguration.privateDnsZoneResourceId
+      stopNewRequests: _apiManagementConfiguration.stopNewRequests
+      foundryIntegration: _apiManagementConfiguration.?foundryIntegration ?? false
       // ADR-004. See the note on the shared-gateway composition below: these two
       // are consumed by policy.bicep and must be forwarded, or the documented
       // allowStreaming opt-in and the call-rate backstop override are inert.
-      allowStreaming: apiManagementConfiguration.?allowStreaming
-      defaultCallsPerMinute: apiManagementConfiguration.?defaultCallsPerMinute
-      callerMappings: apiManagementConfiguration.callerMappings
+      allowStreaming: _apiManagementConfiguration.?allowStreaming
+      defaultCallsPerMinute: _apiManagementConfiguration.?defaultCallsPerMinute
+      callerMappings: _apiManagementConfiguration.callerMappings
     } : null
     // The GitHub environment pipeline adopts only gateways carrying its own
-    // marker, so a gateway created from the flat azd parameters must not claim it.
-    managedBy: _apiManagementWorkloadEnabled ? 'github-dev-environment' : 'ai-landing-zone'
+    // marker, so this must identify the path that actually deployed the gateway.
+    // It was previously derived from whether a workload configuration was
+    // present, which stopped being a valid proxy once the azd path could supply
+    // one too (ADR-007): an azd-built gateway would have falsely claimed the
+    // pipeline's marker and become adoptable by it.
+    managedBy: apiManagementManagedBy
     integrationSubnetResourceId: _apiManagementSubnetId
     backendAccountResourceId: aiFoundryAccountResourceId
     backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
     applicationInsightsResourceId: _appInsightsResourceId
     logAnalyticsWorkspaceResourceId: _lawResourceId
-    initialProvisioning: apiManagementConfiguration.?initialProvisioning ?? false
+    initialProvisioning: _apiManagementConfiguration.?initialProvisioning ?? false
     tags: _tags
   }
   // The gateway must not start injecting until the subnet carries the dedicated
@@ -3574,29 +3606,29 @@ module apiManagementWorkload 'modules/api-management/workload.bicep' = if (deplo
     configuration: {
       enabled: true
       name: _effectiveApiManagementName
-      sku: apiManagementConfiguration.sku
-      capacity: apiManagementConfiguration.capacity
-      publisherEmail: apiManagementConfiguration.publisherEmail
-      publisherName: apiManagementConfiguration.publisherName
-      audience: apiManagementConfiguration.audience
-      integrationSubnetName: apiManagementConfiguration.integrationSubnetName
-      integrationSubnetPrefix: apiManagementConfiguration.integrationSubnetPrefix
-      privateDnsZoneResourceId: apiManagementConfiguration.privateDnsZoneResourceId
-      stopNewRequests: apiManagementConfiguration.stopNewRequests
-      foundryIntegration: apiManagementConfiguration.?foundryIntegration ?? false
+      sku: _apiManagementConfiguration.sku
+      capacity: _apiManagementConfiguration.capacity
+      publisherEmail: _apiManagementConfiguration.publisherEmail
+      publisherName: _apiManagementConfiguration.publisherName
+      audience: _apiManagementConfiguration.audience
+      integrationSubnetName: _apiManagementConfiguration.integrationSubnetName
+      integrationSubnetPrefix: _apiManagementConfiguration.integrationSubnetPrefix
+      privateDnsZoneResourceId: _apiManagementConfiguration.privateDnsZoneResourceId
+      stopNewRequests: _apiManagementConfiguration.stopNewRequests
+      foundryIntegration: _apiManagementConfiguration.?foundryIntegration ?? false
       // ADR-004. Both are optional in gatewayConfiguration and both are read by
       // modules/api-management/policy.bicep, so they must be forwarded here or
       // the module silently falls back to its own defaults and the documented
       // opt-in has no effect. Passed through as-is rather than defaulted, so an
       // absent value still resolves to the module default.
-      allowStreaming: apiManagementConfiguration.?allowStreaming
-      defaultCallsPerMinute: apiManagementConfiguration.?defaultCallsPerMinute
-      callerMappings: apiManagementConfiguration.callerMappings
+      allowStreaming: _apiManagementConfiguration.?allowStreaming
+      defaultCallsPerMinute: _apiManagementConfiguration.?defaultCallsPerMinute
+      callerMappings: _apiManagementConfiguration.callerMappings
     }
     backendAccountResourceId: aiFoundryAccountResourceId
     backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
     applicationInsightsResourceId: _appInsightsResourceId
-    initialProvisioning: apiManagementConfiguration.?initialProvisioning ?? false
+    initialProvisioning: _apiManagementConfiguration.?initialProvisioning ?? false
   }
   dependsOn: [
     apiManagementSharedGatewayRoles
@@ -4338,7 +4370,7 @@ var _developerApplications = _deployContainerApps ? map(containerAppsSettings!.o
 output INFERENCE_GATEWAY_ENDPOINT string = deployApiManagement ? _inferenceGatewayEndpoint : ''
 
 @description('Entra audience required by the inference gateway workload API. Empty when no workload API is deployed.')
-output INFERENCE_GATEWAY_AUDIENCE string = _apiManagementGatewayBound && _apiManagementWorkloadEnabled ? string(apiManagementConfiguration.audience) : ''
+output INFERENCE_GATEWAY_AUDIENCE string = _apiManagementGatewayBound && _apiManagementWorkloadEnabled ? string(_apiManagementConfiguration.audience) : ''
 
 @description('Nonsecret, opt-in completion inputs from actual deployed resources. Observability credentials are references, not values. An output does not assert developer readiness.')
 output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
@@ -4375,7 +4407,7 @@ output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
     // is the operator's live obligation (see apiManagementSubnets).
     injectionNsgManaged: _createApiManagement && !useExistingVNet
     endpoint: _inferenceGatewayEndpoint
-    audience: apiManagementConfiguration.?audience ?? ''
+    audience: _apiManagementConfiguration.?audience ?? ''
     backendResourceId: aiFoundryAccountResourceId
     backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
   }

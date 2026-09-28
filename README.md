@@ -134,6 +134,7 @@ The script has four required parameters. The remaining parameters are optional.
 | `ApiManagementPublisherEmail` | Conditional | Publisher contact email. Required when `DeployApiManagement` is enabled. | `api-owners@contoso.com` |
 | `ApiManagementPublisherName` | No | Publisher display name. Defaults to `AI Landing Zone`. | `Contoso API Team` |
 | `ApiManagementIngressSourceAddressPrefixes` | No | Hub firewall source CIDRs allowed to reach the internal APIM gateway on TCP 443. Defaults to the hub VNet's `AzureFirewallSubnet` prefix, read after sign-in, because Azure Firewall source-NATs gateway traffic to a back-end instance IP in that subnet, not to its frontend IP. Falls back to `EgressNextHopIp/32` with a warning when the hub has no readable `AzureFirewallSubnet`, such as an NVA hub. | `@("10.100.0.0/26")` |
+| `GatewayConfigurationPath` | No | Path to a `gatewayConfiguration` JSON document. Requires `-DeployApiManagement`. Adds this landing zone's workload API, named values and `llm-token-limit` policy to the gateway; without it the gateway is deployed with no workload API and enforces nothing. Validated before sign-in. Start from `environments/gateway-configuration.example.json`. | `./my-gateway.json` |
 | `AdditionalEnvironmentVariables` | No | PowerShell hashtable containing additional `azd` environment values supported by `main.parameters.json`, such as subscription, resource group, private DNS zone IDs, or feature flags. Values persist in the selected local `azd` environment. Note that the script does **not** set `AZURE_SEARCH_LOCATION`; pass it here to place Azure AI Search in a different region when the primary region is out of AI Search capacity. Capacity is not the same as quota, so preflight's quota check can pass while the deployment still fails with `InsufficientResourcesAvailable`. | `@{ AZURE_SUBSCRIPTION_ID = "<id>"; AZURE_SEARCH_LOCATION = "eastus" }` |
 | `PreviewOutput` | No | Preview detail level. `Full` displays ARM What-If changes plus every nested compiled resource declaration, and **requires `AZURE_RESOURCE_GROUP` to already exist in the `azd` environment and in Azure**, because it calls ARM What-If directly against that group. azd only populates it after a successful provision, so `Full` is for second and later deployments; a first deployment uses `Slim`. `Slim` (default) displays the original condensed `azd provision --preview` summary. | `Full` |
 | `PreviewOnly` | No | Switch that stops after `azd provision --preview`. Without it, the script displays the preview and then asks you to type `DEPLOY` before provisioning. The prompt reads stdin, so a non-interactive caller can satisfy it by piping `DEPLOY` into the script. | `-PreviewOnly` |
@@ -382,34 +383,49 @@ dedicated `api-management-subnet` at `192.168.3.128/27` and a dedicated route
 table. The subnet has service endpoints for Storage, SQL, Key Vault and Event
 Hubs.
 
-#### What this deploys, and what it does not
+#### Configuring the gateway
 
-> **`Deploy-AilzIntegrated.ps1` deploys the gateway *service* only. It does not add this
-> landing zone's workload API, named values, caller configuration or token limits.**
+By default `Deploy-AilzIntegrated.ps1` deploys the gateway **service** only. Pass
+`-GatewayConfigurationPath` to also deploy this landing zone's workload API, its named
+values and its token-limit policy:
 
-`apiManagementConfiguration` is what adds those, and `main.parameters.json` binds it to a
-literal `{}` with no azd substitution. The deploy script never sets it, so on this path
-the gateway comes up containing only the stock `echo-api`.
+```powershell
+./Deploy-AilzIntegrated.ps1 `
+  -EnvironmentName "ailz-dev" `
+  -Location "eastus2" `
+  -HubVnetResourceId $hubVnetResourceId `
+  -EgressNextHopIp $egressNextHopIp `
+  -DeployApiManagement `
+  -ApiManagementPublisherEmail "api-owners@contoso.com" `
+  -GatewayConfigurationPath ./my-gateway.json
+```
 
-That is by design — the gateway is per-subscription platform infrastructure with a much
-longer lifecycle than any one landing zone — but it has consequences worth stating
-plainly:
+Start from `environments/gateway-configuration.example.json`, which documents every
+field. The document is validated before sign-in, so a missing field or a malformed
+caller fails in seconds rather than partway through a 30-minute gateway create.
 
-- The **`llm-token-limit`** policy is not present. Any statement that the gateway is the
-  real-time hard stop on inference spend does not hold until the workload API is
-  configured.
-- The ADR-004 controls (streaming refused by default, call-rate backstop) ship as part of
-  that configuration and are likewise not deployed.
-- The guardrails playbook's gateway plane will report `Unverifiable` for the token limit,
-  the caller configuration and the emergency stop control, because no API carries the
-  ownership marker it looks for. That is an accurate report of an unconfigured gateway,
-  not a fault in the playbook.
+> **Without it the gateway enforces nothing.** It comes up containing only the stock
+> `echo-api` — no workload API, no `llm-token-limit`, and none of the ADR-004 controls —
+> while billing for its tier. Preflight warns with `APIM_GATEWAY_WITHOUT_WORKLOAD`.
+> The guardrails playbook's gateway plane will also report `Unverifiable`, which is an
+> accurate report of an unconfigured gateway rather than a fault in the playbook.
 
-To get a configured gateway, deploy through the environment-profile path
+Deploying the gateway alone is still a legitimate choice: API Management is
+per-subscription platform infrastructure with a much longer lifecycle than any single
+landing zone, and `existingApiManagementResourceId` binds a landing zone to one that
+already exists. It should just be a decision rather than a surprise.
+
+The token limit is enforced **per caller**. Each `callerMappings` entry names an Entra
+object ID with its own `tokensPerMinute` and `tokenQuota`; a caller that is not listed is
+refused with `403 gateway_mapping_missing`. There is deliberately no unlimited path and
+no gateway-wide default limit — a shared fallback counter would let one abusive caller
+exhaust the budget for every other unmapped caller.
+
+The GitHub environment-profile path
 (`scripts/github/Invoke-EnvironmentDeployment.ps1` with an `environments/<env>.json`
-profile), which supplies a complete `gatewayConfiguration` — SKU and capacity, the
-workload API, explicit caller and model mappings, and token limits. See
-`environments/schema.json` and the `*.example.json` profiles.
+profile) supplies the same configuration as a structured object and additionally carries
+release attestation and approval gates. Supply the configuration through exactly one of
+the two paths; preflight fails with `APIM_CONFIGURATION_CONFLICT` if both are set.
 
 
 Its NSG allows:

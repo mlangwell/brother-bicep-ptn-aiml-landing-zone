@@ -47,6 +47,8 @@
 
     "additionalAppConfigurationSettings":  { "value": [] },
     "apiManagementConfiguration":          { "value": {} },
+    "apiManagementConfigurationJson":      { "value": "${API_MANAGEMENT_CONFIGURATION=}" },
+    "apiManagementManagedBy":              { "value": "${API_MANAGEMENT_MANAGED_BY=ai-landing-zone}" },
     "enableDeveloperExperience":           { "value": "${ENABLE_DEVELOPER_EXPERIENCE=false}" },
     "developerExperience":                 { "value": {} },
 

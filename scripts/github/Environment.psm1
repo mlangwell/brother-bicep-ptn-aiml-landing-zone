@@ -550,6 +550,11 @@ function Get-ComposedParameterValues {
         principalType = 'ServicePrincipal'
         deployApiManagement = $Profile.gateway.enabled
         apiManagementConfiguration = $gateway
+        # The adoption marker is no longer inferred from the presence of a
+        # workload configuration, because the azd path can supply one too
+        # (ADR-007). This path opts in explicitly; every other path gets the
+        # safe default of 'ai-landing-zone' and is therefore not adoptable here.
+        apiManagementManagedBy = 'github-dev-environment'
         apiManagementWorkloadKey = $Profile.gateway.workloadKey
         enableDeveloperExperience = $Profile.parameters.deployContainerApps
         developerExperience = $developer
