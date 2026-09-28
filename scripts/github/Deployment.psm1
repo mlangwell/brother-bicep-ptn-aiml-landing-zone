@@ -97,8 +97,13 @@ function New-EnvironmentArmRequest {
         }
         $stopValueRead = $Method -ceq 'POST' -and $target.AbsolutePath -ieq "$stopId/listValue" -and $null -eq $Body
         if ($Method -cne 'GET' -and -not $stopValueRead) {
-            $disablePublic = $Method -ceq 'PATCH' -and $target.AbsolutePath -ieq $gatewayId -and
-                (& $jsonCommand -Value $Body) -ceq '{"properties":{"publicNetworkAccess":"Disabled"}}'
+            # No publicNetworkAccess mutation is permitted in either direction.
+            # Classic VNet injection has no private-endpoint transition, so
+            # 'Enabled' is the only value Azure accepts on this topology - see
+            # the block in modules/api-management/main.bicep and the assertions
+            # in Gateway.Tests.ps1. A PATCH to 'Disabled' was previously allowed
+            # here; nothing ever sent it, and permitting it contradicted the
+            # rest of the design.
             $setStop = $Method -cin @('PUT', 'PATCH') -and $target.AbsolutePath -ieq $stopId -and
                 $Body.properties.value -ceq ([string]$approvedStop).ToLowerInvariant()
             if ($setStop) {
@@ -108,7 +113,7 @@ function New-EnvironmentArmRequest {
                     throw 'Stop-control completion cannot introduce keys, secret references or unrelated properties.'
                 }
             }
-            if (-not $disablePublic -and -not $setStop) { throw 'Completion transport only permits public-disable and the approved owned stop-control value.' }
+            if (-not $setStop) { throw 'Completion transport only permits the approved owned stop-control value.' }
         }
         foreach ($key in $Headers.Keys) {
             if ($key -cnotin @('If-Match', 'If-None-Match', 'Accept')) { throw 'ARM transport header override is not permitted.' }

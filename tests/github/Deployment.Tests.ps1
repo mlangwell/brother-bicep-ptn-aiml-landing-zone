@@ -76,6 +76,10 @@ $account.tenantId = '55555555-5555-5555-5555-555555555555'
 Assert-Rejected { Assert-AzureDeploymentIdentity -Profile $profile -Phase Deploy -Account $account } 'A different tenant reached deployment.'
 $request = New-EnvironmentArmRequest -Profile $profile
 Assert-Rejected { & $request 'PATCH' "https://management.azure.com${gatewayId}?api-version=2024-05-01" @{properties=@{publicNetworkAccess='Enabled'}} @{} } 'Completion could enable public access.'
+# Neither direction. Injection has no private-endpoint transition, so Disabled is
+# unreachable for this topology and a privileged completion caller must not be
+# able to submit it either.
+Assert-Rejected { & $request 'PATCH' "https://management.azure.com${gatewayId}?api-version=2024-05-01" @{properties=@{publicNetworkAccess='Disabled'}} @{} } 'Completion could disable public access on an injected gateway.'
 Assert-Rejected { & $request 'GET' "https://untrusted.invalid${gatewayId}?api-version=2024-05-01" $null @{} } 'ARM credentials could be sent to another origin.'
 Assert-Rejected { & $request 'GET' 'https://management.azure.com/subscriptions/other/resourceGroups/other/providers/Microsoft.ApiManagement/service/other?api-version=2024-05-01' $null @{} } 'ARM completion could cross its scope.'
 Assert-Rejected { & $request 'GET' "https://management.azure.com${gatewayId}?api-version=2024-05-01" $null @{Authorization='untrusted'} } 'Caller could replace transport authentication.'
