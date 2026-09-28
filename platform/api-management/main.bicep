@@ -66,6 +66,7 @@ targetScope = 'resourceGroup'
 // not merely unnecessary; they are invalid.
 
 import * as const from '../../constants/constants.bicep'
+import { injectionEgressRouting } from './network.bicep'
 
 @description('API Management service name. Globally unique within azure-api.net.')
 @minLength(1)
@@ -170,8 +171,8 @@ param injectionSubnetPrefix string
 @description('Set false when the platform team owns the injection subnet and its NSG outside this template. The existing subnet must then be UNDELEGATED and carry the required NSG rules - see network.bicep for the authoritative rule set.')
 param deployInjectionSubnet bool = true
 
-@description('Optional route table for the injection subnet. When the platform forces tunnelling by routing 0.0.0.0/0 to a hub firewall - which is this landing zone default - the route table MUST carry a route for the ApiManagement service tag with next hop type Internet. See the operatorObligations output.')
-param routeTableResourceId string = ''
+@description('Egress routing for the injection subnet. REQUIRED, with no default: force tunnelling demands a route for the ApiManagement service tag with next hop type Internet, and this template cannot see whether the platform VNet force tunnels, so there is no value that is safe to assume. Mode "managed" has this template build a dedicated route table carrying that route plus 0.0.0.0/0 to the supplied hub firewall or NVA address; mode "operator" attaches a platform-owned route table that must already carry it; mode "none" explicitly declares the subnet is not force tunnelled. Pass { mode: \'none\' } when deployInjectionSubnet is false, where the value is unused.')
+param egressRouting injectionEgressRouting
 
 @description('Enable service endpoints for Storage, SQL, Key Vault and Event Hubs on the injection subnet. Strongly recommended by Learn whenever the subnet is force tunnelled.')
 param enableDependencyServiceEndpoints bool = true
@@ -188,6 +189,19 @@ var ownedTags = union(tags, {
   'ailz-environment': environmentTag
   'ailz-component': 'platform-api-management'
 })
+
+// The forced-tunnelling obligation is discharged, transferred or explicitly
+// waived depending on who owns egress routing. Stating only the one that
+// actually applies keeps it an instruction rather than a generic warning the
+// reader has to decide is relevant - which is how the mandatory
+// ApiManagement -> Internet route came to be missable in the first place.
+var _forcedTunnellingObligation = !deployInjectionSubnet
+  ? 'Forced tunnelling: the platform team owns this subnet, so its route table MUST carry a user-defined route for the ApiManagement service tag with next hop type Internet whenever 0.0.0.0/0 goes to a firewall or NVA. Learn: when force tunnelled "the responses won\'t symmetrically map back to these inbound source IPs and connectivity to the management endpoint is lost".'
+  : (egressRouting.mode == 'managed'
+      ? 'Forced tunnelling: DISCHARGED by this template. It created route table ${const.abbrs.networking.routeTable}${name} carrying ApiManagement -> Internet plus 0.0.0.0/0 -> ${string(egressRouting.?nextHopIpAddress ?? '')}, with BGP propagation disabled, and attached it to the injection subnet. The separate hub firewall egress obligation below still applies.'
+      : (egressRouting.mode == 'operator'
+          ? 'Forced tunnelling: this template attached YOUR route table and deliberately wrote no routes into it. It MUST already carry a user-defined route for the ApiManagement service tag with next hop type Internet. Learn: when force tunnelled "the responses won\'t symmetrically map back to these inbound source IPs and connectivity to the management endpoint is lost". Learn also states this bypass "isn\'t considered a significant security risk" because inbound 3443 is already restricted to the ApiManagement service tag.'
+          : 'Forced tunnelling: egressRouting mode is "none", so NO route table is attached and Azure default system routes apply. This is only correct while nothing overrides 0.0.0.0/0. A default route learned over BGP from an ExpressRoute or VPN gateway force tunnels a subnet that has no route table of its own, and would break control-plane connectivity with no configuration change visible on this subnet. Re-deploy with mode "managed" or "operator" if that changes.'))
 
 // Developer cannot scale. Forcing the value here rather than trusting the
 // caller keeps a copy-pasted capacity: 3 from a Premium profile from producing
@@ -224,7 +238,8 @@ module injectionNetwork './network.bicep' = if (deployInjectionSubnet) {
     virtualNetworkName: virtualNetworkName
     subnetName: injectionSubnetName
     subnetAddressPrefix: injectionSubnetPrefix
-    routeTableResourceId: routeTableResourceId
+    egressRouting: egressRouting
+    routeTableName: '${const.abbrs.networking.routeTable}${name}'
     enableDependencyServiceEndpoints: enableDependencyServiceEndpoints
     tags: ownedTags
   }
@@ -342,6 +357,9 @@ output facts object = {
   virtualNetworkType: 'Internal'
   injectionSubnetResourceId: injectionSubnetResourceId
   subnetDelegated: false
+  egressRoutingMode: egressRouting.mode
+  injectionSubnetManaged: deployInjectionSubnet
+  apiManagementServiceTagRouteGuaranteed: deployInjectionSubnet && egressRouting.mode == 'managed'
   privateEndpointSupported: false
   publicNetworkAccess: 'Enabled'
   publicNetworkAccessRationale: 'Classic injected instances cannot hold a private endpoint, and Learn permits disabling public network access only on instances that have one. Enabled is the sole legal value. Inbound privacy comes from virtualNetworkType Internal; the public VIP serves control-plane 3443 only and the NSG restricts it to the ApiManagement service tag.'
@@ -367,7 +385,7 @@ output facts object = {
     'Re-check that A record after ANY availability zone change. Learn: "Changing the availability zone configuration of an existing API Management Premium instance changes the public virtual IP (VIP) address and, if the instance is deployed in internal virtual network mode, the private VIP address." That includes switching between automatic and manual zones. The DNS record IS the reachability mechanism here, so a stale record silently breaks every caller.'
     'NEVER create a private DNS zone for the apex domain "azure-api.net". Learn: "Do not create a Private DNS zone or forward lookup zone for azure-api.net." It is a shared public Azure domain; an apex private zone becomes authoritative inside the VNet and breaks resolution for other Azure services.'
     'DNS ordering: if the platform VNet uses custom DNS servers, configure them BEFORE deploying this gateway. Learn: otherwise "you\'ll need to update the API Management service each time you change the DNS server(s) by running the Apply Network Configuration Operation".'
-    'Forced tunnelling: if the injection subnet routes 0.0.0.0/0 to a hub firewall, add a user-defined route for the ApiManagement service tag with next hop type Internet. Learn: when force tunnelled "the responses won\'t symmetrically map back to these inbound source IPs and connectivity to the management endpoint is lost". Learn also states this bypass "isn\'t considered a significant security risk" because inbound 3443 is already restricted to the ApiManagement service tag.'
+    _forcedTunnellingObligation
     'Hub firewall egress: an NSG allow rule is not sufficient when egress is tunnelled. The firewall must also permit the gateway\'s outbound dependencies, or service endpoints must carry them off the tunnelled path (enableDependencyServiceEndpoints, on by default).'
     'Spoke reachability: peer each landing zone spoke to the platform VNet, and ensure the gateway can resolve each spoke\'s Foundry privatelink zones while each spoke can resolve this gateway hostname.'
   ]

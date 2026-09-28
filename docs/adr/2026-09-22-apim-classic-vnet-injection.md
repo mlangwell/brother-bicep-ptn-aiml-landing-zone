@@ -171,6 +171,46 @@ templates, because a deployment can be entirely healthy and still unreachable:
    the subnet is force-tunnelled, or control-plane responses cannot map back
    symmetrically and deployment fails. Learn states this bypass "isn't
    considered a significant security risk".
+
+   > **Amended 2026-09-28 — obligation 4 is no longer carried by prose.**
+   > Review feedback observed that the platform module's route table parameter
+   > was optional, which meant a caller could create a force-tunnelled injection
+   > subnet with **no route table at all** and no route: the obligation was
+   > stated in a parameter description and in this list, and nothing enforced
+   > it. The failure was expressible by silent omission.
+   >
+   > `platform/api-management/network.bicep` now takes a discriminated union,
+   > `injectionEgressRouting`, instead of an optional `routeTableResourceId`:
+   >
+   > - `managed` — the template creates a dedicated route table carrying **both**
+   >   mandatory routes (`ApiManagement` → `Internet`, and `0.0.0.0/0` →
+   >   the supplied hub firewall or NVA), with BGP propagation disabled, and the
+   >   subnet depends on it so the route exists *before* the gateway injects.
+   > - `operator` — attach a platform-owned table, writing nothing into it,
+   >   matching `main.bicep`, which likewise declines to write into a route table
+   >   it does not own. The obligation transfers and is restated in the output.
+   > - `none` — an explicit declaration that the subnet is not force-tunnelled.
+   >
+   > The parameter is **required, with no default**, because the template cannot
+   > detect whether the platform VNet force-tunnels, so no value is safe to
+   > assume. This is a breaking change to the platform template's parameter
+   > contract, taken while it still has no callers and has never been deployed.
+   >
+   > `facts.operatorObligations` now states only the obligation that actually
+   > applies — discharged, transferred, or waived — rather than a generic
+   > warning the reader has to decide is relevant, and `facts` gained
+   > `egressRoutingMode` and `apiManagementServiceTagRouteGuaranteed`.
+   >
+   > Note the `none` trap recorded in the type's own description: a default route
+   > learned over **BGP from an ExpressRoute or VPN gateway** force-tunnels a
+   > subnet that has no route table of its own, breaking the control plane with
+   > no configuration change visible on the subnet itself.
+   >
+   > The landing-zone path in `main.bicep` was already correct and is unchanged;
+   > its topology gate guarantees the dedicated table and both routes. The
+   > prepared-spoke path (`useExistingVNet` + `deploySubnets: false`) is an
+   > operator obligation that preflight and bootstrap now **fail closed** on —
+   > see "Closed 2026-09-28" under Verification.
 5. **Open the outbound dependencies on the hub firewall** — an NSG rule alone is
    not sufficient when egress is tunnelled.
 6. **Peer and resolve both directions** — the gateway must resolve each spoke's
@@ -256,6 +296,53 @@ Closing this at runtime would mean adding subnet → NSG → rule ARM reads to
 `Gateway.psm1`, widening its transport contract. That is deliberately deferred,
 not overlooked. Until it is done, **Azure Policy or equivalent drift detection on
 the injection subnet's NSG is the operator's control, not this template's.**
+
+### Closed 2026-09-28: the prepared spoke's `ApiManagement` route is now gated
+
+Recorded alongside the obligation-4 amendment above, because the two had the
+same shape: a requirement stated in prose that no gate enforced.
+
+`scripts/github/Bootstrap.psm1` already read the prepared spoke's route table
+and blocked on `EGRESS_INVALID` unless it carried exactly one `0.0.0.0/0` route
+with next hop `VirtualAppliance` at the approved address. It did **not** check
+for a route with address prefix `ApiManagement` and next hop `Internet`. So a
+profile enabling an injected gateway on a prepared spoke passed bootstrap with a
+route table that force-tunnelled the injection subnet and omitted the
+control-plane exception — the exact condition Learn says loses management
+connectivity. Preflight emitted an informational warning; nothing failed.
+
+Both gates now fail closed:
+
+- **`Invoke-PreflightChecks.ps1`** gained `Test-ApiManagementForcedTunnelRoute`.
+  It runs only when the deployment *injects* a gateway (`deployApiManagement`
+  without `existingApiManagementResourceId`) on the `PreparedSpoke` shape, since
+  `NewSpoke` is template-owned and guaranteed. It resolves the injection subnet
+  the way `main.bicep` does, reads the route table **actually attached to that
+  subnet** rather than trusting a parameter, and emits
+  `APIM_FORCED_TUNNEL_ROUTE_MISSING` as a **FAIL** when the subnet force tunnels
+  `0.0.0.0/0` to an appliance or gateway with no `ApiManagement` → `Internet`
+  route. Absence of a route table, or BGP propagation left enabled with no such
+  route, is a WARN: neither proves force tunnelling, but a default learned from
+  an ExpressRoute or VPN gateway would introduce it invisibly. Unreadable
+  resources warn rather than claim the route is missing.
+- **`Bootstrap.psm1`** adds the `APIM_CONTROL_PLANE_ROUTE_REQUIRED` blocker on
+  the same condition, asserted against the route table it already reads.
+
+This also fixed a latent resolution bug: `main.parameters.json` does not expose
+`apiManagementSubnetName`, so preflight could not identify the injection subnet
+on the azd path at all. `Get-ApiManagementSubnetName` now mirrors
+`Get-ApiManagementSubnetPrefix` and falls back to the `main.bicep` default.
+
+Covered by 16 assertions in `Test-AzdOperationsContract.ps1` and 4 in
+`Bootstrap.Tests.ps1`, including that adding the route clears the block, so
+neither gate is a permanently-on blocker. One early return — a consumed platform
+gateway — is asserted only in `Bootstrap.Tests.ps1`, because
+`existingApiManagementResourceId` is a GitHub environment-profile parameter that
+`main.parameters.json` does not expose to azd.
+
+**Still not verified against Azure.** These gates assert route *configuration*;
+they do not prove the gateway provisions or that the control plane returns
+symmetrically.
 
 ## Open items
 

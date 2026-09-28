@@ -1329,6 +1329,29 @@ function Add-NetworkPlans {
         $defaults[0].properties.nextHopIpAddress -cne $nextHop) {
         Add-BootstrapBlocker $Context 'EGRESS_INVALID' $egress.routeTableResourceId 'Require the approved 0/0 VirtualAppliance next hop and an actual spoke subnet association; routing is not changed automatically.'
     }
+    # API Management control plane. This route table force tunnels 0.0.0.0/0 to
+    # the hub appliance, which is precisely the condition that severs an injected
+    # gateway's management endpoint: Learn, "when the traffic is force tunneled,
+    # the responses won't symmetrically map back to these inbound source IPs and
+    # connectivity to the management endpoint is lost." The fix is a UDR for the
+    # ApiManagement service tag with next hop Internet.
+    #
+    # Asserted here because a profile can enable an INJECTED gateway on this
+    # prepared spoke (deployApiManagement without existingApiManagementResourceId),
+    # the landing zone does not own that subnet's routing in this shape, and the
+    # 0/0 assertion above would otherwise let a known-broken table through. A
+    # consumed platform gateway lives in the platform VNet and is unaffected.
+    $parameters = Get-Field $p 'parameters' @{}
+    $injectsGateway = ((Get-Field $parameters 'deployApiManagement' $false) -eq $true) -and
+        [string]::IsNullOrWhiteSpace([string](Get-Field $parameters 'existingApiManagementResourceId' ''))
+    if ($injectsGateway) {
+        $controlPlane = @($routeTable.properties.routes | Where-Object {
+                $_.properties.addressPrefix -ceq 'ApiManagement' -and $_.properties.nextHopType -ceq 'Internet'
+            })
+        if ($controlPlane.Count -ne 1) {
+            Add-BootstrapBlocker $Context 'APIM_CONTROL_PLANE_ROUTE_REQUIRED' $egress.routeTableResourceId 'An injected API Management gateway on a force-tunnelled subnet requires exactly one route with address prefix ApiManagement and next hop type Internet. Without it the gateway loses its management endpoint and provisioning fails; routing is not changed automatically.'
+        }
+    }
     $forward = Read-BootstrapCollection $Context 'Azure' "$spokeId/virtualNetworkPeerings?api-version=2024-05-01" 'value'
     $toHub = @($forward | Where-Object { $_.properties.remoteVirtualNetwork.id -ieq $hubId })
     if ($toHub.Count -ne 1 -or -not $toHub[0].properties.allowVirtualNetworkAccess -or $toHub[0].properties.allowForwardedTraffic -ne $network.allowForwardedTraffic) {

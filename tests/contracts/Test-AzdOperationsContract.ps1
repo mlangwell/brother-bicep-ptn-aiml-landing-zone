@@ -37,6 +37,7 @@ $spokeVnetId = "/subscriptions/$spokeSubscription/resourceGroups/rg-spoke/provid
 $otherVnetId = "/subscriptions/$spokeSubscription/resourceGroups/rg-other/providers/Microsoft.Network/virtualNetworks/vnet-other"
 $searchId = "/subscriptions/$spokeSubscription/resourceGroups/rg-spoke/providers/Microsoft.Search/searchServices/srch-contract"
 $scopeId = "/subscriptions/$spokeSubscription/resourceGroups/rg-spoke/providers/microsoft.insights/privateLinkScopes/pls-contract"
+$spokeRouteTableId = "/subscriptions/$spokeSubscription/resourceGroups/rg-spoke/providers/Microsoft.Network/routeTables/rt-spoke"
 
 function Reset-Stub {
     $global:StubCalls = [System.Collections.Generic.List[string]]::new()
@@ -62,6 +63,14 @@ function Reset-Stub {
     $global:StubDeleteFails = $false
     $global:StubReadHost = ''
     $global:StubNow = [datetime]'2026-01-01T00:00:00Z'
+    # Prepared injection subnet routing, for the forced-tunnelling gate. The
+    # default is the broken-by-omission shape the gate exists to catch: a subnet
+    # force tunnelled to the hub appliance with no ApiManagement exception.
+    $global:StubApimSubnetRouteTableId = $spokeRouteTableId
+    $global:StubApimRoutes = @(@{ name = 'default'; addressPrefix = '0.0.0.0/0'; nextHopType = 'VirtualAppliance'; nextHopIpAddress = '10.100.0.4' })
+    $global:StubApimDisableBgp = $true
+    $global:StubApimSubnetShowFails = $false
+    $global:StubApimRouteTableShowFails = $false
 }
 
 function New-Peering([string]$RemoteId, [string]$State, [string[]]$Prefixes = @('192.168.0.0/21'), [bool]$AllowAccess = $true, [bool]$AllowForwarded = $true, [string]$LocalVnetId = $hubVnetId, [switch]$ArmShape) {
@@ -107,6 +116,21 @@ function az {
             return (ConvertTo-Json -InputObject @($listed) -Depth 10 -AsArray)
         }
         '^network vnet show' { return "{`"id`":`"$hubVnetId`",`"name`":`"vnet-hub`",`"addressSpace`":{`"addressPrefixes`":[`"10.100.0.0/22`"]},`"subnets`":[]}" }
+        '^network vnet subnet show' {
+            if ($global:StubApimSubnetShowFails) { $global:LASTEXITCODE = 1; return }
+            $subnet = [ordered]@{ id = "$spokeVnetId/subnets/api-management-subnet"; name = 'api-management-subnet' }
+            if ($global:StubApimSubnetRouteTableId) { $subnet.routeTable = @{ id = $global:StubApimSubnetRouteTableId } }
+            return (ConvertTo-Json -InputObject $subnet -Depth 10)
+        }
+        '^network route-table show' {
+            if ($global:StubApimRouteTableShowFails) { $global:LASTEXITCODE = 1; return }
+            return (ConvertTo-Json -InputObject ([ordered]@{
+                        id = $global:StubApimSubnetRouteTableId
+                        name = 'rt-spoke'
+                        disableBgpRoutePropagation = $global:StubApimDisableBgp
+                        routes = @($global:StubApimRoutes)
+                    }) -Depth 10)
+        }
         '^group exists' {
             if ($global:StubGroupExistsFails -or -not ($spokeScope -and (Test-Argument $joined '--name' 'rg-spoke'))) { $global:LASTEXITCODE = 1; return }
             return ($(if ($global:StubGroupExists) { 'true' } else { 'false' }))
@@ -469,6 +493,71 @@ try {
     $global:StubAzdEnv.DEPLOY_API_MANAGEMENT = 'false'
     $result = Invoke-Preflight
     Assert-True (-not ($result.Text -match 'APIM_HUB_PEERING_')) 'The gate must not run when API Management is disabled.'
+
+    # -----------------------------------------------------------------------
+    # Preflight: a force-tunnelled prepared injection subnet must carry the
+    # ApiManagement -> Internet route.
+    # -----------------------------------------------------------------------
+    # Learn: when force tunnelled "the responses won't symmetrically map back to
+    # these inbound source IPs and connectivity to the management endpoint is
+    # lost." On a prepared spoke an administrator owns that route table, so the
+    # template cannot guarantee the route and preflight must refuse the deploy
+    # rather than restate the obligation and continue.
+    Reset-Stub; Set-ApiManagementEnvironment -PreparedSpoke
+    $result = Invoke-Preflight
+    Assert-True (Test-Finding $result 'FAIL' 'APIM_FORCED_TUNNEL_ROUTE_MISSING') 'A prepared injection subnet that force tunnels without the ApiManagement route must fail.'
+    Assert-True ($result.ExitCode -eq 1) 'A missing control-plane route must make preflight exit 1.'
+    Assert-True ($result.Text -match "next hop type 'Internet'") 'The failure must give the remedy.'
+    Assert-True (@($global:StubCalls -match '^az network route-table show --ids ').Count -eq 1) 'The gate must read the route table actually attached to the subnet.'
+
+    Reset-Stub; Set-ApiManagementEnvironment -PreparedSpoke
+    $global:StubApimRoutes = @(
+        @{ name = 'default'; addressPrefix = '0.0.0.0/0'; nextHopType = 'VirtualAppliance'; nextHopIpAddress = '10.100.0.4' }
+        @{ name = 'api-management-control-plane'; addressPrefix = 'ApiManagement'; nextHopType = 'Internet' }
+    )
+    $result = Invoke-Preflight
+    Assert-True (Test-Finding $result 'INFO' 'APIM_FORCED_TUNNEL_ROUTE_PRESENT') 'The required ApiManagement route must satisfy the gate.'
+    Assert-True (-not ($result.Text -match 'APIM_FORCED_TUNNEL_ROUTE_MISSING')) 'A compliant route table must not be reported as broken.'
+
+    Reset-Stub; Set-ApiManagementEnvironment -PreparedSpoke
+    $global:StubApimSubnetRouteTableId = ''
+    $result = Invoke-Preflight
+    Assert-True (Test-Finding $result 'WARN' 'APIM_FORCED_TUNNEL_ROUTE_ABSENT') 'A subnet with no route table warns, because a BGP-learned default would still force tunnel it.'
+    Assert-True (-not (Test-Finding $result 'FAIL' 'APIM_FORCED_TUNNEL_ROUTE_MISSING')) 'Absence of a route table is not proof of force tunnelling, so it must not fail.'
+
+    Reset-Stub; Set-ApiManagementEnvironment -PreparedSpoke
+    $global:StubApimRoutes = @()
+    $global:StubApimDisableBgp = $false
+    $result = Invoke-Preflight
+    Assert-True (Test-Finding $result 'WARN' 'APIM_FORCED_TUNNEL_ROUTE_ABSENT') 'A route table with BGP propagation enabled and no ApiManagement route must warn.'
+    Assert-True ($result.Text -match 'ExpressRoute or VPN gateway') 'The warning must name the BGP-learned default route risk.'
+
+    Reset-Stub; Set-ApiManagementEnvironment -PreparedSpoke
+    $global:StubApimSubnetShowFails = $true
+    $result = Invoke-Preflight
+    Assert-True (Test-Finding $result 'WARN' 'APIM_FORCED_TUNNEL_ROUTE_UNVERIFIED') 'An unreadable subnet must warn rather than claim the route is missing.'
+    Assert-True (-not ($result.Text -match 'APIM_FORCED_TUNNEL_ROUTE_MISSING')) 'An unreadable subnet is not evidence of a missing route.'
+
+    Reset-Stub; Set-ApiManagementEnvironment -PreparedSpoke
+    $result = Invoke-Preflight -Extra @{ SkipAzureLookups = $true }
+    Assert-True (Test-Finding $result 'INFO' 'APIM_FORCED_TUNNEL_ROUTE_UNVERIFIED') 'Skipped lookups must still name the control-plane route prerequisite.'
+    Assert-True (-not ($global:StubCalls -match '^az network route-table show')) 'Skipped lookups must not call az.'
+
+    Reset-Stub; Set-ApiManagementEnvironment
+    $result = Invoke-Preflight
+    Assert-True (-not ($result.Text -match 'APIM_FORCED_TUNNEL_ROUTE_')) 'A new spoke owns its route table and creates both routes, so the gate must not run.'
+
+    Reset-Stub; Set-ApiManagementEnvironment -PreparedSpoke
+    $global:StubAzdEnv.DEPLOY_API_MANAGEMENT = 'false'
+    $result = Invoke-Preflight
+    Assert-True (-not ($result.Text -match 'APIM_FORCED_TUNNEL_ROUTE_')) 'The gate must not run when API Management is disabled.'
+
+    # The remaining early return - a consumed platform gateway, which is injected
+    # into the platform VNet and so does not depend on this spoke's route table -
+    # cannot be exercised here: existingApiManagementResourceId is a GitHub
+    # environment-profile parameter and main.parameters.json does not expose it to
+    # azd. It is covered behaviourally by the matching assertion in
+    # tests/github/Bootstrap.Tests.ps1.
 
     # -----------------------------------------------------------------------
     # Deploy-AilzIntegrated.ps1: the full preview runs preflight before What-If.

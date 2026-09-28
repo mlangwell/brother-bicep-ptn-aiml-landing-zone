@@ -424,6 +424,80 @@ try {
         -Message 'The injection subnet binds the dedicated route table and the dependency service endpoints'
 
     # ---------------------------------------------------------------------
+    # Forced tunnelling on the PLATFORM path.
+    # ---------------------------------------------------------------------
+    # The platform module previously took a single optional route table resource
+    # ID, so a caller could create a force-tunnelled injection subnet with no
+    # route table and therefore no ApiManagement -> Internet route. Learn is
+    # unambiguous that this loses management connectivity, and the failure was
+    # expressed by silent omission: nothing in the template objected.
+    #
+    # The contract is now a discriminated union, so that state is not merely
+    # discouraged, it is unrepresentable. These assertions hold that line: the
+    # bare optional parameter must not come back, the managed mode must emit
+    # BOTH mandatory routes, and the broken input must still fail to compile.
+    Assert-True `
+        -Condition ($platformNetworkSource -notmatch "(?m)^param\s+routeTableResourceId\s+string\s*=" -and
+            $platformSource -notmatch "(?m)^param\s+routeTableResourceId\s+string\s*=") `
+        -Message 'Neither platform template accepts a bare optional route table ID, which is what allowed a force-tunnelled subnet to carry no route at all'
+
+    Assert-True `
+        -Condition ($platformNetworkSource -match "@discriminator\('mode'\)" -and
+            $platformNetworkSource -match "type injectionEgressRouting\s*=\s*managedEgressRouting\s*\|\s*operatorEgressRouting\s*\|\s*unroutedEgress") `
+        -Message 'Egress routing is a discriminated union, so force tunnelling cannot be declared without naming who owns the ApiManagement route'
+
+    Assert-True `
+        -Condition ($platformSource -match "(?m)^param\s+egressRouting\s+injectionEgressRouting\s*$") `
+        -Message 'The platform gateway template requires an explicit egress routing decision, because it cannot detect whether the platform VNet force tunnels'
+
+    $platformTemplate = Build-Template -Path $platformFile -OutFile (Join-Path $scratch 'platform-routing.json') |
+        ConvertFrom-Json -Depth 200
+    $platformRouteTable = $platformTemplate.resources.injectionNetwork.properties.template.resources.injectionRouteTable
+    $platformRoutes = @($platformRouteTable.properties.routes)
+    $controlPlane = @($platformRoutes | Where-Object { [string]$_.properties.addressPrefix -ceq 'ApiManagement' })
+    $defaultRoute = @($platformRoutes | Where-Object { [string]$_.properties.addressPrefix -ceq '0.0.0.0/0' })
+
+    Assert-True `
+        -Condition ($controlPlane.Count -eq 1 -and [string]$controlPlane[0].properties.nextHopType -ceq 'Internet') `
+        -Message 'The platform-managed route table returns the ApiManagement service tag straight to the Internet'
+
+    Assert-True `
+        -Condition ($defaultRoute.Count -eq 1 -and [string]$defaultRoute[0].properties.nextHopType -ceq 'VirtualAppliance') `
+        -Message 'The platform-managed route table force tunnels 0.0.0.0/0 to the hub firewall or NVA'
+
+    Assert-True `
+        -Condition ([bool]$platformRouteTable.properties.disableBgpRoutePropagation) `
+        -Message 'BGP propagation is disabled, so a hub-learned route cannot silently undo the control-plane exception'
+
+    $platformSubnet = $platformTemplate.resources.injectionNetwork.properties.template.resources.injectionSubnet
+    Assert-True `
+        -Condition (@($platformSubnet.dependsOn) -contains 'injectionRouteTable') `
+        -Message 'The platform injection subnet waits for its route table, so the mandatory route exists before the gateway injects'
+
+    # The defect itself, asserted by compilation rather than by inspection:
+    # declaring force tunnelling without supplying somewhere for 0.0.0.0/0 to go
+    # must be rejected outright.
+    $probeFile = Join-Path $scratch 'force-tunnel-without-route.bicep'
+    $networkPath = $platformNetworkFile -replace '\\', '/'
+    @"
+module probe '$networkPath' = {
+  name: 'probe'
+  params: {
+    networkSecurityGroupName: 'nsg-probe'
+    virtualNetworkName: 'vnet-probe'
+    subnetName: 'snet-apim'
+    subnetAddressPrefix: '10.0.1.0/27'
+    routeTableName: 'rt-probe'
+    egressRouting: { mode: 'managed' }
+  }
+}
+"@ | Set-Content -LiteralPath $probeFile -Encoding utf8
+    az bicep build --file $probeFile --stdout 2>&1 | Out-Null
+    Assert-True `
+        -Condition ($LASTEXITCODE -ne 0) `
+        -Message 'Declaring force-tunnelled egress without a next hop fails to compile, so the reported defect cannot be reintroduced by omission'
+
+    # ---------------------------------------------------------------------
     # Public IP: required by Azure for a zone-redundant injected instance.
     # ---------------------------------------------------------------------
     # Learn, reliability-api-management: "When you enable availability zone

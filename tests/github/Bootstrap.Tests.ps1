@@ -1027,6 +1027,47 @@ try {
     $plan = New-PlatformBootstrapPlan -ResolvedEnvironment $c.Resolved -PlatformInputs $c.Inputs -Stage Network -Transport $c.Transport
     Assert-Bootstrap 'Each explicitly approved subnet must actually use its approved egress route table' ($plan.blockers.code -contains 'EGRESS_INVALID')
 
+    # API Management control-plane route. The mock route table force tunnels
+    # 0.0.0.0/0 to the hub appliance, which is exactly the state that severs an
+    # injected gateway's management endpoint unless the ApiManagement service tag
+    # is steered back to Internet (Learn, force tunnelling). The 0/0 assertion
+    # above passes on this table, so without a dedicated check a known-broken
+    # gateway configuration would clear the gate.
+    $c = New-MockContext
+    Add-MockNetwork $c
+    $plan = New-PlatformBootstrapPlan -ResolvedEnvironment $c.Resolved -PlatformInputs $c.Inputs -Stage Network -Transport $c.Transport
+    $codes = @($plan.blockers | ForEach-Object { $_.code })
+    Assert-Bootstrap 'A prepared spoke that deploys no gateway needs no ApiManagement route' (-not ($codes -contains 'APIM_CONTROL_PLANE_ROUTE_REQUIRED'))
+
+    $c = New-MockContext
+    Add-MockNetwork $c
+    $c.Resolved.profile.parameters.deployApiManagement = $true
+    Rehash-Resolved $c
+    $plan = New-PlatformBootstrapPlan -ResolvedEnvironment $c.Resolved -PlatformInputs $c.Inputs -Stage Network -Transport $c.Transport
+    $codes = @($plan.blockers | ForEach-Object { $_.code })
+    Assert-Bootstrap 'An injected gateway on a force-tunnelled spoke is blocked when the ApiManagement route is missing' (($codes -contains 'APIM_CONTROL_PLANE_ROUTE_REQUIRED') -and $c.Writes.Count -eq 0)
+
+    $c = New-MockContext
+    Add-MockNetwork $c
+    $c.Resolved.profile.parameters.deployApiManagement = $true
+    Rehash-Resolved $c
+    $c.State["Azure:$($c.Inputs.network.egress.routeTableResourceId)"].properties.routes = @(
+        $c.State["Azure:$($c.Inputs.network.egress.routeTableResourceId)"].properties.routes[0]
+        @{ name = 'api-management-control-plane'; properties = @{ addressPrefix = 'ApiManagement'; nextHopType = 'Internet' } }
+    )
+    $plan = New-PlatformBootstrapPlan -ResolvedEnvironment $c.Resolved -PlatformInputs $c.Inputs -Stage Network -Transport $c.Transport
+    $codes = @($plan.blockers | ForEach-Object { $_.code })
+    Assert-Bootstrap 'Adding the ApiManagement -> Internet route clears the gateway block' (-not ($codes -contains 'APIM_CONTROL_PLANE_ROUTE_REQUIRED'))
+
+    $c = New-MockContext
+    Add-MockNetwork $c
+    $c.Resolved.profile.parameters.deployApiManagement = $true
+    $c.Resolved.profile.parameters.existingApiManagementResourceId = "$($c.Scope)/providers/Microsoft.ApiManagement/service/platform-gateway"
+    Rehash-Resolved $c
+    $plan = New-PlatformBootstrapPlan -ResolvedEnvironment $c.Resolved -PlatformInputs $c.Inputs -Stage Network -Transport $c.Transport
+    $codes = @($plan.blockers | ForEach-Object { $_.code })
+    Assert-Bootstrap 'A consumed platform gateway is injected into the platform VNet, so the spoke route table is not its concern' (-not ($codes -contains 'APIM_CONTROL_PLANE_ROUTE_REQUIRED'))
+
     $c = New-MockContext
     $plan = New-PlatformBootstrapPlan -ResolvedEnvironment $c.Resolved -PlatformInputs $c.Inputs -Stage Completion -Transport $c.Transport
     Assert-Bootstrap 'Completion RBAC is an explicit blocked stage until actual outputs exist' ($plan.blockers.code -contains 'COMPLETION_OUTPUT_REQUIRED')

@@ -591,8 +591,8 @@ function Test-Topology {
 
         if ($apimPreparedSpoke) {
             Add-Finding -Severity WARN -Code 'APIM_PREPARED_SUBNET_OBLIGATION' `
-                -Message 'API Management will be injected into an operator-prepared subnet. This deployment does not manage that subnet, its NSG or its route table.' `
-                -Hint 'Before provisioning, confirm the subnet is undelegated and carries the rule set in modules/networking/api-management-injection-nsg.bicep, including the hub-firewall-only ingress rules. It must also route the ApiManagement service tag to Internet whenever 0.0.0.0/0 goes to a firewall.'
+                -Message 'API Management will be injected into an operator-prepared subnet. This deployment does not manage that subnet or its NSG.' `
+                -Hint 'Before provisioning, confirm the subnet is undelegated and carries the rule set in modules/networking/api-management-injection-nsg.bicep, including the hub-firewall-only ingress rules. Neither is checked here. Its forced-tunnelling route IS checked separately — see APIM_FORCED_TUNNEL_ROUTE_*.'
         }
         else {
             try {
@@ -1303,6 +1303,27 @@ function Get-ApiManagementSubnetPrefix {
     return ''
 }
 
+function Get-ApiManagementSubnetName {
+    # Mirrors main.bicep: the resolved configuration's integrationSubnetName takes
+    # precedence over apiManagementSubnetName, whose Bicep default is read from
+    # main.bicep when the parameters file leaves it unset. main.parameters.json
+    # does not expose this name at all, so without the Bicep fallback the
+    # forced-tunnelling gate could never identify the subnet on the azd path.
+    param([hashtable]$P)
+    $configuration = Resolve-ApiManagementConfiguration -P $P
+    if ($null -ne $configuration -and -not [string]::IsNullOrWhiteSpace([string]$configuration.integrationSubnetName)) {
+        return ([string]$configuration.integrationSubnetName).Trim()
+    }
+    $explicit = (Get-StringValue $P['apiManagementSubnetName']).Trim()
+    if ($explicit) { return $explicit }
+    $bicepPath = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'main.bicep'
+    if (Test-Path -LiteralPath $bicepPath) {
+        $match = [regex]::Match((Get-Content -LiteralPath $bicepPath -Raw), "(?m)^param apiManagementSubnetName string = '([^']+)'")
+        if ($match.Success) { return $match.Groups[1].Value }
+    }
+    return ''
+}
+
 function Test-ApiManagementHubPeering {
     # API Management activates over the spoke's egress path. In the new-spoke
     # shape the template routes the injection subnet's 0.0.0.0/0 to the hub next
@@ -1488,6 +1509,128 @@ function Test-ApiManagementHubPeering {
     Add-Finding -Severity $severity -Code 'APIM_HUB_PEERING_MISSING' `
         -Message "Hub VNet '$hubName' has no peering to $spokeLabel. $impact" `
         -Hint $twoPassHint
+}
+
+function Test-ApiManagementForcedTunnelRoute {
+    <#
+    .SYNOPSIS
+        Fail when the injection subnet is force tunnelled without the mandatory
+        ApiManagement -> Internet route.
+    .DESCRIPTION
+        Learn, api-management-using-with-internal-vnet, "Force tunnel traffic to
+        on-premises firewall": "When the traffic is force tunneled, the responses
+        won't symmetrically map back to these inbound source IPs and connectivity
+        to the management endpoint is lost. To overcome this limitation,
+        configure a user-defined route (UDR) for the ApiManagement service tag
+        with next hop type set to 'Internet'."
+
+        On the NewSpoke shape main.bicep owns a dedicated route table and creates
+        both routes, so there is nothing to verify. On the PreparedSpoke shape an
+        administrator owns the injection subnet and its route table, and nothing
+        in this repository previously checked it: preflight only restated the
+        obligation as a warning, and the GitHub bootstrap validator asserts the
+        0.0.0.0/0 route while ignoring the ApiManagement one. A profile could
+        therefore pass every gate and then deploy a gateway that loses control
+        plane connectivity.
+
+        This reads the subnet's ACTUAL route table rather than trusting a
+        parameter, because the operator's table need not be the one named by
+        hubIntegrationExistingRouteTableResourceId.
+    #>
+    param([hashtable]$P)
+
+    if (-not (Resolve-DeployFlag -P $P -Key 'deployApiManagement' -Default $false)) { return }
+    if (-not [string]::IsNullOrWhiteSpace((Get-StringValue $P['existingApiManagementResourceId']))) { return }
+
+    # NewSpoke is guaranteed by the template and covered by the classic-injection
+    # contract test. Only an operator-owned subnet can be missing the route.
+    if ((Get-ApiManagementTopologyShape -P $P) -ne 'PreparedSpoke') { return }
+
+    $vnetId = (Get-StringValue $P['existingVnetResourceId']).Trim()
+    $subnetName = Get-ApiManagementSubnetName -P $P
+
+    $fixHint = "Add a route to the injection subnet's route table with address prefix 'ApiManagement' and next hop type 'Internet'. Learn states this bypass 'isn''t considered a significant security risk' because inbound 3443 is already restricted to the ApiManagement service tag, and the route covers only the return path of that Azure traffic."
+
+    if ($SkipAzureLookups) {
+        Add-Finding -Severity INFO -Code 'APIM_FORCED_TUNNEL_ROUTE_UNVERIFIED' `
+            -Message "API Management will be injected into an operator-prepared subnet, which must route the ApiManagement service tag to Internet when it force tunnels. Not verified because Azure lookups were skipped." `
+            -Hint $fixHint
+        return
+    }
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) { return }
+    if (-not $vnetId -or -not $subnetName) {
+        Add-Finding -Severity WARN -Code 'APIM_FORCED_TUNNEL_ROUTE_UNVERIFIED' `
+            -Message 'Could not identify the prepared injection subnet, so its forced-tunnelling route could not be verified.' `
+            -Hint "Set existingVnetResourceId and apiManagementSubnetName (or apiManagementConfiguration.integrationSubnetName). $fixHint"
+        return
+    }
+
+    $subnet = Invoke-AzCli -Arguments @('network', 'vnet', 'subnet', 'show', '--ids', "$vnetId/subnets/$subnetName", '-o', 'json')
+    if (-not $subnet) {
+        Add-Finding -Severity WARN -Code 'APIM_FORCED_TUNNEL_ROUTE_UNVERIFIED' `
+            -Message "Could not read the prepared injection subnet '$subnetName' in '$vnetId', so its forced-tunnelling route could not be verified." `
+            -Hint "Grant the deploying identity Reader on the spoke VNet, or confirm the route with the subnet's owner. $fixHint"
+        return
+    }
+
+    $routeTableId = ''
+    if ($subnet.PSObject.Properties.Name -contains 'routeTable' -and $null -ne $subnet.routeTable) {
+        $routeTableId = [string]$subnet.routeTable.id
+    }
+
+    if (-not $routeTableId) {
+        # No UDR at all. Correct only while nothing overrides 0.0.0.0/0; a
+        # default learned over BGP from an ExpressRoute or VPN gateway force
+        # tunnels a subnet that has no route table of its own.
+        Add-Finding -Severity WARN -Code 'APIM_FORCED_TUNNEL_ROUTE_ABSENT' `
+            -Message "The prepared injection subnet '$subnetName' has no route table. That is correct only if nothing overrides 0.0.0.0/0 for this subnet, including a default route learned over BGP from an ExpressRoute or VPN gateway." `
+            -Hint "If the subnet is force tunnelled by any means, the gateway will lose control-plane connectivity. $fixHint"
+        return
+    }
+
+    $routeTable = Invoke-AzCli -Arguments @('network', 'route-table', 'show', '--ids', $routeTableId, '-o', 'json')
+    if (-not $routeTable) {
+        Add-Finding -Severity WARN -Code 'APIM_FORCED_TUNNEL_ROUTE_UNVERIFIED' `
+            -Message "Could not read route table '$routeTableId' attached to the prepared injection subnet, so its forced-tunnelling route could not be verified." `
+            -Hint "Grant the deploying identity Reader on the route table. $fixHint"
+        return
+    }
+
+    $routes = @($routeTable.routes)
+    $hasControlPlaneRoute = @($routes | Where-Object {
+            ([string]$_.addressPrefix) -eq 'ApiManagement' -and ([string]$_.nextHopType) -eq 'Internet'
+        }).Count -gt 0
+    $forcedTunnelRoutes = @($routes | Where-Object {
+            ([string]$_.addressPrefix) -eq '0.0.0.0/0' -and ([string]$_.nextHopType) -in @('VirtualAppliance', 'VirtualNetworkGateway')
+        })
+    $bgpEnabled = -not [bool]$routeTable.disableBgpRoutePropagation
+
+    if ($hasControlPlaneRoute) {
+        Add-Finding -Severity INFO -Code 'APIM_FORCED_TUNNEL_ROUTE_PRESENT' `
+            -Message "The prepared injection subnet's route table '$($routeTable.name)' carries the required ApiManagement -> Internet route." `
+            -Hint ''
+        return
+    }
+
+    if ($forcedTunnelRoutes.Count -gt 0) {
+        $nextHop = [string]$forcedTunnelRoutes[0].nextHopIpAddress
+        $via = if ($nextHop) { "next hop $nextHop" } else { [string]$forcedTunnelRoutes[0].nextHopType }
+        Add-Finding -Severity FAIL -Code 'APIM_FORCED_TUNNEL_ROUTE_MISSING' `
+            -Message "The prepared injection subnet '$subnetName' force tunnels 0.0.0.0/0 ($via) via route table '$($routeTable.name)', which carries no ApiManagement -> Internet route. The gateway will lose control-plane connectivity and deployment fails." `
+            -Hint $fixHint
+        return
+    }
+
+    if ($bgpEnabled) {
+        Add-Finding -Severity WARN -Code 'APIM_FORCED_TUNNEL_ROUTE_ABSENT' `
+            -Message "Route table '$($routeTable.name)' on the prepared injection subnet has no ApiManagement -> Internet route and leaves BGP route propagation enabled, so a default route learned from an ExpressRoute or VPN gateway would force tunnel this subnet and break the control plane with no change visible on the subnet itself." `
+            -Hint $fixHint
+        return
+    }
+
+    Add-Finding -Severity WARN -Code 'APIM_FORCED_TUNNEL_ROUTE_ABSENT' `
+        -Message "Route table '$($routeTable.name)' on the prepared injection subnet has no ApiManagement -> Internet route. It currently has no 0.0.0.0/0 override, so the gateway works today, but adding one later breaks it." `
+        -Hint $fixHint
 }
 
 # --------------------------------------------------------------------------
@@ -2283,6 +2426,7 @@ Test-LocalCidrSanity -P $effective
 Test-FoundryIqConfiguration -P $effective
 Test-AzureResources -P $effective
 Test-ApiManagementHubPeering -P $effective
+Test-ApiManagementForcedTunnelRoute -P $effective
 Test-ResourceProviders -P $effective
 Test-CosmosAnalyticalStorageRegionSupport -P $effective
 Test-RegionalReadiness -P $effective

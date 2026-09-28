@@ -491,6 +491,19 @@ erDiagram
   subnet is the only one in the template that carries four service endpoints —
   Storage, Sql, KeyVault, EventHub — because the landing zone force-tunnels
   `0.0.0.0/0` to a hub firewall.
+- **Egress routing is a discriminated union, not an optional resource ID.** A
+  force-tunnelled injection subnet must carry a UDR for the `ApiManagement`
+  service tag with next hop `Internet`, or control-plane responses cannot map
+  back symmetrically and management connectivity is lost. On the landing zone
+  path `main.bicep` owns that route outright. On the platform path the contract
+  is `injectionEgressRouting` (`platform/api-management/network.bicep`), whose
+  three modes are `managed` (this template builds the route table and both
+  mandatory routes), `operator` (attach a platform-owned table that must already
+  carry the route) and `none` (an explicit declaration that the subnet is not
+  force-tunnelled). The union exists so the previously expressible state —
+  force-tunnelled with no route table at all — cannot be written down, and so
+  that "route table *and* next hop", which the landing zone path needs a
+  preflight check to reject, is a compile error here.
 - **Private access is a DNS A record, not a private endpoint.** The
   `gatewayPrivateDnsZone` is service-scoped: `<gateway-name>.azure-api.net`,
   holding an apex `@` A record pointing at the gateway's private VIP. The schema
