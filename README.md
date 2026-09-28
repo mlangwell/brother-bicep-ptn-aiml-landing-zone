@@ -416,10 +416,14 @@ landing zone, and `existingApiManagementResourceId` binds a landing zone to one 
 already exists. It should just be a decision rather than a surprise.
 
 The token limit is enforced **per caller**. Each `callerMappings` entry names an Entra
-object ID with its own `tokensPerMinute` and `tokenQuota`; a caller that is not listed is
-refused with `403 gateway_mapping_missing`. There is deliberately no unlimited path and
-no gateway-wide default limit — a shared fallback counter would let one abusive caller
-exhaust the budget for every other unmapped caller.
+object ID with its own `tokensPerMinute` and `tokenQuota`. A caller whose object ID is
+not in the list is refused with `403 gateway_forbidden` before the limit is even
+evaluated — the gateway operates a closed allow-list, so it cannot serve a caller it has
+not been told about.
+
+Note that the three token fields are currently **required on every caller**; there is no
+gateway-level default for them yet, the way `defaultCallsPerMinute` backstops
+`callsPerMinute`. See ADR-007 for the follow-up.
 
 The GitHub environment-profile path
 (`scripts/github/Invoke-EnvironmentDeployment.ps1` with an `environments/<env>.json`

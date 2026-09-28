@@ -26,22 +26,39 @@ the customer paid for a Developer or Premium gateway that served no inference ro
 all, while the guardrails playbook's gateway plane correctly reported `Unverifiable` and
 the run otherwise looked green.
 
-### Why a default token limit is not the answer
+### Why the caller allow-list is the gate, and what can still be defaulted
 
-`llm-token-limit` is enforced per caller. `modules/api-management/policy.bicep` emits one
-`<when condition="caller-id == '<objectId>'">` branch per `callerMapping`, and the
-`<otherwise>` in `responses-policy.xml` returns `403 gateway_mapping_missing`. The
-template cannot synthesise caller mappings, because it cannot know the Entra object IDs
-of the callers.
+`llm-token-limit` is rendered per caller. `modules/api-management/policy.bicep` emits one
+`<when condition="caller-id == '<objectId>'">` branch per `callerMapping`.
 
-A caller-agnostic fallback limit was considered and rejected. `llm-token-limit` counts
-against `counter-key`; a shared fallback bucket would put every unmapped caller in one
-counter, so the first abusive caller would deny service to all the others. That trades a
-precise 403 for shared-fate exhaustion. Refusing an unmapped caller is the correct
-behaviour and is already what the policy does.
+The gate on an unknown caller is **not** that branch. `responses-policy.xml:37-48` rejects
+any caller whose object ID does not resolve to exactly one valid `callerMappings` entry,
+with `403 gateway_forbidden` ("An approved caller is required"), long before the token
+limit is reached. The `<otherwise>` at `:129-145` that returns `gateway_mapping_missing`
+is a defence-in-depth backstop, not the operative control.
 
-So the goal — "the policies apply whether it goes through the pipeline or not" — is met
-by making the configuration **reachable** from the azd path, not by inventing a default.
+So the template cannot serve a caller it has never been told about, and that is a
+deliberate closed allow-list. Changing it would be a posture decision, not a defaulting
+decision, and is out of scope here.
+
+**What can be defaulted, and is not yet:** the per-caller numbers themselves.
+`responses-policy.xml:30-33` rejects a mapping that omits `tokensPerMinute`,
+`tokenQuota` or a valid `tokenQuotaPeriod`, so every caller must currently restate all
+three. A gateway-level default would remove that burden, and the pattern already exists
+one field over — `policy.bicep:48` resolves the call-rate backstop as
+`caller.?callsPerMinute ?? configuration.?defaultCallsPerMinute ?? 600`.
+
+An earlier draft of this ADR argued that a default limit was unsafe because a
+caller-agnostic fallback would share one counter and let the first abusive caller starve
+the rest. **That was wrong.** `counter-key` is built at `responses-policy.xml:107-112` as
+`owner|environment|tid|caller-id|project|model`, so it is per-caller by construction
+regardless of which branch renders the policy. A default limit would not share a counter.
+The argument is withdrawn, and adding `defaultTokensPerMinute` / `defaultTokenQuota` /
+`defaultTokenQuotaPeriod` to `gatewayConfiguration` is recorded as follow-up work rather
+than as something ruled out.
+
+The decision below therefore addresses reachability — the gap that made the gateway
+serve nothing — and does not depend on that withdrawn argument.
 
 ## Decision
 
@@ -104,6 +121,34 @@ GitHub path and the compatibility baseline are untouched.
   `Compatibility.Tests.ps1` iterates only baseline keys, so the parameter contract holds.
 - `environments/gateway-configuration.example.json` is the customer-facing starting point.
   It is an example and is read by no deployment.
+
+## Follow-up: gateway-level token defaults
+
+Not done here, and recorded so it is not lost. `responses-policy.xml:30-33` requires every
+`callerMappings` entry to supply `tokensPerMinute`, `tokenQuota` and a valid
+`tokenQuotaPeriod`; a mapping missing any of them resolves to `{}` and the caller is
+refused. That is the main reason a gateway configuration is tedious to author, and it is
+the thing most likely to stop an operator turning the gateway on at all.
+
+Adding `defaultTokensPerMinute`, `defaultTokenQuota` and `defaultTokenQuotaPeriod` to
+`gatewayConfiguration`, resolved as
+`caller.?tokensPerMinute ?? configuration.?defaultTokensPerMinute ?? <module default>`,
+would reduce a caller entry to `objectId`, `project` and `models`. The pattern already
+exists for the call-rate backstop at `policy.bicep:48`, and the per-caller `counter-key`
+means such a default carries no shared-counter risk.
+
+This changes the rendered policy, but it should **not** relax
+`responses-policy.xml`. That file reads `tokensPerMinute` and `tokenQuota` back out of
+the configuration named value twice — the `mapping` validator at `:30-33`, and the
+`max_output_tokens` ceiling `Math.Min(tokensPerMinute, tokenQuota)` at `:84` — so the
+mappings it receives must stay fully populated. Resolve the defaults where that named
+value is built, in `gatewayNamedValues` (`policy.bicep:63`), so `callerMappings` is
+already complete by the time it is serialised. Loosening the validator instead would
+trade the defence-in-depth described above for a configuration convenience.
+
+That still touches `types.bicep`, `policy.bicep`, `environments/schema.json` and the
+`Read-GatewayConfiguration` validation in `Deploy-AilzIntegrated.ps1`, so it wants its
+own change with `Gateway.Tests.ps1` coverage rather than being folded in here.
 
 ## Amends ADR-004
 
