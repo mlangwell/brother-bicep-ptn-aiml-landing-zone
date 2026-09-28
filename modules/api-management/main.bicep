@@ -100,7 +100,11 @@ var telemetrySubscriptionId = !empty(applicationInsightsResourceId) ? split(appl
 // gateway module below.
 var _needsPublicIp = sku == 'Premium'
 var _createPublicIp = _needsPublicIp && empty(publicIpAddressResourceId)
-var _effectivePublicIpResourceId = !empty(publicIpAddressResourceId)
+// Gated by _needsPublicIp as well as the creation path. The parameter contract
+// says a supplied address is ignored on Developer, and without this gate it was
+// not: a supplied ID flowed through to the service on every SKU, so Developer
+// could attach a public VIP the topology neither needs nor documents.
+var _effectivePublicIpResourceId = (_needsPublicIp && !empty(publicIpAddressResourceId))
   ? publicIpAddressResourceId
   : (_createPublicIp ? gatewayPublicIp!.outputs.resourceId : '')
 

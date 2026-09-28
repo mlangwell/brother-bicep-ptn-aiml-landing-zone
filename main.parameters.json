@@ -66,6 +66,7 @@
     "apiManagementPublisherName":           { "value": "${API_MANAGEMENT_PUBLISHER_NAME=AI Landing Zone}" },
     "apiManagementIngressSourceAddressPrefixes":     { "value": "${API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES=[]}" },
     "apiManagementDirectCallerAddressPrefixes":      { "value": "${API_MANAGEMENT_DIRECT_CALLER_ADDRESS_PREFIXES=[]}" },
+    "apiManagementPublicIpAvailabilityZones":        { "value": "${API_MANAGEMENT_PUBLIC_IP_AVAILABILITY_ZONES=[1,2,3]}" },
     "appRuntimeConfigurationMode":          { "value": "${APP_RUNTIME_CONFIGURATION_MODE=appConfig}" },
     "deployAppInsights":                    { "value": "true" },
     "deployCosmosDb":                       { "value": "${DEPLOY_COSMOS_DB=true}" },

@@ -300,6 +300,9 @@ param apiManagementIngressSourceAddressPrefixes array = []
 @description('Subnet CIDRs inside this spoke that may call the gateway on TCP 443 directly, without traversing the hub firewall. Default is none. The Container Apps environment subnet is added automatically when enableDeveloperExperience is true, because the developer application calls the gateway from it. Traffic from outside the spoke must still arrive through the hub firewall.')
 param apiManagementDirectCallerAddressPrefixes array = []
 
+@description('Availability zones for the public IP created alongside a Premium gateway. Azure requires a public IP whenever availability zone support is enabled on an injected instance, and a zonal address cannot be created in a region that has no availability zones. Set this to an empty list ONLY for such a region, where the gateway is not zone redundant either. Ignored on Developer, which has no availability zones and needs no public IP. Mirrors the same knob on platform/api-management/main.bicep.')
+param apiManagementPublicIpAvailabilityZones int[] = [1, 2, 3]
+
 @description('How the landing zone should provide runtime configuration to the external Container Apps. ``appConfig`` (default) preserves the existing behavior: an Azure App Configuration store is populated with deployment outputs and each Container App receives an ``APP_CONFIG_ENDPOINT`` env var plus the ``App Configuration Data Reader`` RBAC. ``containerEnv`` skips the App Configuration population and instead injects a small set of bootstrap env vars (tenant, subscription, resource group, location, resource token, network/identity flags, plus the names of the deployed resources) directly on every Container App so consumers can resolve endpoints via SDK without going through App Configuration. ``none`` deploys the Container App shells with only the identity bootstrap env vars (``AZURE_TENANT_ID`` and ``AZURE_CLIENT_ID`` when applicable); callers are expected to supply runtime configuration through their own mechanism. Secrets are always sourced from secure parameters or Key Vault references regardless of mode. Set ``deployAppConfig=false`` to skip the store entirely when the mode is ``containerEnv`` or ``none``.')
 @allowed([
   'appConfig'
@@ -3544,6 +3547,10 @@ module apiManagement 'modules/api-management/main.bicep' = if (_createApiManagem
     capacity: _apiManagementCapacity
     publisherEmail: _apiManagementPublisherEmail
     publisherName: _apiManagementPublisherName
+    // Forwarded, or the module's documented empty-list escape hatch for regions
+    // without availability zones is unreachable from this path and a Premium
+    // gateway there cannot deploy at all.
+    publicIpAvailabilityZones: apiManagementPublicIpAvailabilityZones
     workloadConfiguration: _apiManagementWorkloadEnabled ? {
       enabled: true
       name: _apiManagementName
