@@ -46,6 +46,11 @@
     "foundryIqAiServicesEndpoint":         { "value": "${FOUNDRY_IQ_AI_SERVICES_ENDPOINT=}" },
 
     "additionalAppConfigurationSettings":  { "value": [] },
+    "apiManagementConfiguration":          { "value": {} },
+    "apiManagementConfigurationJson":      { "value": "${API_MANAGEMENT_CONFIGURATION=}" },
+    "apiManagementManagedBy":              { "value": "${API_MANAGEMENT_MANAGED_BY=ai-landing-zone}" },
+    "enableDeveloperExperience":           { "value": "${ENABLE_DEVELOPER_EXPERIENCE=false}" },
+    "developerExperience":                 { "value": {} },
 
     "aiSearchResourceId":                  { "value": null },
     "aiFoundryStorageAccountResourceId":   { "value": null },
@@ -60,6 +65,8 @@
     "apiManagementPublisherEmail":          { "value": "${API_MANAGEMENT_PUBLISHER_EMAIL=}" },
     "apiManagementPublisherName":           { "value": "${API_MANAGEMENT_PUBLISHER_NAME=AI Landing Zone}" },
     "apiManagementIngressSourceAddressPrefixes":     { "value": "${API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES=[]}" },
+    "apiManagementDirectCallerAddressPrefixes":      { "value": "${API_MANAGEMENT_DIRECT_CALLER_ADDRESS_PREFIXES=[]}" },
+    "apiManagementPublicIpAvailabilityZones":        { "value": "${API_MANAGEMENT_PUBLIC_IP_AVAILABILITY_ZONES=[1,2,3]}" },
     "appRuntimeConfigurationMode":          { "value": "${APP_RUNTIME_CONFIGURATION_MODE=appConfig}" },
     "deployAppInsights":                    { "value": "true" },
     "deployCosmosDb":                       { "value": "${DEPLOY_COSMOS_DB=true}" },

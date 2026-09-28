@@ -1,0 +1,110 @@
+{
+  "_comment": [
+    "Log Analytics workspace daily ingestion cap ceiling.",
+    "",
+    "WHY THIS EXISTS: the custom role grants",
+    "Microsoft.OperationalInsights/*, which includes workspaces/write. Plane 4",
+    "of this script sets a daily cap on the workspace it is pointed at, but a",
+    "role holder can create a NEW workspace with no cap at all, or PATCH the",
+    "existing one to a larger cap or to unlimited. Log Analytics is billed per",
+    "GB ingested and has no upper bound of its own, so an uncapped workspace",
+    "is an open-ended bill.",
+    "",
+    "READ THIS BEFORE REWORDING ANYTHING HERE:",
+    "",
+    "  Azure Policy is STATELESS. It evaluates the REQUESTED END STATE of a",
+    "  resource. It cannot see the previous value, so it cannot express",
+    "  'must not be RAISED' - that is a delta, and a delta is not available",
+    "  to a policy rule. Any description that promises to stop someone",
+    "  raising the cap is describing a control that does not exist.",
+    "",
+    "  What IS expressible, and what this definition does, is an ABSOLUTE",
+    "  CEILING: the requested cap must be present, finite, and at or below",
+    "  LOG_ANALYTICS_POLICY_MAX_DAILY_GB. That achieves the same outcome by a",
+    "  different route - a raise above the ceiling is simply a non-compliant",
+    "  end state and is refused on its own terms, without the policy ever",
+    "  needing to know what the value used to be.",
+    "",
+    "THREE BAD STATES, ALL CAUGHT BY THE anyOf:",
+    "  1. workspaceCapping.dailyQuotaGb ABSENT  -> no cap was requested at all",
+    "  2. dailyQuotaGb is NEGATIVE              -> -1 is the documented",
+    "                                              'unlimited' sentinel, which",
+    "                                              is the worst case and would",
+    "                                              pass a naive 'greater' test",
+    "  3. dailyQuotaGb ABOVE the ceiling        -> capped, but too high",
+    "",
+    "WHY A CUSTOM DEFINITION: no built-in covers the daily cap. Verified",
+    "2026-09-25 - the Monitoring built-in category has no policy that reads",
+    "workspaceCapping at all.",
+    "",
+    "WHAT THIS IS NOT: the daily cap is a CIRCUIT BREAKER, not a cost tool.",
+    "Microsoft is explicit that it 'should not be used as a primary mechanism",
+    "to filter or reduce data', that overshoot is still billed, and that while",
+    "it is tripped 'you are effectively blind to the current state of your",
+    "monitored environment'. Set the ceiling WELL ABOVE normal volume and",
+    "treat hitting the cap as an incident.",
+    "",
+    "ALIAS VERIFIED against the live provider:",
+    "  Microsoft.OperationalInsights/workspaces/workspaceCapping.dailyQuotaGb",
+    "      (defaultPath properties.workspaceCapping.dailyQuotaGb)"
+  ],
+  "properties": {
+    "displayName": "Log Analytics workspaces must have a daily ingestion cap at or below the ceiling",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "description": "Denies or audits Microsoft.OperationalInsights workspaces that request no daily ingestion cap, an unlimited cap (-1), or a cap above the approved ceiling. Azure Policy evaluates the requested end state and cannot see a previous value, so this is an absolute ceiling rather than a rule against raising the cap.",
+    "metadata": {
+      "category": "Monitoring",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      },
+      "maxDailyQuotaGb": {
+        "type": "Integer",
+        "defaultValue": 50,
+        "metadata": {
+          "displayName": "Maximum daily ingestion cap (GB)",
+          "description": "The highest daily cap a workspace may request, in GB. A workspace with no cap, or with the -1 unlimited sentinel, is non-compliant regardless of this value."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.OperationalInsights/workspaces"
+          },
+          {
+            "anyOf": [
+              {
+                "field": "Microsoft.OperationalInsights/workspaces/workspaceCapping.dailyQuotaGb",
+                "exists": "false"
+              },
+              {
+                "field": "Microsoft.OperationalInsights/workspaces/workspaceCapping.dailyQuotaGb",
+                "less": 0
+              },
+              {
+                "field": "Microsoft.OperationalInsights/workspaces/workspaceCapping.dailyQuotaGb",
+                "greater": "[parameters('maxDailyQuotaGb')]"
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

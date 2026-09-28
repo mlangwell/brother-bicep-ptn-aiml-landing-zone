@@ -87,6 +87,36 @@ param appConfigLabel string = 'ai-lz'
 @description('Optional. Accelerator-specific App Configuration key-values appended verbatim to the App Configuration store. This lets a consuming accelerator publish its own settings without the landing zone needing to know about them. Values are stored as plaintext in App Configuration, so never pass secrets here (use Key Vault references instead). Each entry must have a unique name+label. On a name+label collision with a workload configuration key the landing zone already emits, the passthrough entry wins. Do not redefine reserved infrastructure keys emitted by other modules (the Cosmos identifiers COSMOS_DB_ACCOUNT_RESOURCE_ID and COSMOS_DB_ENDPOINT, and the per-app <APP>_APIKEY Key Vault references); reusing those names would create a duplicate key-value and fail the deployment. Note: this is only applied on non network-isolated deployments, where the landing zone writes App Configuration at deploy time. Network-isolated deployments configure App Configuration from the accelerator post-provision step, so pass these values through that path instead.')
 param additionalAppConfigurationSettings additionalAppConfigurationSettingType[] = []
 
+@description('Optional structured gateway configuration, resolved from the GitHub environment profile. Leave empty to deploy the gateway alone from the flat apiManagement* parameters. When supplied it must be a complete gatewayConfiguration (modules/api-management/types.bicep): it selects the SKU and capacity and adds this landing zone\'s workload API, with explicit caller/model mappings and token limits. Its publisher and integration-subnet fields take precedence over the flat parameters. azd cannot populate this parameter, because a substitution carrying an object would terminate at the first closing brace; use apiManagementConfigurationJson from the azd path instead.')
+param apiManagementConfiguration object = {}
+
+@description('The same gatewayConfiguration as apiManagementConfiguration, supplied as a JSON string so the azd path can reach it. Without this, only the GitHub environment-profile path can add the workload API, and an azd deployment produces a gateway that serves nothing (ADR-007). Ignored when apiManagementConfiguration is non-empty, so a profile-supplied object can never be silently overridden; preflight fails when both are set. Validate the document against the gatewayServiceConfiguration definition in environments/schema.json before passing it.')
+param apiManagementConfigurationJson string = ''
+
+@description('Ownership marker stamped on a created gateway as the `ailz-managed-by` tag. The GitHub environment pipeline adopts only gateways carrying its own marker, so this must identify the path that actually deployed the gateway. Defaults to the safe value; only scripts/github/Environment.psm1 opts in to `github-dev-environment`. Do not derive this from whether a workload configuration is present: both paths can now supply one.')
+@allowed([
+  'ai-landing-zone'
+  'github-dev-environment'
+])
+param apiManagementManagedBy string = 'ai-landing-zone'
+
+@description('Landing-zone-scoped key that keeps every per-workload gateway resource unique when several landing zones share one API Management gateway. It keys the API name, the public API path, the backend, the logger and the named values. Defaults to a deterministic hash of this resource group, which is unique per landing zone because this template is resource-group scoped. Do NOT derive it from `resourceToken` or the CAF workload token: both hash only subscription + environment + location, so two landing zones in the same subscription, environment and region would produce the same value and collide. Must be lowercase alphanumeric to be valid as both an APIM resource name segment and a URL path segment.')
+@minLength(3)
+@maxLength(24)
+param apiManagementWorkloadKey string = take(toLower(uniqueString(resourceGroup().id)), 12)
+
+@description('Resource ID of an existing, platform-owned API Management gateway to consume instead of creating one. API Management is per-subscription platform infrastructure with a much longer lifecycle than a landing zone, so the recommended topology is to deploy the gateway once per subscription (see platform/api-management/main.bicep) and point every landing zone at it. When supplied, this landing zone creates NO gateway, NO integration subnet and NO integration NSG; it only creates its own workload-scoped API, backend, logger and named values inside the shared gateway. The gateway may live in a different resource group in the same subscription.')
+param existingApiManagementResourceId string?
+
+@description('System-assigned principal ID of the existing API Management gateway, taken from the platform template `principalId` output. Required when `existingApiManagementResourceId` is supplied, because the landing zone must grant that identity the backend inference and telemetry roles on its own resources. It is passed in rather than read so the template never calls `.properties` against a cross-resource-group `existing` reference.')
+param existingApiManagementPrincipalId string?
+
+@description('Opt in to the release-owned developer application and private completion contract. This profile removes executor and application direct Foundry inference grants; privileged deployment access is configured separately by platform bootstrap.')
+param enableDeveloperExperience bool = false
+
+@description('Nonsecret developer application, managed identity, authentication and immutable release settings supplied by the shared environment resolver. Empty for existing consumers.')
+param developerExperience object = {}
+
 @description('Enable network isolation for the deployment. This will restrict public access to resources and require private endpoints where applicable.')
 param networkIsolation bool = false
 
@@ -233,7 +263,7 @@ param jumpboxSubnetPrefix string = '192.168.3.64/27' // 192.168.3.64–192.168.3
 @description('DevOps Build Agents subnet — /27 (32 IPs)')
 param devopsBuildAgentsSubnetPrefix string = '192.168.3.96/27' // 192.168.3.96–192.168.3.127
 
-@description('API Management subnet — /27 (32 IPs), dedicated to the VNet-injected service')
+@description('API Management subnet — /27 (32 IPs), dedicated to the VNet-injected service. apiManagementConfiguration.integrationSubnetPrefix takes precedence when supplied.')
 param apiManagementSubnetPrefix string = '192.168.3.128/27' // 192.168.3.128–192.168.3.159
 
 // ----------------------------------------------------------------------
@@ -255,17 +285,23 @@ param deployAiFoundrySubnet bool = true
 @description('Deploy Azure App Configuration for centralized feature-flag and configuration management.')
 param deployAppConfig bool = true
 
-@description('Deploy a Developer-tier Azure API Management service with internal VNet injection into a dedicated spoke subnet. Requires network isolation and is disabled by default.')
+@description('Deploy an Azure API Management gateway with internal (classic) VNet injection into a dedicated injection subnet. The tier is Developer unless apiManagementConfiguration selects Premium. This template creates the gateway only in the ailz-integrated, network-isolated topology with a hub VNet: either a new spoke with a hub egress next hop, where the template owns the subnet, NSG and route table, or a prepared spoke (useExistingVNet with deploySubnets=false), where an administrator owns them. Alternatively, existingApiManagementResourceId binds this landing zone to a platform-owned gateway. The gateway activates over the hub egress path, so the hub-to-spoke peering must be Connected before it is created; preflight enforces this (ADR-003). Disabled by default.')
 param deployApiManagement bool = false
 
-@description('Publisher email for Azure API Management. Required when deployApiManagement is true.')
+@description('Publisher email for Azure API Management. Required when deployApiManagement is true, unless apiManagementConfiguration supplies publisherEmail.')
 param apiManagementPublisherEmail string = ''
 
-@description('Publisher name for Azure API Management.')
+@description('Publisher name for Azure API Management. apiManagementConfiguration.publisherName takes precedence when supplied.')
 param apiManagementPublisherName string = 'AI Landing Zone'
 
-@description('Hub firewall private IPs as /32 CIDRs allowed to reach the internal API Management gateway on TCP 443. Required when deployApiManagement is true because Azure Firewall source-NATs DNAT traffic to a firewall instance private IP.')
+@description('Hub firewall source CIDRs allowed to reach the internal API Management gateway on TCP 443. Required when this template creates the gateway. Azure Firewall source-NATs DNAT and application-rule traffic to a back-end instance IP in AzureFirewallSubnet, not to its frontend private IP. Pass the hub AzureFirewallSubnet prefix; Deploy-AilzIntegrated.ps1 looks it up by default.')
 param apiManagementIngressSourceAddressPrefixes array = []
+
+@description('Subnet CIDRs inside this spoke that may call the gateway on TCP 443 directly, without traversing the hub firewall. Default is none. The Container Apps environment subnet is added automatically when enableDeveloperExperience is true, because the developer application calls the gateway from it. Traffic from outside the spoke must still arrive through the hub firewall.')
+param apiManagementDirectCallerAddressPrefixes array = []
+
+@description('Availability zones for the public IP created alongside a Premium gateway. Azure requires a public IP whenever availability zone support is enabled on an injected instance, and a zonal address cannot be created in a region that has no availability zones. Set this to an empty list ONLY for such a region, where the gateway is not zone redundant either. Ignored on Developer, which has no availability zones and needs no public IP. Mirrors the same knob on platform/api-management/main.bicep.')
+param apiManagementPublicIpAvailabilityZones int[] = [1, 2, 3]
 
 @description('How the landing zone should provide runtime configuration to the external Container Apps. ``appConfig`` (default) preserves the existing behavior: an Azure App Configuration store is populated with deployment outputs and each Container App receives an ``APP_CONFIG_ENDPOINT`` env var plus the ``App Configuration Data Reader`` RBAC. ``containerEnv`` skips the App Configuration population and instead injects a small set of bootstrap env vars (tenant, subscription, resource group, location, resource token, network/identity flags, plus the names of the deployed resources) directly on every Container App so consumers can resolve endpoints via SDK without going through App Configuration. ``none`` deploys the Container App shells with only the identity bootstrap env vars (``AZURE_TENANT_ID`` and ``AZURE_CLIENT_ID`` when applicable); callers are expected to supply runtime configuration through their own mechanism. Secrets are always sourced from secure parameters or Key Vault references regardless of mode. Set ``deployAppConfig=false`` to skip the store entirely when the mode is ``containerEnv`` or ``none``.')
 @allowed([
@@ -390,7 +426,7 @@ param existingJumpboxResourceId string?
 @description('DEPRECATED (v2.0.0). Legacy v1.x consolidated switch for jumpbox + Bastion + NAT Gateway. Provided as a transitional fallback so v1.x parameter files continue to deploy unmodified — explicit `deployJumpbox` / `deployBastion` / `deployNatGateway` values ALWAYS take precedence over this flag. Will be REMOVED in v3.0.0; migrate to the three component-specific flags.')
 param deployVM bool?
 
-@description('Deploy the virtual network subnets.')
+@description('Deploy the virtual network subnets. NOTE for API Management: with `useExistingVNet: true` and this set to `false` (the prepared-spoke shape), the gateway is STILL deployed, into an administrator-prepared injection subnet that this template does not create. That subnet must be undelegated, must already carry the rule set in `modules/networking/api-management-injection-nsg.bicep` including the hub-firewall-only ingress rules, and must route the ApiManagement service tag to Internet when 0.0.0.0/0 goes to a firewall. Otherwise the gateway fails. The `injectionNsgManaged` gateway fact reports which side owns the NSG.')
 param deploySubnets bool = true
 
 @description('Will deploy network security groups.')
@@ -964,7 +1000,7 @@ param modelDeploymentList array
 // Container Apps params
 // ----------------------------------------------------------------------
 
-@description('List of container apps to create. Dapr is opt-in per app through `dapr.enabled=true`; apps without a `dapr` object deploy with Dapr disabled.')
+@description('List of container apps to create. Dapr is opt-in per app through `dapr.enabled=true`; apps without a `dapr` object deploy with Dapr disabled. Optional image, registry, managedIdentity and environmentVariables fields preserve an explicitly selected application artifact through infrastructure updates. Omitted image retains the legacy placeholder.')
 param containerAppsList array
 
 @description('Workload profiles.')
@@ -1232,8 +1268,18 @@ var _useExistingAiFoundryStorage = !empty(aiFoundryStorageAccountResourceId)
 var _useExistingAiFoundryCosmos = !empty(aiFoundryCosmosDBAccountResourceId)
 var _deployAiFoundrySearch = _deployAiFoundryAgentService && !_useExistingAiFoundrySearch
 var _deployAiFoundryStorage = _deployAiFoundryAgentService && !_useExistingAiFoundryStorage
-var _apiManagementTopologySupported = _networkIsolation && deploymentMode == 'ailz-integrated' && !useExistingVNet && !deployAzureFirewall && _hasHubVnet && _hasExternalEgress && !_hasExistingRouteTable
-var _deployApiManagement = deployApiManagement && _apiManagementTopologySupported
+// API Management topology gate (ADR-001, ADR-002). This template creates a
+// gateway only in the ailz-integrated, network-isolated topology with a hub
+// VNet, in one of two network shapes:
+//   1. New spoke (the Deploy-AilzIntegrated.ps1 path): the template owns the
+//      injection subnet, its NSG and a dedicated route table, so it also needs
+//      the hub egress next hop and must own the spoke routing.
+//   2. Prepared spoke (the GitHub environment pipeline path): useExistingVNet
+//      with deploySubnets=false. An administrator owns the injection subnet,
+//      its NSG and its route table (see the operator obligation on
+//      apiManagementSubnets below).
+// Other topologies create no gateway; preflight reports them.
+var _apiManagementTopologySupported = _networkIsolation && deploymentMode == 'ailz-integrated' && !deployAzureFirewall && _hasHubVnet && ((!useExistingVNet && _hasExternalEgress && !_hasExistingRouteTable) || (useExistingVNet && !deploySubnets))
 var _apiManagementIngressSourceAddressPrefixes = apiManagementIngressSourceAddressPrefixes
 
 
@@ -1249,6 +1295,77 @@ var _apiManagementIngressSourceAddressPrefixes = apiManagementIngressSourceAddre
 //   - it is published on MCR (no auth required from ACA pull egress);
 //   - the explicit tag prevents drift when Microsoft retags `:aspnetapp`.
 var _containerDummyImageName = 'mcr.microsoft.com/dotnet/samples:aspnetapp-9.0'
+
+// One gateway implementation, three input surfaces (ADR-002, ADR-007). The flat
+// apiManagement* parameters deploy the gateway alone. A complete
+// gatewayConfiguration additionally adds this landing zone's workload API, its
+// named values and the token-limit policy, and may arrive either as an object
+// (the GitHub environment-profile path, which builds its own parameter file) or
+// as a JSON string (the azd path, because azd cannot substitute an object).
+//
+// The object wins when both are present, so a profile-supplied configuration can
+// never be silently replaced by a stale azd environment variable — notably
+// initialProvisioning, which scripts/github/Deployment.psm1 mutates and which
+// governs whether the gateway stops during initial provisioning. That is a
+// safe-by-construction precedence, not a licence to set both: preflight fails
+// with APIM_CONFIGURATION_CONFLICT when it sees both, because silently ignoring
+// an operator's input is its own failure mode.
+var _apiManagementConfiguration = !empty(apiManagementConfiguration)
+  ? apiManagementConfiguration
+  : (!empty(apiManagementConfigurationJson) ? json(apiManagementConfigurationJson) : {})
+
+var _apiManagementName = !empty(_apiManagementConfiguration.?name ?? '')
+  ? string(_apiManagementConfiguration.name)
+  : resourceNames.apiManagementName
+
+// ----------------------------------------------------------------------
+// Shared platform gateway (BYO) derivations
+// ----------------------------------------------------------------------
+// Mirrors the existingLogAnalyticsWorkspaceResourceId pattern above. When the
+// operator supplies a platform-owned gateway we create no service, no
+// integration subnet and no integration NSG — those belong to the platform
+// template — and deploy only this landing zone's workload-scoped children into
+// the gateway's own resource group.
+//
+// Cross-RG-safe: the gateway's principal ID is supplied as a parameter and is
+// never read off an `existing` reference.
+var _hasExistingApiManagement = !empty(existingApiManagementResourceId ?? '')
+var _createApiManagement      = deployApiManagement && !_hasExistingApiManagement && _apiManagementTopologySupported
+var _apimSegments             = _hasExistingApiManagement ? split(existingApiManagementResourceId!, '/') : ['']
+var _apimSubscriptionId       = length(_apimSegments) >= 3 ? _apimSegments[2] : subscription().subscriptionId
+var _apimResourceGroupName    = length(_apimSegments) >= 5 ? _apimSegments[4] : resourceGroup().name
+var _effectiveApiManagementName = _hasExistingApiManagement ? last(_apimSegments) : _apiManagementName
+var _apiManagementPrincipalId = existingApiManagementPrincipalId ?? ''
+
+// One gateway implementation, two input surfaces (ADR-002). The flat
+// apiManagement* parameters deploy the gateway alone. A non-empty resolved
+// configuration also selects the tier and adds this landing zone's workload
+// API; its fields take precedence where both are set.
+var _apiManagementWorkloadEnabled = !empty(_apiManagementConfiguration)
+var _apiManagementGatewayBound    = _createApiManagement || (deployApiManagement && _hasExistingApiManagement)
+var _apiManagementSku             = _apiManagementConfiguration.?sku ?? 'Developer'
+var _apiManagementCapacity        = _apiManagementConfiguration.?capacity ?? 1
+var _apiManagementPublisherEmail  = _apiManagementConfiguration.?publisherEmail ?? apiManagementPublisherEmail
+var _apiManagementPublisherName   = _apiManagementConfiguration.?publisherName ?? apiManagementPublisherName
+var _apiManagementSubnetName      = _apiManagementConfiguration.?integrationSubnetName ?? apiManagementSubnetName
+var _apiManagementSubnetPrefix    = _apiManagementConfiguration.?integrationSubnetPrefix ?? apiManagementSubnetPrefix
+// The developer application calls the gateway from the Container Apps subnet,
+// inside the spoke, so that subnet is a named direct caller (ADR-002).
+var _apiManagementDirectCallerAddressPrefixes = union(apiManagementDirectCallerAddressPrefixes, enableDeveloperExperience ? [acaEnvironmentSubnetPrefix] : [])
+
+var _inferenceGatewayApiPath = 'inference/${apiManagementWorkloadKey}'
+var _inferenceGatewayEndpoint = _apiManagementGatewayBound && _apiManagementWorkloadEnabled ? 'https://${_effectiveApiManagementName}.azure-api.net/${_inferenceGatewayApiPath}/v1/responses' : ''
+
+var _developerRuntimeSettings = enableDeveloperExperience ? [
+  { name: 'INFERENCE_ACCESS_MODE', value: 'gateway', label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'INFERENCE_GATEWAY_ENDPOINT', value: _inferenceGatewayEndpoint, label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'INFERENCE_GATEWAY_AUDIENCE', value: _apiManagementConfiguration.?audience ?? '', label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'SMOKE_API_AUDIENCE', value: developerExperience.application.audience, label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'SMOKE_ALLOWED_OBJECT_IDS', value: string(developerExperience.developerObjectIds), label: appConfigLabel, contentType: 'application/json' }
+  { name: 'SMOKE_ALLOWED_GROUP_IDS', value: string(developerExperience.developerGroupObjectIds), label: appConfigLabel, contentType: 'application/json' }
+  { name: 'SMOKE_MODEL_DEPLOYMENT', value: developerExperience.application.modelDeployment, label: appConfigLabel, contentType: 'text/plain' }
+  { name: 'SMOKE_MAX_OUTPUT_TOKENS', value: string(developerExperience.application.maxOutputTokens), label: appConfigLabel, contentType: 'text/plain' }
+] : []
 
 // ----------------------------------------------------------------------
 // Networking vars
@@ -1271,7 +1388,7 @@ var _jumpbxSubnetId = _networkIsolation ? '${virtualNetworkResourceId}/subnets/$
 #disable-next-line BCP318
 var _agentSubnetId = _networkIsolation ? '${virtualNetworkResourceId}/subnets/${agentSubnetName}' : ''
 #disable-next-line BCP318
-var _apiManagementSubnetId = _deployApiManagement ? '${virtualNetworkResourceId}/subnets/${apiManagementSubnetName}' : ''
+var _apiManagementSubnetId = _createApiManagement ? '${virtualNetworkResourceId}/subnets/${_apiManagementSubnetName}' : ''
 
 var _peLocation = !empty(privateEndpointLocation) ? privateEndpointLocation : location
 var _defaultPeResourceGroupName = useExistingVNet && !sideBySideDeploy ? varExistingVnetResourceGroupName : resourceGroup().name
@@ -1370,12 +1487,24 @@ module appGwNsg 'modules/networking/appgw-nsg.bicep' = if (_publicIngressEnabled
   }
 }
 
-module apiManagementNsg 'modules/networking/api-management-nsg.bicep' = if (_deployApiManagement) {
+// API Management injection-subnet NSG (ADR-002). This entry point keeps the
+// fail-closed contract from ADR-001, requiring at least one hub firewall source
+// CIDR, and takes its rules from the shared module that
+// platform/api-management/network.bicep also uses, so the two paths cannot
+// drift. Inbound TCP 443 is allowed only from the hub firewall's post-SNAT
+// source range and from named in-spoke caller subnets; all other inbound
+// traffic is denied.
+//
+// The condition is written inline on purpose: the workload-isolation contract
+// asserts that `_createApiManagement` appears in the compiled condition.
+module apiManagementNsg 'modules/networking/api-management-nsg.bicep' = if (_createApiManagement && !useExistingVNet) {
   name: 'apiManagementNsgDeployment'
   params: {
-    name: cafTrim('nsg-${resourceNames.vnetName}-${apiManagementSubnetName}', 80)
+    name: cafTrim('nsg-${resourceNames.vnetName}-${_apiManagementSubnetName}', 80)
     location: location
     ingressSourceAddressPrefixes: _apiManagementIngressSourceAddressPrefixes
+    directCallerAddressPrefixes: _apiManagementDirectCallerAddressPrefixes
+    subnetAddressPrefix: _apiManagementSubnetPrefix
     tags: _tags
   }
 }
@@ -1401,7 +1530,10 @@ resource routeTable 'Microsoft.Network/routeTables@2024-07-01' = if (_createRout
   }
 }
 
-resource apiManagementRouteTable 'Microsoft.Network/routeTables@2024-07-01' = if (_deployApiManagement && _createRouteTable) {
+// Dedicated API Management route table (ADR-001). The shared spoke table sends
+// 0.0.0.0/0 to the hub firewall with no exception, which would break the
+// gateway's control plane; this one adds the ApiManagement -> Internet route.
+resource apiManagementRouteTable 'Microsoft.Network/routeTables@2024-07-01' = if (_createApiManagement && !useExistingVNet && _createRouteTable) {
   name: '${const.abbrs.networking.routeTable}${resourceToken}-apim'
   location: location
   tags: _tags
@@ -1413,7 +1545,7 @@ resource apiManagementRouteTable 'Microsoft.Network/routeTables@2024-07-01' = if
 #disable-next-line BCP318
 var _apiManagementRouteTableId = _hasExistingRouteTable
   ? hubIntegrationExistingRouteTableResourceId!
-  : (_deployApiManagement && _createRouteTable ? apiManagementRouteTable.id : '')
+  : (_createApiManagement && !useExistingVNet && _createRouteTable ? apiManagementRouteTable.id : '')
 
 // Base subnets that are always included
 var baseSubnets = [
@@ -1498,14 +1630,44 @@ var baseSubnets = [
       }
 ]
 
-var apiManagementSubnets = _deployApiManagement ? [
+// API Management injection subnet (ADR-001, ADR-002). The template creates it
+// only in the new-spoke shape. On the shared-gateway path the subnet belongs to
+// the platform VNet, so the landing zone carves nothing out of its spoke.
+//
+// OPERATOR OBLIGATION - prepared spoke (useExistingVNet with deploySubnets=false).
+// The gateway is still deployed there, into an administrator-prepared subnet
+// that this template does not touch. That subnet MUST be undelegated. It MUST
+// carry the rule set from modules/networking/api-management-injection-nsg.bicep,
+// including the hub-firewall-only ingress rules. Its route table MUST carry an
+// ApiManagement -> Internet route whenever 0.0.0.0/0 goes to a firewall.
+// Otherwise the gateway fails. Learn, virtual-network-injection-resources: "A
+// network security group (NSG) is required to explicitly allow inbound
+// connectivity, because the load balancer used internally by API Management is
+// secure by default and rejects all inbound traffic." The injectionNsgManaged
+// gateway fact reports which side owns the NSG.
+//
+// Delegation: this subnet MUST NOT be delegated. Classic VNet injection
+// requires an undelegated subnet. Learn: "The subnet used to connect to the API
+// Management instance shouldn't have any delegations enabled."
+//
+// Routing: the dedicated API Management route table sends 0.0.0.0/0 to the hub
+// firewall and carries the ApiManagement -> Internet route that keeps the
+// control plane symmetric. The service endpoints keep the gateway's hard
+// dependencies off the tunnelled path, which Learn strongly recommends for
+// force-tunnelled injection subnets.
+var apiManagementSubnets = _createApiManagement && !useExistingVNet ? [
   {
-    name: apiManagementSubnetName
-    addressPrefix: apiManagementSubnetPrefix
+    name: _apiManagementSubnetName
+    addressPrefix: _apiManagementSubnetPrefix
     networkSecurityGroupResourceId: apiManagementNsg!.outputs.resourceId
     routeTableResourceId: _apiManagementRouteTableId
     delegation: ''
-    serviceEndpoints: []
+    serviceEndpoints: [
+      'Microsoft.Storage'
+      'Microsoft.Sql'
+      'Microsoft.KeyVault'
+      'Microsoft.EventHub'
+    ]
   }
 ] : []
 
@@ -1675,7 +1837,7 @@ resource defaultRoute 'Microsoft.Network/routeTables/routes@2024-07-01' = if (_c
   }
 }
 
-resource apiManagementDefaultRoute 'Microsoft.Network/routeTables/routes@2024-07-01' = if (_deployApiManagement && _createDefaultRoute) {
+resource apiManagementDefaultRoute 'Microsoft.Network/routeTables/routes@2024-07-01' = if (_createApiManagement && !useExistingVNet && _createDefaultRoute) {
   parent: apiManagementRouteTable
   name: 'default-to-egress'
   properties: {
@@ -1685,7 +1847,11 @@ resource apiManagementDefaultRoute 'Microsoft.Network/routeTables/routes@2024-07
   }
 }
 
-resource apiManagementControlPlaneRoute 'Microsoft.Network/routeTables/routes@2024-07-01' = if (_deployApiManagement && _createRouteTable) {
+// Learn, api-management-using-with-internal-vnet: without a UDR for the
+// ApiManagement service tag with next hop Internet, force-tunnelled control
+// plane responses "won't symmetrically map back" and management connectivity
+// is lost. This is the only forced-tunnelling exception on the subnet.
+resource apiManagementControlPlaneRoute 'Microsoft.Network/routeTables/routes@2024-07-01' = if (_createApiManagement && !useExistingVNet && _createRouteTable) {
   parent: apiManagementRouteTable
   name: 'api-management-control-plane'
   properties: {
@@ -2269,25 +2435,6 @@ module privateEndpoints 'modules/networking/private-endpoints.bicep' = if (_netw
   ]
 }
 
-module apiManagement 'modules/api-management/main.bicep' = if (_deployApiManagement) {
-  name: 'apiManagementDeployment'
-  params: {
-    name: resourceNames.apiManagementName
-    location: location
-    publisherEmail: apiManagementPublisherEmail
-    publisherName: apiManagementPublisherName
-    subnetResourceId: _apiManagementSubnetId
-    logAnalyticsWorkspaceResourceId: _lawResourceId
-    tags: _tags
-  }
-  dependsOn: [
-    #disable-next-line BCP321
-    !useExistingVNet ? virtualNetwork : null
-    apiManagementDefaultRoute
-    apiManagementControlPlaneRoute
-  ]
-}
-
 
 // Azure Application Gateway
 //////////////////////////////////////////////////////////////////////////
@@ -2380,16 +2527,8 @@ module aiFoundry 'modules/ai-foundry/main.bicep' = if (deployAiFoundry) {
     location: location
     tags: deploymentTags
 
-    // Gate this on `_networkIsolation` to mirror the sibling `aiFoundryStorageAccount`
-    // module at L2220. When network isolation is off, the spoke VNet is not deployed,
-    // `virtualNetworkResourceId` resolves to '', and `varPeSubnetId` collapses to the
-    // bogus literal '/subnets/pe-subnet'. Passing that down to the four AI Foundry-
-    // bundled sub-modules (Cosmos, Key Vault, AI Search, Storage) makes each one's
-    // `privateNetworkingEnabled = !empty(privateEndpointSubnetResourceId)` evaluate
-    // true (the string is non-empty but invalid), and ARM template validation fails
-    // with `databaseAccount_privateEndpoints[0]` / `keyVault_privateEndpoints[0]` ...
-    // `'reference' is not valid: all function arguments should be string literals.`.
-    // See issue #63 for the full diagnosis.
+    // Use the shared subnet binding; a nonempty synthetic ID would incorrectly
+    // enable private endpoints in the Foundry child modules.
     privateEndpointSubnetResourceId: _networkIsolation ? varPeSubnetId : ''
 
     aiFoundryConfiguration: {
@@ -2469,9 +2608,7 @@ module aiFoundry 'modules/ai-foundry/main.bicep' = if (deployAiFoundry) {
 }
 
 
-var varPeSubnetId = empty(existingVnetResourceId!)
-  ? '${virtualNetworkResourceId}/subnets/pe-subnet'
-  : '${existingVnetResourceId!}/subnets/pe-subnet'
+var varPeSubnetId = _peSubnetId
 
 var varAfNetworkingOverride = _networkIsolation
   ? (policyManagedPrivateDns
@@ -2930,10 +3067,14 @@ module containerApps 'br/public:avm/res/app/container-app:0.18.1' = [
       dapr: _containerAppDaprConfigs[index]
 
       managedIdentities: {
-        systemAssigned: (_useUAI) ? false : true
+        systemAssigned: _useUAI || !empty(app.?managedIdentity.?resourceId ?? '') ? false : true
         #disable-next-line BCP318
-        userAssignedResourceIds: (_useUAI) ? [containerAppsUAI[index].id] : []
+        userAssignedResourceIds: !empty(app.?managedIdentity.?resourceId ?? '')
+          ? [app.managedIdentity.resourceId]
+          : (_useUAI ? [containerAppsUAI[index].id] : [])
       }
+
+      registries: app.?registry != null ? [app.registry] : null
 
       scaleSettings: {
         minReplicas: app.min_replicas
@@ -2943,7 +3084,7 @@ module containerApps 'br/public:avm/res/app/container-app:0.18.1' = [
       containers: [
         {
           name: app.service_name
-          image: _containerDummyImageName
+          image: empty(app.?image ?? '') ? _containerDummyImageName : app.image
           resources: {
             cpu: app.?cpu ?? '0.5'
             memory: app.?memory ?? '1.0Gi'
@@ -2954,16 +3095,20 @@ module containerApps 'br/public:avm/res/app/container-app:0.18.1' = [
             // Emitting an empty AZURE_CLIENT_ID alongside AZURE_TENANT_ID breaks
             // DefaultAzureCredential on the SystemAssigned path. With the var omitted,
             // ManagedIdentityCredential uses the platform-injected SystemAssigned MI.
-            _useUAI ? [
+            _useUAI || !empty(app.?managedIdentity.?resourceId ?? '') ? [
               {
                 name: 'AZURE_CLIENT_ID'
                 #disable-next-line BCP318
-                value: containerAppsUAI[index].properties.clientId
+                value: !empty(app.?managedIdentity.?resourceId ?? '')
+                  ? app.managedIdentity.clientId
+                  : containerAppsUAI[index]!.properties.clientId
               }
             ] : [],
             // Bootstrap runtime config when the consumer opts out of App Config
             // (Issue #89, `appRuntimeConfigurationMode == 'containerEnv'`).
-            _runtimeConfigIsContainerEnv ? _containerRuntimeEnvWithAdditional : []
+            _runtimeConfigIsContainerEnv ? _containerRuntimeEnvWithAdditional : [],
+            app.?environmentVariables ?? [],
+            map(_developerRuntimeSettings, setting => { name: setting.name, value: setting.value })
           )
         }
       ]
@@ -3390,6 +3535,144 @@ module storageAccount 'br/public:avm/res/storage/storage-account:0.26.2' = if (d
 // ROLE ASSIGNMENTS
 //////////////////////////////////////////////////////////////////////////
 
+module apiManagement 'modules/api-management/main.bicep' = if (_createApiManagement) {
+  name: 'apiManagementDeployment'
+  params: {
+    name: _apiManagementName
+    location: location
+    environmentName: environmentName
+    workloadKey: apiManagementWorkloadKey
+    tenantId: tenant().tenantId
+    sku: _apiManagementSku
+    capacity: _apiManagementCapacity
+    publisherEmail: _apiManagementPublisherEmail
+    publisherName: _apiManagementPublisherName
+    // Forwarded, or the module's documented empty-list escape hatch for regions
+    // without availability zones is unreachable from this path and a Premium
+    // gateway there cannot deploy at all.
+    publicIpAvailabilityZones: apiManagementPublicIpAvailabilityZones
+    workloadConfiguration: _apiManagementWorkloadEnabled ? {
+      enabled: true
+      name: _apiManagementName
+      sku: _apiManagementSku
+      capacity: _apiManagementCapacity
+      publisherEmail: _apiManagementPublisherEmail
+      publisherName: _apiManagementPublisherName
+      audience: _apiManagementConfiguration.audience
+      integrationSubnetName: _apiManagementSubnetName
+      integrationSubnetPrefix: _apiManagementSubnetPrefix
+      privateDnsZoneResourceId: _apiManagementConfiguration.privateDnsZoneResourceId
+      stopNewRequests: _apiManagementConfiguration.stopNewRequests
+      foundryIntegration: _apiManagementConfiguration.?foundryIntegration ?? false
+      // ADR-004/ADR-008. These are consumed by policy.bicep and must be
+      // forwarded, or the documented allowStreaming opt-in, the call-rate
+      // backstop override and the gateway token defaults are all inert.
+      allowStreaming: _apiManagementConfiguration.?allowStreaming
+      defaultCallsPerMinute: _apiManagementConfiguration.?defaultCallsPerMinute
+      defaultTokensPerMinute: _apiManagementConfiguration.?defaultTokensPerMinute
+      defaultTokenQuota: _apiManagementConfiguration.?defaultTokenQuota
+      defaultTokenQuotaPeriod: _apiManagementConfiguration.?defaultTokenQuotaPeriod
+      callerMappings: _apiManagementConfiguration.callerMappings
+    } : null
+    // The GitHub environment pipeline adopts only gateways carrying its own
+    // marker, so this must identify the path that actually deployed the gateway.
+    // It was previously derived from whether a workload configuration was
+    // present, which stopped being a valid proxy once the azd path could supply
+    // one too (ADR-007): an azd-built gateway would have falsely claimed the
+    // pipeline's marker and become adoptable by it.
+    managedBy: apiManagementManagedBy
+    integrationSubnetResourceId: _apiManagementSubnetId
+    backendAccountResourceId: aiFoundryAccountResourceId
+    backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
+    applicationInsightsResourceId: _appInsightsResourceId
+    logAnalyticsWorkspaceResourceId: _lawResourceId
+    initialProvisioning: _apiManagementConfiguration.?initialProvisioning ?? false
+    tags: _tags
+  }
+  // The gateway must not start injecting until the subnet carries the dedicated
+  // route table with the ApiManagement -> Internet route (ADR-001).
+  dependsOn: [
+    #disable-next-line BCP321
+    !useExistingVNet ? virtualNetwork : null
+    apiManagementDefaultRoute
+    apiManagementControlPlaneRoute
+  ]
+}
+
+// ---------------------------------------------------------------------------
+// Shared platform gateway (BYO) — workload-scoped children only
+// ---------------------------------------------------------------------------
+// The gateway is owned by the platform template and may sit in a different
+// resource group, so these children are deployed AT the gateway's scope. The
+// previous current-resource-group `existing` lookup could not reach it.
+module apiManagementWorkload 'modules/api-management/workload.bicep' = if (deployApiManagement && _hasExistingApiManagement && _apiManagementWorkloadEnabled) {
+  name: 'apiManagementWorkloadDeployment'
+  scope: resourceGroup(_apimSubscriptionId, _apimResourceGroupName)
+  params: {
+    apiManagementName: _effectiveApiManagementName
+    environmentName: environmentName
+    workloadKey: apiManagementWorkloadKey
+    tenantId: tenant().tenantId
+    configuration: {
+      enabled: true
+      name: _effectiveApiManagementName
+      sku: _apiManagementConfiguration.sku
+      capacity: _apiManagementConfiguration.capacity
+      publisherEmail: _apiManagementConfiguration.publisherEmail
+      publisherName: _apiManagementConfiguration.publisherName
+      audience: _apiManagementConfiguration.audience
+      integrationSubnetName: _apiManagementConfiguration.integrationSubnetName
+      integrationSubnetPrefix: _apiManagementConfiguration.integrationSubnetPrefix
+      privateDnsZoneResourceId: _apiManagementConfiguration.privateDnsZoneResourceId
+      stopNewRequests: _apiManagementConfiguration.stopNewRequests
+      foundryIntegration: _apiManagementConfiguration.?foundryIntegration ?? false
+      // ADR-004/ADR-008. All are optional in gatewayConfiguration and all are
+      // read by modules/api-management/policy.bicep, so they must be forwarded
+      // here or the module silently falls back to its own defaults and the
+      // documented opt-ins have no effect. Passed through as-is rather than
+      // defaulted, so an absent value still resolves to the module default.
+      allowStreaming: _apiManagementConfiguration.?allowStreaming
+      defaultCallsPerMinute: _apiManagementConfiguration.?defaultCallsPerMinute
+      defaultTokensPerMinute: _apiManagementConfiguration.?defaultTokensPerMinute
+      defaultTokenQuota: _apiManagementConfiguration.?defaultTokenQuota
+      defaultTokenQuotaPeriod: _apiManagementConfiguration.?defaultTokenQuotaPeriod
+      callerMappings: _apiManagementConfiguration.callerMappings
+    }
+    backendAccountResourceId: aiFoundryAccountResourceId
+    backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
+    applicationInsightsResourceId: _appInsightsResourceId
+    initialProvisioning: _apiManagementConfiguration.?initialProvisioning ?? false
+  }
+  dependsOn: [
+    apiManagementSharedGatewayRoles
+  ]
+}
+
+// The gateway identity needs inference and telemetry rights on THIS landing
+// zone's resources, so the assignments stay at the landing zone's scope even
+// though the gateway itself is elsewhere. The principal ID arrives as a
+// parameter; it is never read from a cross-resource-group existing reference.
+module apiManagementSharedGatewayRoles 'modules/security/resource-role-assignment.bicep' = if (deployApiManagement && _hasExistingApiManagement && !empty(_apiManagementPrincipalId)) {
+  name: 'apiManagementSharedGatewayRoles'
+  params: {
+    name: 'ailz-inference-${environmentName}-${apiManagementWorkloadKey}'
+    roleAssignments: [
+      {
+        resourceId: aiFoundryAccountResourceId
+        roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesOpenAIUser.guid)
+        principalId: _apiManagementPrincipalId
+        principalType: 'ServicePrincipal'
+      }
+      {
+        resourceId: _appInsightsResourceId
+        roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.MonitoringMetricsPublisher.guid)
+        principalId: _apiManagementPrincipalId
+        principalType: 'ServicePrincipal'
+      }
+    ]
+  }
+}
+
 // Role assignments are centralized in this section to make it easier to view all permissions granted in this template.
 // Custom modules are used for role assignments since no published AVM module available for this at the time we created this template.
 
@@ -3462,7 +3745,7 @@ var _executorRoles = concat(
       principalType: principalType
     }
   ] : [],
-  deployAiFoundry ? concat(
+  deployAiFoundry && !enableDeveloperExperience ? concat(
     [
       {
         principalId: principalId
@@ -3541,7 +3824,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.KeyVaultSecretsUser.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: keyVault.id
             principalType: 'ServicePrincipal'
@@ -3551,26 +3834,26 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.AppConfigurationDataReader.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: appConfig.id
             principalType: 'ServicePrincipal'
           }
         ] : [],
-        (deployAiFoundry && contains(app.roles, const.roles.CognitiveServicesUser.key)) ? [
+        (deployAiFoundry && !enableDeveloperExperience && contains(app.roles, const.roles.CognitiveServicesUser.key)) ? [
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesUser.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             resourceId: aiFoundryAccountResourceId
             principalType: 'ServicePrincipal'
           }
         ] : [],
-        (deployAiFoundry && contains(app.roles, const.roles.CognitiveServicesOpenAIUser.key)) ? [
+        (deployAiFoundry && !enableDeveloperExperience && contains(app.roles, const.roles.CognitiveServicesOpenAIUser.key)) ? [
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesOpenAIUser.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             resourceId: aiFoundryAccountResourceId
             principalType: 'ServicePrincipal'
           }
@@ -3579,7 +3862,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.CognitiveServicesUser.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: speechService.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3589,7 +3872,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.AcrPull.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: containerRegistry.id
             principalType: 'ServicePrincipal'
@@ -3599,7 +3882,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.SearchIndexDataReader.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: searchService.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3609,7 +3892,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.SearchIndexDataContributor.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: searchService.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3619,7 +3902,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.StorageBlobDataContributor.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: storageAccount.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3629,7 +3912,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.StorageBlobDataReader.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: storageAccount.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3639,7 +3922,7 @@ module assignContainerAppRoles 'modules/security/resource-role-assignment.bicep'
           {
             roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', const.roles.StorageBlobDelegator.guid)
             #disable-next-line BCP318
-            principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+            principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
             #disable-next-line BCP318
             resourceId: storageAccount.outputs.resourceId
             principalType: 'ServicePrincipal'
@@ -3728,7 +4011,7 @@ module assignCosmosDBCosmosDbBuiltInDataContributorContainerApps 'modules/securi
       #disable-next-line BCP318
       cosmosDbAccountName: cosmosDBAccount.outputs.name
       #disable-next-line BCP318
-      principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+      principalId: !empty(app.?managedIdentity.?resourceId ?? '') ? app.managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
       roleDefinitionGuid: const.roles.CosmosDBBuiltInDataContributor.guid
       scopePath: '/subscriptions/${subscription().subscriptionId}/resourceGroups/${resourceGroup().name}/providers/Microsoft.DocumentDB/databaseAccounts/${resourceNames.dbAccountName}'
     }
@@ -3768,7 +4051,7 @@ resource appConfig 'Microsoft.AppConfiguration/configurationStores@2024-05-01' =
     // here. The public surface still tracks `_publicNetworkAccess` so the
     // service follows the same Enabled/Disabled logic as the rest of the stack.
     publicNetworkAccess: _publicNetworkAccess
-    disableLocalAuth: false
+    disableLocalAuth: enableDeveloperExperience
   }
 }
 
@@ -3795,7 +4078,7 @@ module containerAppsSettings 'modules/container-apps/container-apps-list.bicep' 
         serviceName: containerAppsList[i].service_name
         canonical_name: containerAppsList[i].canonical_name
         #disable-next-line BCP318
-        principalId: (_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!
+        principalId: !empty(containerAppsList[i].?managedIdentity.?resourceId ?? '') ? containerAppsList[i].managedIdentity.principalId : ((_useUAI) ? containerAppsUAI[i].properties.principalId : containerApps[i].outputs.systemAssignedMIPrincipalId!)
         #disable-next-line BCP318
         fqdn: containerApps[i].outputs.fqdn
       }
@@ -3890,19 +4173,19 @@ module appConfigKeyVaultPopulate 'modules/app-configuration/app-configuration.bi
   }
 }
 
+var _cosmosAppConfigurationSettings = deployCosmosDb ? [
+  #disable-next-line BCP318
+  { name: 'COSMOS_DB_ACCOUNT_RESOURCE_ID', value: cosmosDBAccount.outputs.resourceId, label: appConfigLabel, contentType: 'text/plain' }
+  #disable-next-line BCP318
+  { name: 'COSMOS_DB_ENDPOINT', value: cosmosDBAccount.outputs.endpoint, label: appConfigLabel, contentType: 'text/plain' }
+] : []
+
 module cosmosConfigKeyVaultPopulate 'modules/app-configuration/app-configuration.bicep' = if (deployCosmosDb && deployAppConfig && _runtimeConfigIsAppConfig && !_networkIsolation) {
   name: 'cosmosConfigKeyVaultPopulate'
   params: {
     #disable-next-line BCP318
     storeName: appConfig.name
-    keyValues: concat(
-      [
-        #disable-next-line BCP318
-      { name: 'COSMOS_DB_ACCOUNT_RESOURCE_ID', value: cosmosDBAccount.outputs.resourceId, label: appConfigLabel, contentType: 'text/plain' }
-      #disable-next-line BCP318
-      { name: 'COSMOS_DB_ENDPOINT',              value: cosmosDBAccount.outputs.endpoint,            label: appConfigLabel, contentType: 'text/plain' }
-      ]
-    )
+    keyValues: _cosmosAppConfigurationSettings
   }
 }
 
@@ -3919,12 +4202,7 @@ var _normalizedAdditionalAppConfigSettings = [
 // Collision keys for the passthrough, derived exactly how the app-configuration module names each key-value resource (name$label, or name when the label is empty). Used to drop any landing-zone key the passthrough overrides, so the passthrough always wins without emitting a duplicate resource name.
 var _additionalAppConfigKeys = map(_normalizedAdditionalAppConfigSettings, s => empty(s.label) ? s.name : '${s.name}$${s.label}')
 
-module appConfigPopulate 'modules/app-configuration/app-configuration.bicep' = if (deployAppConfig && _runtimeConfigIsAppConfig && !_networkIsolation) {
-  name: 'appConfigPopulate'
-  params: {
-    #disable-next-line BCP318
-    storeName: appConfig.name
-    keyValues: concat(
+var _appConfigurationSettings = concat(
       filter(
       concat(
       #disable-next-line BCP318
@@ -4059,14 +4337,100 @@ module appConfigPopulate 'modules/app-configuration/app-configuration.bicep' = i
       ),
       kv => !contains(_additionalAppConfigKeys, empty(kv.label) ? kv.name : '${kv.name}$${kv.label}')
       ),
-      _normalizedAdditionalAppConfigSettings
-    )
+      _normalizedAdditionalAppConfigSettings,
+      _developerRuntimeSettings
+)
+
+module appConfigPopulate 'modules/app-configuration/app-configuration.bicep' = if (deployAppConfig && _runtimeConfigIsAppConfig && !_networkIsolation) {
+  name: 'appConfigPopulate'
+  params: {
+    #disable-next-line BCP318
+    storeName: appConfig.name
+    keyValues: _appConfigurationSettings
   }
 }
+
+var _observabilityPropertyByKey = {
+  APPLICATIONINSIGHTS_CONNECTION_STRING: 'ConnectionString'
+  APPLICATIONINSIGHTS__INSTRUMENTATIONKEY: 'InstrumentationKey'
+}
+var _privateCompletionSettings = map(
+  concat(_appConfigurationSettings, _cosmosAppConfigurationSettings),
+  setting => {
+    name: setting.name
+    label: setting.label
+    contentType: setting.contentType
+    value: contains(_observabilityPropertyByKey, setting.name) ? '' : setting.value
+    sourceResourceId: contains(_observabilityPropertyByKey, setting.name) ? _appInsightsResourceId : ''
+    sourceProperty: !empty(_appInsightsResourceId) ? (_observabilityPropertyByKey[?setting.name] ?? '') : ''
+  }
+)
+
+var _developerApplications = _deployContainerApps ? map(containerAppsSettings!.outputs.containerAppsList, (app, index) => {
+  name: app.name
+  resourceId: resourceId('Microsoft.App/containerApps', app.name)
+  fqdn: app.fqdn
+  image: containerAppsList[index].?image ?? ''
+  principalId: app.principalId
+  identityResourceId: containerAppsList[index].?managedIdentity.?resourceId ?? ''
+}) : []
 
 //////////////////////////////////////////////////////////////////////////
 // OUTPUTS
 //////////////////////////////////////////////////////////////////////////
+
+@description('Private inference gateway route. Empty unless a gateway is bound and apiManagementConfiguration adds the workload API; never an implicit direct-Foundry fallback.')
+output INFERENCE_GATEWAY_ENDPOINT string = deployApiManagement ? _inferenceGatewayEndpoint : ''
+
+@description('Entra audience required by the inference gateway workload API. Empty when no workload API is deployed.')
+output INFERENCE_GATEWAY_AUDIENCE string = _apiManagementGatewayBound && _apiManagementWorkloadEnabled ? string(_apiManagementConfiguration.audience) : ''
+
+@description('Nonsecret, opt-in completion inputs from actual deployed resources. Observability credentials are references, not values. An output does not assert developer readiness.')
+output DEVELOPER_COMPLETION object = enableDeveloperExperience ? {
+  schemaVersion: 1
+  environment: environmentName
+  tenantId: tenant().tenantId
+  subscriptionId: subscription().subscriptionId
+  resourceGroup: resourceGroup().name
+  release: developerExperience.release
+  appConfiguration: {
+    endpoint: deployAppConfig ? appConfig!.properties.endpoint : ''
+    resourceId: deployAppConfig ? appConfig.id : ''
+    settings: _privateCompletionSettings
+  }
+  applications: _developerApplications
+  gateway: {
+    accessMode: 'gateway'
+    resourceId: _apiManagementGatewayBound
+      ? (_hasExistingApiManagement
+          ? existingApiManagementResourceId!
+          : resourceId('Microsoft.ApiManagement/service', _apiManagementName))
+      : ''
+    // Classic VNet injection has no inbound private endpoint - Learn: "In the
+    // classic API Management tiers, private endpoints aren't supported in
+    // instances injected in an internal or external virtual network." Privacy
+    // is delivered by Internal mode, and the completion evidence that matters
+    // is therefore the gateway hostname plus the private VIP the operator must
+    // publish in DNS, not a private endpoint approval.
+    hostName: _apiManagementGatewayBound ? '${_effectiveApiManagementName}.azure-api.net' : ''
+    privateIpAddress: _createApiManagement ? apiManagement!.outputs.gatewayPrivateIpAddress : ''
+    networkModel: _apiManagementGatewayBound ? 'classic-vnet-injection' : ''
+    // False means the NSG is not template-managed: either the gateway is
+    // platform-owned, or it sits in an administrator-prepared subnet whose NSG
+    // is the operator's live obligation (see apiManagementSubnets).
+    injectionNsgManaged: _createApiManagement && !useExistingVNet
+    endpoint: _inferenceGatewayEndpoint
+    audience: _apiManagementConfiguration.?audience ?? ''
+    backendResourceId: aiFoundryAccountResourceId
+    backendEndpoint: 'https://${resourceNames.aiFoundryAccountName}.openai.azure.com/'
+  }
+  workspace: {
+    repository: developerExperience.application.workspaceRepository
+    ref: developerExperience.application.workspaceRef
+  }
+  registryResourceId: developerExperience.application.registryResourceId
+  vnetResourceId: virtualNetworkResourceId
+} : {}
 
 // ──────────────────────────────────────────────────────────────────────
 // General / Deployment

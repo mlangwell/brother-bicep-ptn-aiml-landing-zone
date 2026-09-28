@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "questionSet": "text-smoke-v1",
+  "scope": "Stateless nonstreaming text inference, not RAG",
+  "cases": [
+    {
+      "id": "utf8-transport",
+      "authoritativeInput": "Hello, caf\u00e9.",
+      "expectedOutcome": "The exact UTF-8 input reaches the fake Responses transport with only the configured model and token cap; the fake output reaches the caller unchanged.",
+      "evidence": "tests/test_service.py::test_real_http_valid_jwt_utf8_and_managed_identity_gateway_only",
+      "answerability": "present for deterministic transport preservation; generation is not assessed",
+      "observedBoundaries": [
+        "actual HTTP request",
+        "same-invocation injected gateway request",
+        "fake upstream Responses body",
+        "delivered HTTP body"
+      ],
+      "mechanicalOutcome": "tested, not a model-quality verdict"
+    },
+    {
+      "id": "prospective-live-ready",
+      "authoritativeInput": "Reply with the word READY.",
+      "expectedOutcome": "A completed text Responses result with same-invocation application/APIM correlation and bounded observed usage.",
+      "answerability": "unknown until the authorized model invocation",
+      "mechanicalOutcome": "local fake-transport exercise only; no paid call authorized or made"
+    }
+  ],
+  "notApplicable": {
+    "extraction": "The authoritative input is already text.",
+    "chunks": "No corpus or chunking pipeline exists.",
+    "index": "No embedding or index exists.",
+    "retrieval": "No retrieval is performed.",
+    "citationAccuracy": "The API is not a grounded or citation-bearing task."
+  },
+  "outcomes": {
+    "transportPreservation": "covered by local effect assertions",
+    "authorizationRejection": "covered by real signed-JWT and local HTTP tests",
+    "generationCorrectness": "unassessed",
+    "generationCompleteness": "unassessed",
+    "groundedness": "unassessed; no claim of grounded generation",
+    "attribution": "unassessed",
+    "modelRefusalQuality": "unassessed"
+  },
+  "sufficientContextControl": {
+    "status": "not_performed",
+    "reason": "No paid model call is authorized; fake output cannot establish generation quality."
+  },
+  "unverified": [
+    "OCI image build/execution: local Docker Linux engine unavailable; trusted CI build pending",
+    "Live Entra issuance and key rotation in the approved tenant",
+    "Workload managed identity and private endpoint access in Azure",
+    "APIM policy enforcement, metering and backend bypass under every identity context",
+    "Model output quality, live latency and billable token/currency usage",
+    "Full promotion and recovery gate"
+  ]
+}

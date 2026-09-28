@@ -1,10 +1,12 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
   Measure the compiled main.json size and apply the release size gate.
 
 .DESCRIPTION
-  Compiles main.bicep (unless -SkipBuild is set), then reports the resulting
-  main.json size in bytes, KB and MB. Emits a warning when the size exceeds the
+  Compiles main.bicep (unless -SkipBuild is set), writes the same JSON values
+  as a compact UTF-8 deployment artifact, then reports its exact size in bytes,
+  KB and MB. SkipBuild remains read-only. Emits a warning when the size exceeds the
   working budget (3.5 MB by default) and exits non-zero when it exceeds the CI
   fail threshold (4.7 MB by default). The ARM hard ceiling is 5.0 MB and is
   treated as an unconditional failure.
@@ -46,6 +48,30 @@ if (-not $SkipBuild) {
   if ($LASTEXITCODE -ne 0) {
     Write-Error "bicep build failed (exit $LASTEXITCODE)."
     exit $LASTEXITCODE
+  }
+  $documentOptions = [System.Text.Json.JsonDocumentOptions]::new()
+  $documentOptions.MaxDepth = 256
+  $document = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($mainJson), $documentOptions)
+  $temporaryJson = "$mainJson.$([guid]::NewGuid().ToString('N')).tmp"
+  try {
+    $writerOptions = [System.Text.Json.JsonWriterOptions]::new()
+    $writerOptions.Indented = $false
+    $writerOptions.Encoder = [Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+    $stream = [IO.File]::Open($temporaryJson, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    $writer = [System.Text.Json.Utf8JsonWriter]::new($stream, $writerOptions)
+    try {
+      $document.RootElement.WriteTo($writer)
+      $writer.Flush()
+    }
+    finally {
+      $writer.Dispose()
+      $stream.Dispose()
+    }
+    [IO.File]::Move($temporaryJson, $mainJson, $true)
+  }
+  finally {
+    $document.Dispose()
+    if (Test-Path -LiteralPath $temporaryJson) { Remove-Item -LiteralPath $temporaryJson }
   }
 }
 

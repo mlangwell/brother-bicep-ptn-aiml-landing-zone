@@ -40,6 +40,7 @@ param(
     [string] $ApiManagementPublisherEmail,
     [string] $ApiManagementPublisherName = 'AI Landing Zone',
     [string[]] $ApiManagementIngressSourceAddressPrefixes = @(),
+    [string] $GatewayConfigurationPath,
     [hashtable] $AdditionalEnvironmentVariables = @{},
     [ValidateSet('Full', 'Slim')]
     [string] $PreviewOutput = 'Slim',
@@ -55,6 +56,182 @@ function Invoke-Azd {
     & azd @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "azd failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Get-HubFirewallSubnetPrefix {
+    param([Parameter(Mandatory)][string] $HubVnetResourceId)
+
+    # Azure Firewall source-NATs DNAT and application-rule traffic to a back-end
+    # instance IP in AzureFirewallSubnet, not to its frontend private IP, so the
+    # gateway NSG must admit that subnet's range (ADR-002). Returns $null when
+    # the hub has no readable AzureFirewallSubnet, for example with an NVA.
+    $subnetId = '{0}/subnets/AzureFirewallSubnet' -f $HubVnetResourceId.TrimEnd('/')
+    $prefix = & az network vnet subnet show --ids $subnetId --query 'addressPrefix || addressPrefixes[0]' --output tsv --only-show-errors 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$prefix)) {
+        return $null
+    }
+
+    return ([string]$prefix).Trim()
+}
+
+function Read-GatewayConfiguration {
+    param([Parameter(Mandatory)][string] $Path)
+
+    # Without a gateway configuration the deployment produces an API Management
+    # instance carrying only the stock echo-api: no workload API, no named
+    # values and no llm-token-limit (ADR-007). This reads the operator's
+    # configuration and hands it to azd as a compact JSON string, because azd
+    # cannot substitute an object into a Bicep object parameter.
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "GatewayConfigurationPath '$Path' was not found."
+    }
+
+    $raw = Get-Content -LiteralPath $Path -Raw
+    try {
+        $configuration = $raw | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "GatewayConfigurationPath '$Path' is not valid JSON: $($_.Exception.Message)"
+    }
+
+    # Drop $-prefixed annotation keys so a documented example file can be copied
+    # and filled in directly. main.bicep rebuilds the configuration field by
+    # field and would ignore them anyway, but there is no reason to carry
+    # commentary into the azd environment.
+    $clean = [ordered]@{}
+    foreach ($property in $configuration.PSObject.Properties) {
+        if ($property.Name.StartsWith('$')) { continue }
+        $clean[$property.Name] = $property.Value
+    }
+    $configuration = [pscustomobject]$clean
+
+    # Validated here rather than left to ARM, because main.bicep rebuilds the
+    # gatewayConfiguration field by field: a missing required key surfaces as an
+    # opaque evaluation failure inside a nested deployment, minutes in, while an
+    # unexpected key is silently dropped.
+    $required = @(
+        'sku', 'capacity', 'publisherEmail', 'publisherName', 'audience',
+        'integrationSubnetName', 'integrationSubnetPrefix',
+        'privateDnsZoneResourceId', 'stopNewRequests', 'callerMappings'
+    )
+    $missing = @($required | Where-Object { -not $configuration.PSObject.Properties[$_] })
+    if ($missing.Count -gt 0) {
+        throw ("GatewayConfigurationPath '$Path' is missing required field(s): {0}. See environments/gateway-configuration.example.json and the gatewayServiceConfiguration definition in environments/schema.json." -f ($missing -join ', '))
+    }
+
+    if ($configuration.sku -notin @('Developer', 'Premium')) {
+        throw "GatewayConfigurationPath '$Path' has sku '$($configuration.sku)'. Only Developer and Premium support classic VNet injection."
+    }
+
+    $callers = @($configuration.callerMappings)
+    if ($callers.Count -lt 1) {
+        throw "GatewayConfigurationPath '$Path' must declare at least one callerMappings entry. The gateway is a closed allow-list; a caller with no mapping is refused with 403 gateway_forbidden."
+    }
+
+    $callerRequired = @('objectId', 'project', 'models')
+    for ($i = 0; $i -lt $callers.Count; $i++) {
+        $caller = $callers[$i]
+        $callerMissing = @($callerRequired | Where-Object { -not $caller.PSObject.Properties[$_] })
+        if ($callerMissing.Count -gt 0) {
+            throw ("callerMappings[$i] is missing required field(s): {0}." -f ($callerMissing -join ', '))
+        }
+        if ([string]$caller.objectId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            throw "callerMappings[$i].objectId '$($caller.objectId)' is not an Entra object ID (GUID). This is the object ID of the service principal or group that calls the gateway, not an application ID URI."
+        }
+        if (@($caller.models).Count -lt 1) {
+            throw "callerMappings[$i].models must name at least one deployed model."
+        }
+    }
+
+    # $PSScriptRoot is the repository root for this script, where main.parameters.json
+    # lives. Guarded because it is empty when the function is dot-sourced outside a
+    # script file, and an advisory check must never be the thing that breaks a deploy.
+    $parametersPath = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        'main.parameters.json'
+    }
+    else {
+        Join-Path $PSScriptRoot 'main.parameters.json'
+    }
+    Test-GatewayTokenOversubscription -Configuration $configuration -ParametersPath $parametersPath
+
+    return ConvertTo-Json -InputObject $configuration -Depth 12 -Compress
+}
+
+function Test-GatewayTokenOversubscription {
+    param(
+        [Parameter(Mandatory)] $Configuration,
+        [Parameter(Mandatory)][string] $ParametersPath
+    )
+
+    # Each llm-token-limit counter is keyed per caller AND per model - the policy
+    # builds counter-key as owner|environment|tid|caller-id|project|model - so a
+    # caller's tokensPerMinute applies separately to every model it may call. What
+    # the callers actually share is the model deployment's own TPM assignment.
+    #
+    # Compare per model: if the callers permitted on a deployment sum past what
+    # that deployment was assigned, the excess is refused by the MODEL, not by the
+    # gateway. That matters because a gateway refusal carries Retry-After and a
+    # remaining-quota count, whereas a model refusal surfaces as an opaque backend
+    # error. Warn rather than fail: the capacity-to-TPM ratio is model-specific and
+    # this assumes the published chat-class figure, so a wrong guess must not block
+    # a deployment.
+    if (-not (Test-Path -LiteralPath $ParametersPath)) { return }
+    try {
+        $deployments = @((Get-Content -LiteralPath $ParametersPath -Raw | ConvertFrom-Json).parameters.modelDeploymentList.value)
+    }
+    catch {
+        return
+    }
+    if ($deployments.Count -eq 0) { return }
+
+    $gatewayDefault = if ($Configuration.PSObject.Properties['defaultTokensPerMinute']) {
+        [long]$Configuration.defaultTokensPerMinute
+    }
+    else {
+        10000
+    }
+
+    foreach ($deployment in $deployments) {
+        $capacity = 0L
+        if ($deployment.PSObject.Properties['sku'] -and $deployment.sku.PSObject.Properties['capacity']) {
+            $capacity = [long]$deployment.sku.capacity
+        }
+        if ($capacity -le 0) { continue }
+        $assignedTpm = $capacity * 1000
+
+        $demand = 0L
+        foreach ($caller in @($Configuration.callerMappings)) {
+            if (@($caller.models) -notcontains [string]$deployment.name) { continue }
+            $demand += if ($caller.PSObject.Properties['tokensPerMinute']) { [long]$caller.tokensPerMinute } else { $gatewayDefault }
+        }
+
+        if ($demand -gt $assignedTpm) {
+            Write-Warning ("Model deployment '{0}' has capacity {1} (about {2} TPM), but the gateway admits {3} TPM across the callers mapped to it. The model will refuse the excess instead of the gateway, so the caller gets an opaque backend error rather than Retry-After. Lower defaultTokensPerMinute, set per-caller tokensPerMinute, or raise the deployment capacity. Assumes the published 1 unit = 1,000 TPM chat-class ratio, which Microsoft notes varies by model." -f $deployment.name, $capacity, $assignedTpm, $demand)
+        }
+    }
+}
+
+function Assert-ApiManagementIngressSource {
+    param([Parameter(Mandatory)][string] $SerializedValue)
+
+    try {
+        $ingressPrefixes = @($SerializedValue | ConvertFrom-Json)
+    }
+    catch {
+        throw 'API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES must be a JSON array of hub firewall source CIDRs.'
+    }
+
+    # A bare JSON string parses and counts as one element, so the count check
+    # alone cannot tell ["10.0.0.0/26"] from "10.0.0.0/26". azd stores the scalar
+    # form with broken escaping, which leaves the environment unreadable, and the
+    # Bicep array parameter would reject it, so reject the shape here.
+    if (-not $SerializedValue.TrimStart().StartsWith('[')) {
+        throw 'API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES must be a JSON array of hub firewall source CIDRs.'
+    }
+
+    if ($ingressPrefixes.Count -eq 0) {
+        throw 'At least one hub firewall source CIDR is required when DeployApiManagement is enabled.'
     }
 }
 
@@ -391,14 +568,41 @@ if ([bool]$ExistingApplicationInsightsResourceId -ne [bool]$ExistingApplicationI
     throw 'ExistingApplicationInsightsResourceId and ExistingApplicationInsightsConnectionString must be supplied together.'
 }
 
-$effectiveApiManagementIngressSourceAddressPrefixes = @(
-    if ($ApiManagementIngressSourceAddressPrefixes.Count -gt 0) {
-        $ApiManagementIngressSourceAddressPrefixes
-    }
-    else {
-        "$EgressNextHopIp/32"
-    }
+$explicitApiManagementIngressSourceAddressPrefixes = @(
+    $ApiManagementIngressSourceAddressPrefixes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 )
+
+# With API Management enabled and no explicit ingress sources, the default is
+# resolved after sign-in from the hub's AzureFirewallSubnet (ADR-002).
+# With API Management disabled the value is left unset rather than defaulted to
+# the next hop's /32. The Bicep parameter is inert while deployApiManagement is
+# false, azd substitutes the parameter file's [] for an unset variable, and a
+# written /32 would persist in the azd environment as a working-looking default
+# that Azure Firewall never matches: it source-NATs gateway traffic to a
+# back-end instance address in AzureFirewallSubnet, not to its frontend IP
+# (ADR-002 live proof, 2026-09-23). Enabling the gateway by any route that does
+# not re-resolve the default would then build an unreachable gateway.
+$defaultApiManagementIngressSourceAddressPrefixes = if ($explicitApiManagementIngressSourceAddressPrefixes.Count -gt 0) {
+    ConvertTo-Json -InputObject $explicitApiManagementIngressSourceAddressPrefixes -Compress
+}
+else {
+    ''
+}
+
+# Read and validate before sign-in, so a malformed configuration fails in
+# seconds rather than after a preview. An empty string clears any value left in
+# the azd environment by an earlier run, which matters because a stale
+# configuration would otherwise be silently reused.
+$resolvedGatewayConfiguration = if ($PSBoundParameters.ContainsKey('GatewayConfigurationPath') -and
+    -not [string]::IsNullOrWhiteSpace($GatewayConfigurationPath)) {
+    if (-not $DeployApiManagement) {
+        throw 'GatewayConfigurationPath requires -DeployApiManagement. The configuration only has an effect when a gateway is deployed.'
+    }
+    Read-GatewayConfiguration -Path $GatewayConfigurationPath
+}
+else {
+    ''
+}
 
 $settings = [ordered]@{
     AZURE_LOCATION                           = $Location
@@ -408,7 +612,8 @@ $settings = [ordered]@{
     DEPLOY_API_MANAGEMENT                   = $DeployApiManagement.ToString().ToLowerInvariant()
     API_MANAGEMENT_PUBLISHER_EMAIL          = $ApiManagementPublisherEmail
     API_MANAGEMENT_PUBLISHER_NAME           = $ApiManagementPublisherName
-    API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES = ConvertTo-Json -InputObject $effectiveApiManagementIngressSourceAddressPrefixes -Compress
+    API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES = $defaultApiManagementIngressSourceAddressPrefixes
+    API_MANAGEMENT_CONFIGURATION            = $resolvedGatewayConfiguration
     HUB_INTEGRATION_HUB_VNET_RESOURCE_ID    = $HubVnetResourceId
     HUB_INTEGRATION_EGRESS_NEXT_HOP_IP      = $EgressNextHopIp
     HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID = ''
@@ -433,15 +638,8 @@ if ([string]$settings.DEPLOY_API_MANAGEMENT -ieq 'true') {
         throw 'ApiManagementPublisherEmail must be a valid email address when DeployApiManagement is enabled.'
     }
 
-    try {
-        $ingressPrefixes = @([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES | ConvertFrom-Json)
-    }
-    catch {
-        throw 'API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES must be a JSON array of hub firewall source CIDRs.'
-    }
-
-    if ($ingressPrefixes.Count -eq 0) {
-        throw 'At least one hub firewall source CIDR is required when DeployApiManagement is enabled.'
+    if (-not [string]::IsNullOrWhiteSpace([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)) {
+        Assert-ApiManagementIngressSource -SerializedValue ([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)
     }
 
     if (-not [string]::IsNullOrWhiteSpace([string]$settings.HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID)) {
@@ -459,6 +657,26 @@ try {
         }
     }
 
+    if ([string]$settings.DEPLOY_API_MANAGEMENT -ieq 'true' -and
+        [string]::IsNullOrWhiteSpace([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)) {
+        $firewallSubnetPrefix = Get-HubFirewallSubnetPrefix -HubVnetResourceId $HubVnetResourceId
+        $resolvedIngressPrefixes = if ($firewallSubnetPrefix) {
+            Write-Host "API Management ingress source: hub AzureFirewallSubnet $firewallSubnetPrefix."
+            @($firewallSubnetPrefix)
+        }
+        else {
+            Write-Warning ("No AzureFirewallSubnet was readable in the hub VNet, so API Management ingress falls back to $EgressNextHopIp/32. " +
+                'Azure Firewall source-NATs gateway traffic to a back-end instance IP in AzureFirewallSubnet, not to its frontend IP. ' +
+                'If the hub uses Azure Firewall, pass -ApiManagementIngressSourceAddressPrefixes with that subnet range.')
+            @("$EgressNextHopIp/32")
+        }
+        # Assigning the output of an if statement unwraps a single-element array
+        # to a scalar, which would serialize as a JSON string rather than a JSON
+        # array, so re-wrap before serializing.
+        $settings['API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES'] = ConvertTo-Json -InputObject @($resolvedIngressPrefixes) -Compress
+        Assert-ApiManagementIngressSource -SerializedValue ([string]$settings.API_MANAGEMENT_INGRESS_SOURCE_ADDRESS_PREFIXES)
+    }
+
     & azd auth login --check-status
     if ($LASTEXITCODE -ne 0) {
         Invoke-Azd -Arguments @('auth', 'login')
@@ -470,13 +688,28 @@ try {
     }
 
     foreach ($setting in $settings.GetEnumerator()) {
+        # Empty values are normally skipped so an unset option does not overwrite
+        # something an operator set by hand. These two are written even when
+        # empty, because a value left over from a previous run is actively
+        # harmful: a stale route table breaks the gateway topology, and a stale
+        # gateway configuration would silently redeploy a caller set and token
+        # limits the operator did not ask for on this run.
+        $alwaysWrite = @('HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID', 'API_MANAGEMENT_CONFIGURATION')
         if (-not [string]::IsNullOrWhiteSpace([string]$setting.Value) -or
-            [string]$setting.Key -eq 'HUB_INTEGRATION_EXISTING_ROUTE_TABLE_RESOURCE_ID') {
+            $alwaysWrite -contains [string]$setting.Key) {
             Invoke-Azd -Arguments @('env', 'set', [string]$setting.Key, [string]$setting.Value)
         }
     }
 
     if ($PreviewOutput -eq 'Full') {
+        # The full preview calls ARM What-If directly, so the azd preprovision
+        # hook does not run before it. Run the same preflight first, so blocking
+        # findings such as an unsupported azd or a missing hub-to-spoke peering
+        # for API Management surface before the preview is reviewed and approved.
+        & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'scripts' 'Invoke-PreflightChecks.ps1') -AzdEnv $EnvironmentName
+        if ($LASTEXITCODE -ne 0) {
+            throw "Preflight failed with exit code $LASTEXITCODE. Resolve the FAIL findings above and rerun."
+        }
         Invoke-CompletePreview -EnvironmentName $EnvironmentName
     }
     else {

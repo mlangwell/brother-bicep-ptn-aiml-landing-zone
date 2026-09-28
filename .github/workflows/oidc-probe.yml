@@ -1,0 +1,87 @@
+name: Capture verified OIDC claims only
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: true
+        type: choice
+        options: [dev, test, prod]
+      purpose:
+        required: true
+        type: choice
+        options: [preview, deploy]
+      configuration_sha:
+        description: Approved immutable commit with the profile and platform input
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      job_environment: ${{ steps.prepare.outputs.job_environment }}
+      profile_hash: ${{ steps.prepare.outputs.profile_hash }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check existing protections without requesting a token
+        id: prepare
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.AILZ_GITHUB_READ_TOKEN || github.token }}
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          TARGET_PURPOSE: ${{ inputs.purpose }}
+          CONFIGURATION_SHA: ${{ inputs.configuration_sha }}
+        run: |
+          ./scripts/github/Prepare-OidcProbe.ps1 -Environment $env:TARGET_ENVIRONMENT `
+            -Purpose $env:TARGET_PURPOSE -ConfigurationSha $env:CONFIGURATION_SHA `
+            -OutputDirectory (Join-Path $env:RUNNER_TEMP 'oidc-input')
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oidc-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oidc-input/profile.json
+          if-no-files-found: error
+          retention-days: 1
+
+  capture:
+    needs: [prepare]
+    environment: ${{ needs.prepare.outputs.job_environment }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: oidc-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/oidc-input
+      - name: Verify signature and exact emitted claims without Azure login
+        shell: pwsh
+        env:
+          TARGET_PURPOSE: ${{ inputs.purpose }}
+          PROFILE_HASH: ${{ needs.prepare.outputs.profile_hash }}
+        run: |
+          Import-Module ./scripts/github/Environment.psm1
+          $profilePath = Join-Path $env:RUNNER_TEMP 'oidc-input/profile.json'
+          $profile = Read-EnvironmentProfile -Path $profilePath
+          if ((Get-CanonicalHash -Value $profile) -cne $env:PROFILE_HASH) { throw 'OIDC profile changed after preparation.' }
+          ./scripts/github/Export-OidcClaims.ps1 -ProfilePath $profilePath `
+            -Purpose $env:TARGET_PURPOSE -ExpectedWorkflowRef $env:GITHUB_WORKFLOW_REF `
+            -ExpectedWorkflowSha $env:GITHUB_WORKFLOW_SHA -OutputPath (Join-Path $env:RUNNER_TEMP 'claims.json')
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-oidc-claims-${{ inputs.environment }}-${{ inputs.purpose }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/claims.json
+          if-no-files-found: error
+          retention-days: ${{ fromJSON(vars.AILZ_ARTIFACT_RETENTION_DAYS || '14') }}

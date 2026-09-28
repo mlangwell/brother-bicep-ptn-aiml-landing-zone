@@ -1,0 +1,44 @@
+{
+  "if": {
+    "allOf": [
+      {
+        "field": "type",
+        "equals": "Microsoft.CognitiveServices/accounts/deployments"
+      },
+      {
+        "count": {
+          "value": "[parameters('allowedModels')]",
+          "name": "approvedModel",
+          "where": {
+            "allOf": [
+              {
+                "field": "Microsoft.CognitiveServices/accounts/deployments/model.format",
+                "equals": "[current('approvedModel').format]"
+              },
+              {
+                "field": "Microsoft.CognitiveServices/accounts/deployments/model.name",
+                "equals": "[current('approvedModel').name]"
+              },
+              {
+                "anyOf": [
+                  {
+                    "value": "[current('approvedModel').version]",
+                    "equals": ""
+                  },
+                  {
+                    "field": "Microsoft.CognitiveServices/accounts/deployments/model.version",
+                    "equals": "[current('approvedModel').version]"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        "equals": 0
+      }
+    ]
+  },
+  "then": {
+    "effect": "[parameters('effect')]"
+  }
+}

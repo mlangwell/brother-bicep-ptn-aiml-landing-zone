@@ -45,8 +45,8 @@ Azure services in standard and network-isolated deployment modes.
 - `scripts/` and `install.ps1` contain cross-platform PowerShell automation.
 - `pipelines/azuredevops/` and `.github/workflows/` contain validation and
   deployment automation.
-- `tests/` contains deterministic preflight tests and the optional hub/spoke
-  integration fixture.
+- `tests/` contains the API Management contract tests, the GitHub environment
+  suites and the hub/spoke peering helper.
 - `manifest.json` is a release and jumpbox-bootstrap contract. Consumers may
   extend its pinned `components` list.
 
@@ -109,15 +109,21 @@ risk:
 
 - Copilot assets:
   `pwsh ./.github/scripts/Validate-CopilotAssets.ps1`
-- Validator tests:
-  `pwsh ./tests/scripts/Validate-CopilotAssets.Tests.ps1`
 - Bicep compile/lint:
   `az bicep build --file main.bicep` and
   `az bicep lint --file main.bicep`
-- Compiled-template size:
+- Compiled-template size (compacted `main.json`):
   `pwsh ./scripts/Measure-MainJsonSize.ps1`
-- Deterministic preflight tests:
-  `pwsh ./tests/scripts/Invoke-PreflightChecks.Tests.ps1`
+- API Management contracts:
+  `pwsh ./tests/contracts/Test-ApiManagementWorkloadIsolationContract.ps1` and
+  `pwsh ./tests/contracts/Test-ApiManagementClassicInjectionContract.ps1`
+- azd operator paths (azd floor, API Management peering gate, teardown):
+  `pwsh ./tests/contracts/Test-AzdOperationsContract.ps1`
+- GitHub environment suites:
+  `pwsh ./scripts/github/Test-GitHubEnvironment.ps1 -TemplatePath ./main.json`
+- Full local gate: `npm test`
+- Deterministic preflight:
+  `pwsh ./scripts/Invoke-PreflightChecks.ps1 -SkipAzureLookups`
 - Azure-aware preflight:
   `pwsh ./scripts/Invoke-PreflightChecks.ps1`
 - Deployment preview:
@@ -136,15 +142,17 @@ integration, security, testing, or operational changes. Load
 identity, topology, or deployment behavior.
 
 Use `documentation-consistency` whenever behavior, parameters, defaults,
-outputs, deployment modes, or operator steps change. Keep `README.md`,
-`CHANGELOG.md`, relevant `docs/` runbooks, and the public
-`Azure/AI-Landing-Zones` documentation aligned with shipped behavior.
+outputs, deployment modes, or operator steps change. Keep `README.md`, relevant
+`docs/` runbooks and ADRs, and the public `Azure/AI-Landing-Zones`
+documentation aligned with shipped behavior. This repository has no
+`CHANGELOG.md`; record change notes in an ADR under `docs/adr/` and in the pull
+request.
 
 This repository uses semantic versioning. `main` holds released versions and
 `develop` is the integration branch when present. Before feature work, ensure
 the integration branch includes the latest release from `main`. Release tags
 and GitHub Release titles use exactly `vMAJOR.MINOR.PATCH`; keep
-`manifest.json`, changelog, tag, and release title aligned. Major or minor
+`manifest.json`, release notes, tag, and release title aligned. Major or minor
 changes require Portal and Terraform landing-zone parity review.
 
 ## Collaboration and handoffs
