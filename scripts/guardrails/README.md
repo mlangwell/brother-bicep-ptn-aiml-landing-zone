@@ -379,12 +379,44 @@ Dependencies, not planes, set the order. Each step fails while the one above it 
 Deleting an assignment destroys its system-assigned identity, which leaves an unresolvable
 "Identity not found" grant that can no longer be looked up by principal.
 
+Do **not** name the loop variable `$pid`. `$PID` is a PowerShell automatic variable holding
+the current process ID; assigning to it does not take, and every revoke then runs against
+the process ID and fails with `No matched assignments were found to delete` — silently
+defeating this entire step. Verified the hard way on the first live teardown.
+
 ```powershell
 foreach ($name in (az policy assignment list --scope "/subscriptions/$sub" --query "[?metadata.\"ailz-owner\"=='$stamp'].name" -o tsv)) {
-  $pid = az policy assignment show --name $name --scope "/subscriptions/$sub" --query identity.principalId -o tsv
-  if ($pid -and $pid -ne 'null') { az role assignment delete --assignee-object-id $pid --scope "/subscriptions/$sub" }
+  $principalId = az policy assignment show --name $name --scope "/subscriptions/$sub" --query identity.principalId -o tsv
+  if ($principalId -and $principalId -ne 'null') { az role assignment delete --assignee-object-id $principalId --scope "/subscriptions/$sub" }
 }
 ```
+
+If the assignments were already deleted and the grants are orphaned, principal lookup can
+no longer find them. Recover from the **evidence file**, which records the exact
+`roleAssignmentId` of every grant the run created, and delete by id:
+
+```powershell
+$ev = Get-Content ./evidence/guardrails-apply-<stamp>.json -Raw | ConvertFrom-Json
+$ev.Results |
+  Where-Object { $_.Name -like '*Identity role grant*' -and $_.Evidence } |
+  ForEach-Object { az role assignment delete --ids $_.Evidence.roleAssignmentId }
+```
+
+Do this rather than deleting every unresolved grant on the subscription. A shared
+subscription can carry unrelated orphaned grants — the first live teardown found 16
+unresolved principals, of which only 6 were the playbook's and 10 were pre-existing
+`Owner` grants belonging to someone else.
+
+Two more things a script here must get right, both found live:
+
+- Under `Set-StrictMode`, `$_.metadata.'ailz-owner'` **throws** on any object whose
+  `metadata` lacks the key. With `$ErrorActionPreference = 'Continue'` the pipeline keeps
+  going and the filter still returns the right objects, so it looks like it worked while
+  emitting an exception per non-matching object. Probe
+  `$_.PSObject.Properties['ailz-owner']` explicitly.
+- Reuse the api-versions the apply modules use. `DELETE` against
+  `settings/taginheritance` with a stale api-version returns a bare `Bad Request` that
+  reads like a permissions or payload problem.
 
 **2. Delete the assignments.** Definitions will not delete while assigned.
 

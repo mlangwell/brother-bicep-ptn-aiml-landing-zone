@@ -134,9 +134,9 @@ The script has four required parameters. The remaining parameters are optional.
 | `ApiManagementPublisherEmail` | Conditional | Publisher contact email. Required when `DeployApiManagement` is enabled. | `api-owners@contoso.com` |
 | `ApiManagementPublisherName` | No | Publisher display name. Defaults to `AI Landing Zone`. | `Contoso API Team` |
 | `ApiManagementIngressSourceAddressPrefixes` | No | Hub firewall source CIDRs allowed to reach the internal APIM gateway on TCP 443. Defaults to the hub VNet's `AzureFirewallSubnet` prefix, read after sign-in, because Azure Firewall source-NATs gateway traffic to a back-end instance IP in that subnet, not to its frontend IP. Falls back to `EgressNextHopIp/32` with a warning when the hub has no readable `AzureFirewallSubnet`, such as an NVA hub. | `@("10.100.0.0/26")` |
-| `AdditionalEnvironmentVariables` | No | PowerShell hashtable containing additional `azd` environment values supported by `main.parameters.json`, such as subscription, resource group, private DNS zone IDs, or feature flags. Values persist in the selected local `azd` environment. | `@{ AZURE_SUBSCRIPTION_ID = "<id>" }` |
-| `PreviewOutput` | No | Preview detail level. `Full` displays ARM What-If changes plus every nested compiled resource declaration. `Slim` (default) displays the original condensed `azd provision --preview` summary. | `Full` |
-| `PreviewOnly` | No | Switch that stops after `azd provision --preview`. Without it, the script displays the preview and then asks you to type `DEPLOY` before provisioning. | `-PreviewOnly` |
+| `AdditionalEnvironmentVariables` | No | PowerShell hashtable containing additional `azd` environment values supported by `main.parameters.json`, such as subscription, resource group, private DNS zone IDs, or feature flags. Values persist in the selected local `azd` environment. Note that the script does **not** set `AZURE_SEARCH_LOCATION`; pass it here to place Azure AI Search in a different region when the primary region is out of AI Search capacity. Capacity is not the same as quota, so preflight's quota check can pass while the deployment still fails with `InsufficientResourcesAvailable`. | `@{ AZURE_SUBSCRIPTION_ID = "<id>"; AZURE_SEARCH_LOCATION = "eastus" }` |
+| `PreviewOutput` | No | Preview detail level. `Full` displays ARM What-If changes plus every nested compiled resource declaration, and **requires `AZURE_RESOURCE_GROUP` to already exist in the `azd` environment and in Azure**, because it calls ARM What-If directly against that group. azd only populates it after a successful provision, so `Full` is for second and later deployments; a first deployment uses `Slim`. `Slim` (default) displays the original condensed `azd provision --preview` summary. | `Full` |
+| `PreviewOnly` | No | Switch that stops after `azd provision --preview`. Without it, the script displays the preview and then asks you to type `DEPLOY` before provisioning. The prompt reads stdin, so a non-interactive caller can satisfy it by piping `DEPLOY` into the script. | `-PreviewOnly` |
 
 ### Find the required values
 
@@ -181,6 +181,32 @@ If the hub uses a network virtual appliance instead of Azure Firewall, obtain
 its private forwarding IP from the platform or networking team.
 
 ## Deploy
+
+> **Before you start: the hub-to-spoke peering and the hub firewall allow-list are
+> prerequisites, not follow-up steps.**
+>
+> The template creates only the spoke-to-hub peering direction, and it attaches a route
+> table whose only route is `0.0.0.0/0` to the hub firewall. Until the **hub-to-spoke**
+> peering is `Connected` and the hub firewall allows the spoke's egress, the spoke has no
+> working path off the VNet.
+>
+> This bites during the **first** pass, not only when you add API Management. The Windows
+> jumpbox bootstraps through a Custom Script Extension that downloads `install.ps1` from
+> `raw.githubusercontent.com`. With no working hub path that download fails and the whole
+> provision exits non-zero **at the very last step**, after every other resource has
+> already succeeded:
+>
+> ```
+> VMExtensionProvisioningError: VM has reported a user failure when processing
+> extension 'cse' ... Error code: '58'. Error message: 'CustomScript failed to
+> download the blob https://raw.githubusercontent.com/.../install.ps1 because it
+> was unable to connect to the remote server.'
+> ```
+>
+> A peering in `Initiated` does not carry traffic; both directions must read `Connected`.
+> See [Complete hub integration](#3-complete-hub-integration) for the peering and
+> [Hub firewall egress requirements](#hub-firewall-egress-requirements) for the
+> allow-list. Set `deployJumpbox=false` if you do not want that dependency at all.
 
 ### 1. Preview the deployment
 
@@ -239,20 +265,77 @@ provisioning. Any other response cancels the deployment.
 
 ### 3. Complete hub integration
 
-After provisioning:
+The reverse peering and the hub firewall allow-list are **prerequisites for a clean first
+provision**, not post-deployment polish — see the note at the top of [Deploy](#deploy).
+Arrange them with the hub owner before you provision. The steps are listed here because
+the spoke resource IDs they need do not exist until the template has run once.
+
+If the first pass failed on the jumpbox Custom Script Extension, complete steps 1 to 3
+and rerun the same command; the provision is idempotent and converges in about ten
+minutes, retrying only the extension.
 
 1. Create the reverse hub-to-spoke VNet peering. The template creates only the
-  spoke-to-hub direction. API Management depends on this peering, so complete it
-  before you enable the gateway; see [Deploy API Management](#deploy-api-management).
-2. Link the hub-managed private DNS zones to the spoke VNet when Azure Policy
+  spoke-to-hub direction. Both the jumpbox bootstrap and API Management depend on it;
+  see [Deploy API Management](#deploy-api-management). If you own the hub, run
+  `pwsh ./tests/scripts/Add-HubSpokePeering.ps1 -HubVnetResourceId $hubVnetResourceId -SpokeVnetResourceId $spokeVnetResourceId`.
+  Confirm that **both** directions report `Connected` and `FullyInSync`:
+
+  ```powershell
+  az network vnet peering list -g <hub-rg>   --vnet-name <hub-vnet>   --query "[].{name:name,state:peeringState}" -o table
+  az network vnet peering list -g <spoke-rg> --vnet-name <spoke-vnet> --query "[].{name:name,state:peeringState}" -o table
+  ```
+
+2. Confirm the hub firewall allows the spoke's egress. See
+  [Hub firewall egress requirements](#hub-firewall-egress-requirements).
+3. Link the hub-managed private DNS zones to the spoke VNet when Azure Policy
   does not manage those links.
-3. Verify that the hub firewall permits the spoke source range and that its DNS
-  configuration resolves the private endpoints.
-4. Test access from a host with network connectivity to the spoke, such as a
+4. Verify that the hub firewall's DNS configuration resolves the private endpoints.
+5. Test access from a host with network connectivity to the spoke, such as a
   hub jumpbox reached through Azure Bastion.
 
 See the [hub-and-spoke deployment walkthrough](https://azure.github.io/AI-Landing-Zones/bicep/hub-and-spoke/)
 for the post-deployment network checks.
+
+### Hub firewall egress requirements
+
+In `ailz-integrated` mode the firewall belongs to the hub, so `deployAzureFirewall` is
+forced to `false` and **this template creates no firewall rules at all**. The hub owner
+must allow the spoke's egress. An Azure Firewall with no matching rule denies by default,
+and the first symptom is the jumpbox CSE failure above.
+
+`modules/networking/azure-firewall.bicep` is the authoritative list of what the landing
+zone needs. It is the module this template deploys when it *does* own the firewall, so
+treat its rules as the specification to mirror in the hub policy. It covers, at minimum:
+
+| Purpose | Targets | Ports |
+| --- | --- | --- |
+| Landing-zone bootstrap and tooling | `github.com`, `raw.githubusercontent.com`, `codeload.github.com`, `objects.githubusercontent.com`, `*.githubusercontent.com` | 443 |
+| Microsoft container registry | `mcr.microsoft.com` and its data endpoint | 443 |
+| Entra ID / Microsoft Graph | `login.microsoftonline.com`, `graph.microsoft.com` and related | 443 |
+| Azure platform, diagnostics and CRL | `*.monitor.azure.com`, `*.opinsights.azure.com`, `*.loganalytics.io`, `*.azurecontainerapps.io`, `oneocsp.microsoft.com`, `crl*.microsoft.com`, `crl*.digicert.com`, `ctldl.windowsupdate.com`, `agent365.svc.cloud.microsoft` | 443 |
+| Jumpbox bootstrap (`jumpbox-subnet` only) | Chocolatey, NuGet, `download.microsoft.com`, `aka.ms`, `go.microsoft.com` | 80, 443 |
+| Jumpbox dev runtimes (`jumpbox-subnet` only) | `*.python.org`, `pypi.org`, `files.pythonhosted.org`, `bootstrap.pypa.io`, `registry.npmjs.org` | 443 |
+| Platform network rules | NTP, Windows activation (KMS) | UDP 123, TCP 1688 |
+
+When API Management is enabled the hub firewall must **also** allow everything the
+`api-management-subnet` NSG allows outbound. The NSG permits it at the subnet edge, but
+the subnet's route table still sends `0.0.0.0/0` to the hub firewall, so an NSG allow is
+necessary and not sufficient. Per the
+[API Management virtual network reference](https://learn.microsoft.com/azure/api-management/virtual-network-reference):
+
+| Destination | Ports | Required |
+| --- | --- | --- |
+| `Storage` | 443 | Yes |
+| `Sql` | 1433 | Yes |
+| `AzureKeyVault` | 443 | Yes |
+| `AzureMonitor` | 1886, 443 | Yes |
+| `AzureActiveDirectory` | 443 | Yes |
+| Internet (certificate chain validation) | 80 | Yes |
+| DNS | 53 | Yes |
+| `EventHub` | 5671, 5672, 443 | Only with Event Hub logging / Azure Monitor |
+
+Only `ApiManagement` control-plane traffic bypasses the firewall, via the dedicated
+service-tag route the template creates.
 
 ## Optional configuration
 
@@ -298,6 +381,36 @@ The deployment uses the Developer SKU and internal VNet mode. It creates the
 dedicated `api-management-subnet` at `192.168.3.128/27` and a dedicated route
 table. The subnet has service endpoints for Storage, SQL, Key Vault and Event
 Hubs.
+
+#### What this deploys, and what it does not
+
+> **`Deploy-AilzIntegrated.ps1` deploys the gateway *service* only. It does not add this
+> landing zone's workload API, named values, caller configuration or token limits.**
+
+`apiManagementConfiguration` is what adds those, and `main.parameters.json` binds it to a
+literal `{}` with no azd substitution. The deploy script never sets it, so on this path
+the gateway comes up containing only the stock `echo-api`.
+
+That is by design — the gateway is per-subscription platform infrastructure with a much
+longer lifecycle than any one landing zone — but it has consequences worth stating
+plainly:
+
+- The **`llm-token-limit`** policy is not present. Any statement that the gateway is the
+  real-time hard stop on inference spend does not hold until the workload API is
+  configured.
+- The ADR-004 controls (streaming refused by default, call-rate backstop) ship as part of
+  that configuration and are likewise not deployed.
+- The guardrails playbook's gateway plane will report `Unverifiable` for the token limit,
+  the caller configuration and the emergency stop control, because no API carries the
+  ownership marker it looks for. That is an accurate report of an unconfigured gateway,
+  not a fault in the playbook.
+
+To get a configured gateway, deploy through the environment-profile path
+(`scripts/github/Invoke-EnvironmentDeployment.ps1` with an `environments/<env>.json`
+profile), which supplies a complete `gatewayConfiguration` — SKU and capacity, the
+workload API, explicit caller and model mappings, and token limits. See
+`environments/schema.json` and the `*.example.json` profiles.
+
 
 Its NSG allows:
 - Azure control-plane traffic and load-balancer probes;
@@ -518,6 +631,48 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 Do not weaken the machine-wide execution policy unless your organization has
 approved that change.
+
+### Provision fails on the jumpbox extension with `VMExtensionProvisioningError` / CSE error 58
+
+```
+VMExtensionProvisioningError: VM has reported a user failure when processing
+extension 'cse' ... Error code: '58'. Error message: 'CustomScript failed to
+download the blob https://raw.githubusercontent.com/.../install.ps1 because it
+was unable to connect to the remote server. Please verify the bloburi is correct
+and there are no blocking firewall rules or network connection issues'
+```
+
+**The blob URI is almost never the problem, despite what the message says.** This is a
+spoke egress failure. The jumpbox subnet is attached to a route table whose only route is
+`0.0.0.0/0` to the hub firewall, so the download fails whenever that path is not working.
+Everything else in the deployment succeeds first, so the failure lands at the very end of
+a long run.
+
+Check, in this order:
+
+1. **Hub-to-spoke peering.** Both directions must read `Connected`. A peering in
+  `Initiated` does not carry traffic, and the template only creates the spoke-to-hub
+  direction.
+
+  ```powershell
+  az network vnet peering list -g <hub-rg>   --vnet-name <hub-vnet>   --query "[].{name:name,state:peeringState}" -o table
+  az network vnet peering list -g <spoke-rg> --vnet-name <spoke-vnet> --query "[].{name:name,state:peeringState}" -o table
+  ```
+
+2. **Hub firewall rules.** An Azure Firewall with no matching rule denies by default. See
+  [Hub firewall egress requirements](#hub-firewall-egress-requirements).
+
+3. **Confirm the fix before rerunning**, so you do not spend another long cycle to find
+  out:
+
+  ```powershell
+  az vm run-command invoke -g <spoke-rg> -n <jumpbox-vm> --command-id RunPowerShellScript `
+    --scripts "try { `$r=Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Azure/bicep-ptn-aiml-landing-zone/refs/tags/v2.6.1/install.ps1' -UseBasicParsing -TimeoutSec 40; Write-Host ('OK ' + `$r.StatusCode) } catch { Write-Host ('FAIL: ' + `$_.Exception.Message) }"
+  ```
+
+Then rerun the same provision command. It is idempotent: the existing resources converge
+in about ten minutes and only the extension is retried. Set `deployJumpbox=false` if you
+do not need the jumpbox.
 
 ### `this project requires a version of azd within the range '>= 1.25.5'`
 
