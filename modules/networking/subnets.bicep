@@ -59,7 +59,10 @@ module subnetsM 'subnet.bicep' = [
         // EventHub) because Learn strongly recommends service endpoints for
         // those dependencies whenever the subnet is force tunnelled, and this
         // landing zone routes 0.0.0.0/0 to the hub firewall by default.
-        serviceEndpoints: map(subnets[i].serviceEndpoints, endpoint => {
+        // Coalesced because `subnets` is an untyped array: a caller that omits
+        // this optional property would otherwise fail evaluation rather than
+        // keep the empty endpoint list the child module defaults to.
+        serviceEndpoints: map(subnets[i].?serviceEndpoints ?? [], endpoint => {
           service: endpoint
         })
         networkSecurityGroupId: !empty(subnets[i].?networkSecurityGroupResourceId ?? '')
