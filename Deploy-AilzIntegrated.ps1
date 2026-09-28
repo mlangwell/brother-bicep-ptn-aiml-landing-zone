@@ -126,7 +126,7 @@ function Read-GatewayConfiguration {
 
     $callers = @($configuration.callerMappings)
     if ($callers.Count -lt 1) {
-        throw "GatewayConfigurationPath '$Path' must declare at least one callerMappings entry. The token limit is enforced per caller; a caller with no mapping is refused with 403 gateway_mapping_missing."
+        throw "GatewayConfigurationPath '$Path' must declare at least one callerMappings entry. The gateway is a closed allow-list; a caller with no mapping is refused with 403 gateway_forbidden."
     }
 
     $callerRequired = @('objectId', 'project', 'models', 'tokensPerMinute', 'tokenQuota', 'tokenQuotaPeriod')

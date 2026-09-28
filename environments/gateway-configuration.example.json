@@ -69,7 +69,7 @@
 
   "$comment_callers": [
     "At least one entry is required. There is no unlimited path: a caller whose",
-    "object ID is not listed here is refused with 403 gateway_mapping_missing.",
+    "object ID is not listed here is refused with 403 gateway_forbidden.",
     "",
     "objectId is the Entra OBJECT ID (a GUID) of the service principal, managed",
     "identity or group that calls the gateway - find it with:",
