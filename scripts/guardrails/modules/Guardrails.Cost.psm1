@@ -530,6 +530,17 @@ function Set-SavedCostView {
                     chart       = 'StackedColumn'
                     accumulated = 'false'
                     metric      = 'ActualCost'
+                    # The Views API rejects any non-Table chart that does not carry
+                    # exactly three pivots ("Non table views should have three
+                    # pivots."). `pivots` configures the three sub-views beneath the
+                    # main chart in Cost Analysis, and the API documents the count as
+                    # three rather than "up to three", so all three must be supplied.
+                    # https://learn.microsoft.com/azure/templates/microsoft.costmanagement/views
+                    pivots      = @(
+                        @{ type = 'Dimension'; name = 'ServiceName' }
+                        @{ type = 'Dimension'; name = 'ResourceGroupName' }
+                        @{ type = 'Dimension'; name = 'ResourceId' }
+                    )
                     query       = @{
                         type      = 'ActualCost'
                         timeframe = 'MonthToDate'
