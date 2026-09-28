@@ -294,6 +294,15 @@ module gateway 'br/public:avm/res/api-management/service:0.14.4' = {
 // why it is surfaced rather than left to a manual portal lookup.
 resource deployedGateway 'Microsoft.ApiManagement/service@2024-05-01' existing = {
   name: name
+  // dependsOn is required: an existing resource compiles to a declared ARM
+  // resource with a Read operation, which ARM runs as soon as the deployment
+  // starts. On a first deployment the gateway does not exist yet, so that read
+  // fails with ResourceNotFound AFTER the ~30-minute create has already run.
+  // modules/api-management/main.bicep carries the same dependency for the same
+  // reason; this module was missing it.
+  dependsOn: [
+    gateway
+  ]
 }
 
 @description('Platform gateway resource ID. Pass this to the landing zone as existingApiManagementResourceId.')
