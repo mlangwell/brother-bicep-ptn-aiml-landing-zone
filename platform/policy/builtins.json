@@ -1,0 +1,36 @@
+{
+  "sourceCommit": "7b0fa25ac055d8c3001d5205cd009cd119a289a5",
+  "verifiedOn": "2026-09-16",
+  "definitions": {
+    "network": {
+      "id": "/providers/Microsoft.Authorization/policyDefinitions/037eea7a-bd0a-46c5-9a66-03aea78705d3",
+      "version": "3.3.0",
+      "source": "https://raw.githubusercontent.com/Azure/azure-policy/7b0fa25ac055d8c3001d5205cd009cd119a289a5/built-in-policies/policyDefinitions/Azure%20Ai%20Services/NetworkAcls_Audit.json"
+    },
+    "localAuth": {
+      "id": "/providers/Microsoft.Authorization/policyDefinitions/71ef260a-8f18-47b7-abcb-62d0673d94dc",
+      "version": "1.1.0",
+      "source": "https://raw.githubusercontent.com/Azure/azure-policy/7b0fa25ac055d8c3001d5205cd009cd119a289a5/built-in-policies/policyDefinitions/Azure%20Ai%20Services/DisableLocalAuth_Audit.json"
+    },
+    "locations": {
+      "id": "/providers/Microsoft.Authorization/policyDefinitions/e56962a6-4747-49cd-b67b-bf8b01975c4c",
+      "version": "1.1.0",
+      "source": "https://raw.githubusercontent.com/Azure/azure-policy/7b0fa25ac055d8c3001d5205cd009cd119a289a5/built-in-policies/policyDefinitions/General/AllowedLocations_Deny.json"
+    },
+    "privateEndpoint": {
+      "id": "/providers/Microsoft.Authorization/policyDefinitions/d6759c02-b87f-42b7-892e-71b3f471d782",
+      "version": "1.0.0",
+      "source": "https://raw.githubusercontent.com/Azure/azure-policy/7b0fa25ac055d8c3001d5205cd009cd119a289a5/built-in-policies/policyDefinitions/Azure%20Ai%20Services/EnablePrivateEndpoints_Audit.json"
+    },
+    "tags": {
+      "id": "/providers/Microsoft.Authorization/policyDefinitions/871b6d14-10aa-478d-b590-94f262ecfa99",
+      "version": "1.0.1",
+      "source": "https://raw.githubusercontent.com/Azure/azure-policy/7b0fa25ac055d8c3001d5205cd009cd119a289a5/built-in-policies/policyDefinitions/Tags/RequireTag_Deny.json"
+    },
+    "diagnostics": {
+      "id": "/providers/Microsoft.Authorization/policyDefinitions/7f89b1eb-583c-429a-8828-af049802c1d9",
+      "version": "2.0.1",
+      "source": "https://raw.githubusercontent.com/Azure/azure-policy/7b0fa25ac055d8c3001d5205cd009cd119a289a5/built-in-policies/policyDefinitions/Monitoring/DiagnosticSettingsForTypes_Audit.json"
+    }
+  }
+}

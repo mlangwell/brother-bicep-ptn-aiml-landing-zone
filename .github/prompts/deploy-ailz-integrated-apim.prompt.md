@@ -26,20 +26,33 @@ operator guidance in the [README](../../README.md).
    - Require a valid private IPv4 address for the egress next hop.
    - Require a syntactically valid email address.
    If validation fails, explain the invalid field and collect only its replacement.
-4. Confirm that `pwsh`, `az`, and `azd` are available. Stop and report the
-   missing prerequisite if any command is unavailable.
+4. Confirm that `pwsh`, `az`, and `azd` are available, and that `azd version`
+   reports 1.25.5 or later; the template's `azure.yaml` rejects older releases.
+   Stop and report the missing prerequisite or the upgrade command
+   `winget upgrade Microsoft.Azd` if a check fails.
 5. Sign in interactively if required, select the requested Azure subscription,
    and show the subscription name, subscription ID, target resource group,
    location, hub VNet ID, and egress next-hop IP for confirmation. Do not print
    the complete `azd` environment.
-6. Explain that the script will configure the `ailz-integrated` network-isolated
-   topology, route spoke egress through the supplied next hop, and deploy an
-   internal Developer-tier API Management service. State that existing
-   resources may be modified by the resulting incremental ARM deployment.
+6. Decide which pass this run is. API Management activates over the hub egress
+   path, so it needs a Connected hub-to-spoke peering before the gateway is
+   created, and the template creates only the spoke-to-hub direction. Using
+   read-only commands only, list the hub VNet peerings with
+   `az network vnet peering list --subscription <hub-subscription> --resource-group <hub-resource-group> --vnet-name <hub-vnet> --output json`.
+   - If a peering whose `remoteVirtualNetwork.id` is in the target spoke
+     resource group has `peeringState` `Connected`, this is the second pass:
+     deploy with API Management.
+   - Otherwise this is the first pass: deploy the spoke without API Management.
+     Explain why before running anything.
+   Explain that the script will configure the `ailz-integrated` network-isolated
+   topology, route spoke egress through the supplied next hop, and, on the
+   second pass, deploy an internal Developer-tier API Management service. State
+   that existing resources may be modified by the resulting incremental ARM
+   deployment.
 7. From the repository root, run the script once with these parameters:
    - Pass the collected environment name, location, hub VNet resource ID,
      egress next-hop IP, and publisher email.
-   - Always pass `-DeployApiManagement`.
+   - Pass `-DeployApiManagement` on the second pass only.
    - Pass `-PreviewOutput Full`.
    - Pass the subscription ID and resource group through
      `-AdditionalEnvironmentVariables` as `AZURE_SUBSCRIPTION_ID` and
@@ -54,6 +67,8 @@ operator guidance in the [README](../../README.md).
     value. Preserve the command output and exit code, and stop the transcript
     when the script completes or fails. Before continuing to step 8, verify that
     the transcript file exists, is non-empty, and contains the completed preview.
+    If preflight fails with `APIM_HUB_PEERING_MISSING` or
+    `APIM_HUB_PEERING_NOT_CONNECTED`, explain the finding and return to step 6.
 8. When the script displays `Preview complete. Type DEPLOY to continue`, do not
    answer automatically. Summarize any deletes, replacements, role assignments,
    public network access, policy effects, and changes outside the target resource
@@ -61,6 +76,12 @@ operator guidance in the [README](../../README.md).
     explicit approval to provision this exact subscription and resource group.
     Send `DEPLOY` only after approval; otherwise send a different response to
     cancel.
-9. Do not retry a non-transient failure. Report the failed phase and first Azure
+9. After a successful first pass, stop. Tell me the hub owner must create the
+   hub-to-spoke peering. If I own the hub, offer
+   `pwsh ./tests/scripts/Add-HubSpokePeering.ps1 -HubVnetResourceId <hub-vnet-id>`,
+   but run it only after my explicit approval because it changes the hub. When I
+   confirm the peering exists, recheck it with the read-only command from
+   step 6, and run the second pass from step 7 only when it shows `Connected`.
+10. Do not retry a non-transient failure. Report the failed phase and first Azure
    resource error. On success, report the environment, subscription, resource
    group, deployment status, and Azure portal resource-group URL.

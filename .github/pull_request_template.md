@@ -35,5 +35,5 @@ was not run.
 - [ ] I verified the changes locally to ensure they work as expected
 - [ ] I tested the new functionality and ensured existing features still work
 - [ ] I preserved parameter, output, naming, identity, and network-isolation contracts or documented the migration
-- [ ] I updated `CHANGELOG.md` and all affected documentation
+- [ ] I recorded change notes in an ADR under `docs/adr/` and updated all affected documentation
 - [ ] I added at least one reviewer to this Pull Request

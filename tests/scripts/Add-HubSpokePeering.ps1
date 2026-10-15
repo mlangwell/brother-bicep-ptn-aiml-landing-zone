@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Creates the reverse hub→spoke VNet peering after the spoke is deployed.
+    Creates the reverse hub→spoke VNet peering after the spoke is deployed and
+    before API Management is enabled.
 
 .DESCRIPTION
     The spoke→hub peering is created automatically by main.bicep when
@@ -9,6 +10,10 @@
     (hub→spoke) must be created separately because the spoke deployment
     typically does not have write access to the hub resource group in real
     landing-zone topologies.
+
+    API Management activates over the hub egress path, so a gateway in the spoke
+    needs this peering Connected before it is created. Deploy the spoke without
+    API Management, run this script, then enable API Management (ADR-003).
 
     This script:
       1. Reads the spoke VNet resource ID from `azd env get-values` (or

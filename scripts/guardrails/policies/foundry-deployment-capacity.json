@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "Foundry model deployment capacity ceiling.",
+    "",
+    "WHY THIS EXISTS: there is no built-in policy that constrains Cognitive",
+    "Services / Foundry deployment capacity. The landing-zone template already",
+    "constrains the deployment SKU NAME (deployment-skus.policy.json) but not",
+    "its SIZE, so an approved GlobalStandard SKU can still be deployed at any",
+    "capacity. This closes that gap.",
+    "",
+    "UNITS: sku.capacity on Standard-family deployments is thousands of",
+    "tokens-per-minute. maxCapacity=50 means 50,000 TPM.",
+    "",
+    "WHAT THIS IS NOT: a spend control. Capacity is throughput, not currency -",
+    "a deployment run flat out inside this ceiling for a month is still a large",
+    "bill. The real-time spend control is the APIM llm-token-limit policy.",
+    "",
+    "ALIAS VERIFIED 2026-09-25 against the live provider:",
+    "  az provider show --namespace Microsoft.CognitiveServices",
+    "    --expand resourceTypes/aliases",
+    "  -> Microsoft.CognitiveServices/accounts/deployments/sku.capacity"
+  ],
+  "properties": {
+    "displayName": "Foundry model deployments must not exceed the approved capacity ceiling",
+    "policyType": "Custom",
+    "mode": "All",
+    "description": "Denies or audits Microsoft.CognitiveServices deployments whose sku.capacity exceeds the approved ceiling. Capacity is a throughput ceiling, not a cost ceiling; the gateway token limit remains the real-time spend control.",
+    "metadata": {
+      "category": "Cognitive Services",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      },
+      "maxCapacity": {
+        "type": "Integer",
+        "defaultValue": 50,
+        "metadata": {
+          "displayName": "Maximum deployment capacity",
+          "description": "Maximum permitted sku.capacity. For Standard-family deployments this is thousands of TPM."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.CognitiveServices/accounts/deployments"
+          },
+          {
+            "field": "Microsoft.CognitiveServices/accounts/deployments/sku.capacity",
+            "exists": "true"
+          },
+          {
+            "field": "Microsoft.CognitiveServices/accounts/deployments/sku.capacity",
+            "greater": "[parameters('maxCapacity')]"
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

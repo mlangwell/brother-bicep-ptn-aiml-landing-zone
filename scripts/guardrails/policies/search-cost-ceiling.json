@@ -1,0 +1,128 @@
+{
+  "_comment": [
+    "Azure AI Search cost ceiling: SKU, replicas and partitions together.",
+    "",
+    "WHY ALL THREE: AI Search is billed on search units, and",
+    "  search units = replicas x partitions",
+    "so capping the SKU alone does not cap the cost. A 'standard' service at",
+    "12 replicas x 12 partitions is 144 search units.",
+    "",
+    "WHY THIS EXISTS: no built-in allow-list policy for AI Search SKUs exists.",
+    "Verified 2026-09-25 - the only SKU-touching built-in is",
+    "a049bf77-880b-470f-ba6d-9f21c530cf83 ('Azure AI Search service should use",
+    "a SKU that supports private link'), whose rule is only",
+    "sku.name equals 'free'. It blocks the free tier; it cannot express an",
+    "allow-list and does nothing about the expensive end.",
+    "",
+    "storage_optimized_l1 / storage_optimized_l2 and standard3 are deliberately",
+    "absent from the default allow-list.",
+    "",
+    "ALIASES VERIFIED against the live provider:",
+    "  Microsoft.Search/searchServices/sku.name",
+    "  Microsoft.Search/searchServices/replicaCount",
+    "  Microsoft.Search/searchServices/partitionCount",
+    "",
+    "NOTE ON exists: replicaCount and partitionCount are optional on create and",
+    "default to 1. Each numeric test is guarded by an exists check so that an",
+    "omitted property is not treated as a violation."
+  ],
+  "properties": {
+    "displayName": "Azure AI Search services must stay within the approved SKU and scale ceiling",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "description": "Denies or audits Microsoft.Search services that use a SKU outside the approved list, or that exceed the approved replica or partition count. AI Search bills on search units (replicas x partitions), so all three are constrained together.",
+    "metadata": {
+      "category": "Search",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      },
+      "allowedSkus": {
+        "type": "Array",
+        "defaultValue": [ "basic", "standard" ],
+        "metadata": {
+          "displayName": "Allowed AI Search SKUs",
+          "description": "Permitted sku.name values. Lower-case, as emitted by the resource provider."
+        }
+      },
+      "maxReplicas": {
+        "type": "Integer",
+        "defaultValue": 2,
+        "metadata": {
+          "displayName": "Maximum replica count",
+          "description": "Maximum permitted replicaCount."
+        }
+      },
+      "maxPartitions": {
+        "type": "Integer",
+        "defaultValue": 2,
+        "metadata": {
+          "displayName": "Maximum partition count",
+          "description": "Maximum permitted partitionCount."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.Search/searchServices"
+          },
+          {
+            "anyOf": [
+              {
+                "allOf": [
+                  {
+                    "field": "Microsoft.Search/searchServices/sku.name",
+                    "exists": "true"
+                  },
+                  {
+                    "field": "Microsoft.Search/searchServices/sku.name",
+                    "notIn": "[parameters('allowedSkus')]"
+                  }
+                ]
+              },
+              {
+                "allOf": [
+                  {
+                    "field": "Microsoft.Search/searchServices/replicaCount",
+                    "exists": "true"
+                  },
+                  {
+                    "field": "Microsoft.Search/searchServices/replicaCount",
+                    "greater": "[parameters('maxReplicas')]"
+                  }
+                ]
+              },
+              {
+                "allOf": [
+                  {
+                    "field": "Microsoft.Search/searchServices/partitionCount",
+                    "exists": "true"
+                  },
+                  {
+                    "field": "Microsoft.Search/searchServices/partitionCount",
+                    "greater": "[parameters('maxPartitions')]"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

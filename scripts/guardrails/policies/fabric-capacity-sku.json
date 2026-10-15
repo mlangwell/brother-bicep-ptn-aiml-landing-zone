@@ -1,0 +1,75 @@
+{
+  "_comment": [
+    "Microsoft Fabric capacity SKU allow-list.",
+    "",
+    "WHY THIS EXISTS: there is NO built-in policy of any kind for",
+    "Microsoft.Fabric. Verified 2026-09-25 - the built-in policy repository has",
+    "no Fabric category, and a scoped code search for 'Microsoft.Fabric' across",
+    "built-in-policies returns zero results. A custom definition is the only",
+    "option.",
+    "",
+    "WHY IT MATTERS HERE: Fabric capacity is exactly the shape of spend this",
+    "playbook exists to bound - a single resource, trivially created, billed",
+    "hourly on the provisioned tier regardless of use. F64 is the licence",
+    "threshold tier and a large step up from F8. An innovation sandbox does not",
+    "need it, and nobody should be able to create one by accident.",
+    "",
+    "This is the half of the guardrail that RBAC cannot do. The custom role",
+    "grants Microsoft.Fabric write so the team can innovate; this policy is",
+    "what stops the F2048.",
+    "",
+    "ALIAS VERIFIED against the live provider:",
+    "  Microsoft.Fabric/capacities/sku.name"
+  ],
+  "properties": {
+    "displayName": "Microsoft Fabric capacities must use an approved SKU",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "description": "Denies or audits Microsoft.Fabric capacities created with a SKU outside the approved list. Fabric capacity bills hourly on the provisioned tier regardless of utilisation, so the SKU is the cost decision.",
+    "metadata": {
+      "category": "Fabric",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      },
+      "allowedSkus": {
+        "type": "Array",
+        "defaultValue": [ "F2", "F4", "F8" ],
+        "metadata": {
+          "displayName": "Allowed Fabric capacity SKUs",
+          "description": "Permitted sku.name values for Microsoft.Fabric/capacities."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.Fabric/capacities"
+          },
+          {
+            "field": "Microsoft.Fabric/capacities/sku.name",
+            "exists": "true"
+          },
+          {
+            "field": "Microsoft.Fabric/capacities/sku.name",
+            "notIn": "[parameters('allowedSkus')]"
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}

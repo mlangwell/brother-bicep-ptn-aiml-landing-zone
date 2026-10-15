@@ -6,8 +6,9 @@ description: Keeps AI Landing Zone contributor, user, and operator documentation
 # AI Landing Zone documentation consistency
 
 1. Identify the user, consumer, contributor, or operator behavior that changed.
-2. Search `README.md`, `CHANGELOG.md`, `docs/`, `pipelines/README.md`, examples,
-   and tests for the parameter, output, flag, topology, command, and old term.
+2. Search `README.md`, `docs/` (including `docs/adr/`), `pipelines/README.md`,
+   examples, and tests for the parameter, output, flag, topology, command, and
+   old term.
 3. Update every affected in-repository source in the same change.
 4. When the public Bicep landing-zone narrative changes, update the MkDocs source
    on `Azure/AI-Landing-Zones` `main` and link the companion pull request.

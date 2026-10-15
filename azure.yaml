@@ -2,6 +2,10 @@
 name: azure-ai-lz
 metadata:
   template: azure-ai-lz
+# 1.23.4 carries JSON arrays through ${VAR} substitution into array parameters
+# (azure-dev#6694); 1.25.5 lets azd down purge Foundry accounts (azure-dev#8493).
+requiredVersions:
+  azd: ">= 1.25.5"
 infra:
   provider: bicep
   path: .
@@ -17,4 +21,28 @@ hooks:
       shell: pwsh
       run: ./scripts/Invoke-PreflightChecks.ps1
       continueOnError: false
+      interactive: true
+  # Post-deployment governance. Dry run by default and a no-op when
+  # scripts/guardrails/.env is absent, so it can never fail a provision that
+  # succeeded; continueOnError keeps a governance finding advisory rather than
+  # fatal. Set GUARDRAILS_AUTO_APPLY=true in the azd environment to apply.
+  #
+  # interactive is true so the operator actually sees the result. azd captures
+  # and discards non-interactive hook output on success, which silently hid the
+  # "governance has NOT been applied" reminder at the one moment it matters
+  # (live run, 2026-09-27). It is also azd's documented default. This does not
+  # require a TTY and does not make the hook prompt: neither this hook nor the
+  # playbook contains Read-Host, Get-Credential or $Host.UI, the hook always
+  # passes -NonInteractive, and preprovision already runs interactive under
+  # `azd provision --no-prompt` in pipelines/azuredevops/templates/deploy-bicep.yml.
+  postprovision:
+    posix:
+      shell: pwsh
+      run: ./scripts/guardrails/Invoke-GuardrailsAzdHook.ps1
+      continueOnError: true
+      interactive: true
+    windows:
+      shell: pwsh
+      run: ./scripts/guardrails/Invoke-GuardrailsAzdHook.ps1
+      continueOnError: true
       interactive: true

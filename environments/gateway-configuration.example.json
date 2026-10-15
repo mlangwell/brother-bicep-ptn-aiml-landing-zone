@@ -1,0 +1,122 @@
+{
+  "$comment": [
+    "Gateway configuration for the azd deployment path. Copy this file, fill in every",
+    "placeholder, and pass it as:",
+    "",
+    "  ./Deploy-AilzIntegrated.ps1 ... -DeployApiManagement -GatewayConfigurationPath ./my-gateway.json",
+    "",
+    "Without it the deployment produces an API Management instance containing only the",
+    "stock echo-api: no workload API, no named values and no llm-token-limit. The",
+    "gateway bills for its tier and governs nothing (ADR-007).",
+    "",
+    "The authoritative schema is the gatewayServiceConfiguration definition in",
+    "environments/schema.json, and the Bicep type is gatewayConfiguration in",
+    "modules/api-management/types.bicep. Unknown keys are silently dropped by the",
+    "orchestrator, so check spelling against those two files.",
+    "",
+    "This file is an example and is not read by any deployment."
+  ],
+
+  "sku": "Developer",
+  "capacity": 1,
+
+  "publisherEmail": "api-owners@contoso.com",
+  "publisherName": "AI Landing Zone",
+
+  "$comment_audience": [
+    "Application ID URI of the Entra app registration that represents this gateway.",
+    "Callers request a token for this audience. This is NOT a GUID and NOT the",
+    "caller's object ID - it is the identifier URI, for example api://<app-id>."
+  ],
+  "audience": "api://00000000-0000-0000-0000-000000000000",
+
+  "$comment_subnet": [
+    "Must match the subnet the landing zone creates, unless you are deploying into a",
+    "prepared spoke whose subnet you own. The default prefix is main.bicep's",
+    "apiManagementSubnetPrefix. Preflight validates this prefix for overlap and",
+    "containment, so a wrong value is caught before the 30-minute gateway create."
+  ],
+  "integrationSubnetName": "api-management-subnet",
+  "integrationSubnetPrefix": "192.168.3.128/27",
+
+  "$comment_dns": [
+    "Service-scoped private DNS zone for <apim-name>.azure-api.net. NOT a",
+    "privatelink.azure-api.net zone: a classic injected instance cannot hold a",
+    "private endpoint, and Azure forbids a private zone for the shared apex domain."
+  ],
+  "privateDnsZoneResourceId": "/subscriptions/<subscription-id>/resourceGroups/<dns-rg>/providers/Microsoft.Network/privateDnsZones/<apim-name>.azure-api.net",
+
+  "$comment_stop": [
+    "Emergency stop. true makes the gateway refuse new requests without a",
+    "redeployment. Leave false for a normal deployment."
+  ],
+  "stopNewRequests": false,
+
+  "$comment_streaming": [
+    "ADR-004. Streaming is refused by default. When streaming is enabled the",
+    "llm-token-limit policy ALWAYS estimates prompt and completion tokens, with no",
+    "setting that changes it, so a streaming caller is enforced on estimates rather",
+    "than on billed usage. Enable only where that trade-off is recorded and accepted."
+  ],
+  "allowStreaming": false,
+
+  "$comment_calls": [
+    "Gateway-wide call-rate backstop in calls per minute, for callers that do not set",
+    "their own callsPerMinute. Token limits bound consumption but only after tokens",
+    "are counted; this bounds request volume. Omit to use the module default of 600."
+  ],
+  "defaultCallsPerMinute": 600,
+
+  "$comment_token_defaults": [
+    "Gateway-wide token limits, used for any caller that does not set its own.",
+    "Omit all three and the module defaults apply: 10000 TPM, 5000000 tokens Monthly.",
+    "",
+    "Microsoft publishes no default for llm-token-limit - the policy reference lists",
+    "these with Default = N/A - so these numbers are ours, not vendor guidance.",
+    "10000 assumes roughly four callers sharing the default 'chat' deployment, which",
+    "ships at capacity 40 (Learn: 1 unit = 1,000 TPM for chat-class models, moved in",
+    "1,000 increments). Change the model or the capacity and you should revisit this.",
+    "",
+    "TWO THINGS THAT SURPRISE PEOPLE:",
+    "",
+    "1. These also cap each request. The gateway refuses any request whose",
+    "   max_output_tokens exceeds min(tokensPerMinute, tokenQuota), with",
+    "   403 gateway_request_rejected / invalid-output-limit. With the defaults that",
+    "   ceiling is 10000. Set tokensPerMinute too low and callers get a 403 that",
+    "   looks like a permissions problem but is really a quota one.",
+    "",
+    "2. Per-caller limits do not add up to a shared budget. Four callers at 10000 TPM",
+    "   admit 40000 TPM of demand against ONE model deployment. If that exceeds the",
+    "   TPM assigned to the deployment, the model refuses the excess instead of the",
+    "   gateway, and the caller gets a backend error with nothing actionable in it.",
+    "   Deploy-AilzIntegrated.ps1 warns when the sum looks oversubscribed."
+  ],
+  "defaultTokensPerMinute": 10000,
+  "defaultTokenQuota": 5000000,
+  "defaultTokenQuotaPeriod": "Monthly",
+
+  "$comment_callers": [
+    "At least one entry is required. There is no unlimited path: a caller whose",
+    "object ID is not listed here is refused with 403 gateway_forbidden.",
+    "",
+    "Only objectId, project and models are required - the token fields fall back to",
+    "the gateway defaults above, then to the module defaults. Set them per caller",
+    "only where one caller genuinely needs different limits from the rest.",
+    "",
+    "objectId is the Entra OBJECT ID (a GUID) of the service principal, managed",
+    "identity or group that calls the gateway - find it with:",
+    "  az ad sp show --id <app-id> --query id -o tsv",
+    "",
+    "models must name deployed model deployment names, not model family names.",
+    "label is an optional readable billing dimension; without it the raw object ID",
+    "appears in cost telemetry. Keep distinct labels under 100."
+  ],
+  "callerMappings": [
+    {
+      "objectId": "00000000-0000-0000-0000-000000000000",
+      "project": "default",
+      "models": [ "chat", "text-embedding" ],
+      "label": "example-workload"
+    }
+  ]
+}

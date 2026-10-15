@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "Foundry / AI Services account SKU allow-list.",
+    "",
+    "WHY THIS EXISTS: no built-in policy constrains Cognitive Services account",
+    "SKUs. Verified 2026-09-25 - neither the 'Cognitive Services' nor the",
+    "'Azure Ai Services' built-in category contains a SKU policy.",
+    "",
+    "ALIAS VERIFIED against the live provider:",
+    "  Microsoft.CognitiveServices/accounts/sku.name"
+  ],
+  "properties": {
+    "displayName": "Foundry and AI Services accounts must use an approved SKU",
+    "policyType": "Custom",
+    "mode": "Indexed",
+    "description": "Denies or audits Microsoft.CognitiveServices accounts created with a SKU outside the approved list. Commitment-tier and reserved account SKUs represent committed spend and are excluded by default.",
+    "metadata": {
+      "category": "Cognitive Services",
+      "version": "1.0.0",
+      "source": "apim_policy_prep/deploy - AI cost control playbook"
+    },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "allowedValues": [ "Audit", "Deny", "Disabled" ],
+        "defaultValue": "Audit",
+        "metadata": {
+          "displayName": "Effect",
+          "description": "Audit reports without blocking. Deny blocks the deployment."
+        }
+      },
+      "allowedSkus": {
+        "type": "Array",
+        "defaultValue": [ "S0", "F0" ],
+        "metadata": {
+          "displayName": "Allowed account SKUs",
+          "description": "Account-level SKU names permitted for Microsoft.CognitiveServices accounts."
+        }
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.CognitiveServices/accounts"
+          },
+          {
+            "field": "Microsoft.CognitiveServices/accounts/sku.name",
+            "exists": "true"
+          },
+          {
+            "field": "Microsoft.CognitiveServices/accounts/sku.name",
+            "notIn": "[parameters('allowedSkus')]"
+          }
+        ]
+      },
+      "then": {
+        "effect": "[parameters('effect')]"
+      }
+    }
+  }
+}
